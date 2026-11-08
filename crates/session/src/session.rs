@@ -1424,7 +1424,7 @@ mod slow_network_tests {
         // The first lookup fails through all of its retries.
         let lookups = Arc::new(AtomicUsize::new(0));
         let seen = lookups.clone();
-        let server = SlowServer::start(Network::new(Duration::from_millis(20)), move |request| {
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), move |_request| {
             if seen.fetch_add(1, Ordering::SeqCst) < 4 {
                 return Reply::json(json!({ "message": "Bad gateway" })).status(502);
             }
