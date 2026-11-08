@@ -318,7 +318,9 @@ impl Updater {
         self.announced = Some(version.clone());
         cx.emit(UpdateEvent::Ready { version });
         cx.notify();
-        crate::actions::set_menus(cx);
+        // The menus read this updater's status, which can't be read while
+        // it is being updated, so rebuild them once this update finishes.
+        cx.defer(crate::actions::set_menus);
     }
 
     fn failed(&mut self, previous: UpdateStatus, err: anyhow::Error, cx: &mut Context<Self>) {
@@ -417,5 +419,31 @@ pub fn title_bar_button(cx: &App) -> Option<AnyElement> {
                 .into_any_element(),
         ),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::TestAppContext;
+
+    use super::*;
+
+    #[gpui_kit::test]
+    fn installing_an_update_rebuilds_the_menus_without_panicking(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            init(cx);
+            crate::actions::init(cx);
+        });
+        let updater = cx.update(|cx| updater(cx));
+        updater.update(cx, |updater, cx| {
+            updater.installed(Version::new(9, 0, 0), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| status(cx)),
+            UpdateStatus::Ready {
+                version: Version::new(9, 0, 0)
+            }
+        );
     }
 }
