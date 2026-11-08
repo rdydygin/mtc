@@ -108,7 +108,6 @@ pub fn emoji_for(name: &str) -> Option<&'static str> {
     let name = match name {
         "+1" | "thumbsup" => "+1",
         "-1" | "thumbsdown" => "-1",
-        "white_check_mark" | "heavy_check_mark" => name,
         other => other,
     };
     emojis::get_by_shortcode(name).map(|e| e.as_str())
@@ -147,8 +146,7 @@ fn autolink(text: &str) -> String {
             let end = candidate
                 .find(|c: char| c.is_whitespace() || c == '<' || c == '>')
                 .unwrap_or(candidate.len());
-            // Trailing punctuation usually ends the sentence, not the URL.
-            let url = candidate[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')']);
+            let url = trim_url_end(&candidate[..end]);
             out.push_str(before);
             out.push('<');
             out.push_str(url);
@@ -158,6 +156,24 @@ fn autolink(text: &str) -> String {
         out.push_str(rest);
     }
     out
+}
+
+/// Drop trailing punctuation, which usually ends the sentence rather than the
+/// URL. A closing parenthesis stays when it balances one inside the URL, as in
+/// `https://en.wikipedia.org/wiki/Rust_(programming_language)`.
+fn trim_url_end(url: &str) -> &str {
+    let mut url = url;
+    loop {
+        let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        let trimmed = match trimmed.strip_suffix(')') {
+            Some(inner) if inner.matches('(').count() <= inner.matches(')').count() => inner,
+            _ => trimmed,
+        };
+        if trimmed.len() == url.len() {
+            return url;
+        }
+        url = trimmed;
+    }
 }
 
 /// A conservative test for Markdown syntax that would render differently
@@ -225,6 +241,14 @@ mod tests {
             "[x](https://example.com)"
         );
         assert_eq!(autolink("httpd is fine"), "httpd is fine");
+        assert_eq!(
+            autolink("see https://en.wikipedia.org/wiki/Rust_(language)."),
+            "see <https://en.wikipedia.org/wiki/Rust_(language)>."
+        );
+        assert_eq!(
+            autolink("(see https://example.com/a)."),
+            "(see <https://example.com/a>)."
+        );
     }
 
     #[test]
