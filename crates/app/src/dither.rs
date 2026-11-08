@@ -200,7 +200,12 @@ impl Render for DitherView {
                                         .child(
                                             Button::new("idle-jump")
                                                 .ghost()
-                                                .label("Jump to…  ⌘K")
+                                                .label(format!(
+                                                    "Jump to…  {}",
+                                                    crate::actions::shortcut_label(
+                                                        crate::actions::QUICK_SWITCH_KEY
+                                                    )
+                                                ))
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(
                                                         Box::new(crate::actions::QuickSwitch),

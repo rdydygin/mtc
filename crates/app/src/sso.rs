@@ -3,9 +3,10 @@
 //! [`SsoPanel`] shows the server's SSO providers. Choosing one opens the
 //! browser; the server's last page hands the result back through a
 //! `mattermost-dev://` URL (server 9.1 and later) or an `mmauth://` URL
-//! (older servers), which macOS delivers to [`handle_open_urls`] when mtc
-//! runs as a bundle (see `script/bundle-macos`). If the browser can't hand it
-//! back, the user pastes the link instead.
+//! (older servers), which reaches [`handle_open_urls`]: from macOS when mtc
+//! runs as a bundle (see `script/bundle-macos`), or through `deep_link` on
+//! Linux and Windows. If the browser can't hand it back, the user pastes the
+//! link instead.
 
 use std::time::{Duration, Instant};
 
@@ -26,10 +27,7 @@ use gpui_kit::{
 };
 use mattermost::{
     Client, User,
-    sso::{
-        self, CALLBACK_SCHEME, Handoff, LoginOptions, MOBILE_CALLBACK_SCHEME, SsoAttempt, SsoKind,
-        SsoProvider,
-    },
+    sso::{self, Handoff, LoginOptions, SsoAttempt, SsoKind, SsoProvider},
 };
 
 /// Wait this long after the last keystroke before asking a server how to
@@ -37,7 +35,7 @@ use mattermost::{
 const LOOKUP_DELAY: Duration = Duration::from_millis(450);
 
 /// A callback that arrives with no panel on screen is shown by the next panel
-/// opened within this long (macOS can launch mtc with the URL).
+/// opened within this long (the system can launch mtc with the URL).
 const ORPHAN_WINDOW: Duration = Duration::from_secs(120);
 
 const ORPHANED: &str = "That sign-in was cancelled or mtc restarted before it finished. \
@@ -190,7 +188,7 @@ impl SsoPanel {
         cx.notify();
     }
 
-    /// A callback URL from the browser, delivered by macOS.
+    /// A callback URL from the browser, delivered by the system.
     fn receive(&mut self, url: String, cx: &mut Context<Self>) {
         if self.pending.is_some() {
             self.complete(url, cx);
@@ -391,9 +389,20 @@ pub fn handle_open_urls(urls: Vec<String>, cx: &mut App) {
     }
 }
 
-/// Ask macOS to send our callback schemes to this app. Only works when mtc
-/// runs from an app bundle; a bare `cargo run` binary falls back to pasting.
+/// Ask the system to send our callback schemes to this app. On macOS this
+/// only works when mtc runs from an app bundle; a bare `cargo run` binary
+/// falls back to pasting. Linux and Windows register the executable itself.
+#[cfg(not(target_os = "macos"))]
+pub fn register_callback_schemes(_: &mut App) {
+    crate::deep_link::register();
+}
+
+/// Ask the system to send our callback schemes to this app. On macOS this
+/// only works when mtc runs from an app bundle; a bare `cargo run` binary
+/// falls back to pasting. Linux and Windows register the executable itself.
+#[cfg(target_os = "macos")]
 pub fn register_callback_schemes(cx: &mut App) {
+    use mattermost::sso::{CALLBACK_SCHEME, MOBILE_CALLBACK_SCHEME};
     for scheme in [CALLBACK_SCHEME, MOBILE_CALLBACK_SCHEME] {
         let task = cx.register_url_scheme(scheme);
         cx.background_spawn(async move {

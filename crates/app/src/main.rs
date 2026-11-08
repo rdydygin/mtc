@@ -1,10 +1,15 @@
 //! mtc: a fast, keyboard-first Mattermost desktop client.
 
+// Release builds on Windows are GUI apps: no console window behind them.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod actions;
 mod app_root;
 mod appearance;
 mod assets;
 mod composer;
+#[cfg(not(target_os = "macos"))]
+mod deep_link;
 mod dither;
 mod extensions;
 mod http;
@@ -32,9 +37,28 @@ fn main() {
     )
     .init();
 
-    // macOS delivers SSO callback URLs before or after launch; forward them
-    // into the app once it is running.
+    // Linux and Windows open an SSO callback link by starting mtc with it.
+    // Pass it to the instance that's already running, if there is one.
+    #[cfg(not(target_os = "macos"))]
+    let launch_urls = {
+        let urls = deep_link::urls_from_args();
+        if !urls.is_empty() && deep_link::forward_to_running(&urls) {
+            return;
+        }
+        urls
+    };
+
+    // SSO callback URLs arrive before or after launch (from macOS, or from
+    // processes the browser starts elsewhere); forward them into the app
+    // once it is running.
     let (urls_tx, mut urls_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
+    #[cfg(not(target_os = "macos"))]
+    {
+        deep_link::listen(urls_tx.clone());
+        if !launch_urls.is_empty() {
+            let _ = urls_tx.unbounded_send(launch_urls);
+        }
+    }
     let app = gpui_kit::application().with_assets(assets::AppAssets);
     app.on_open_urls(move |urls| {
         let _ = urls_tx.unbounded_send(urls);

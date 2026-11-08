@@ -3,7 +3,8 @@
 //! Each command is one GPUI Action, so the menu bar, key bindings, the
 //! command palette, and buttons all dispatch the same thing.
 
-use gpui_kit::{App, KeyBinding, Menu, MenuItem, actions};
+use gpui_kit::component::kbd::Kbd;
+use gpui_kit::{App, KeyBinding, Keystroke, Menu, MenuItem, actions};
 
 use crate::{appearance, persist::Appearance};
 
@@ -35,15 +36,46 @@ actions!(
     ]
 );
 
+/// A keystroke with the platform's primary modifier: ⌘ on macOS, Ctrl on
+/// Linux and Windows. GPUI reads a literal `cmd-` as the Super/Windows key
+/// there, which the desktop usually claims for itself.
+#[cfg(target_os = "macos")]
+macro_rules! primary {
+    ($key:literal) => {
+        concat!("cmd-", $key)
+    };
+}
+#[cfg(not(target_os = "macos"))]
+macro_rules! primary {
+    ($key:literal) => {
+        concat!("ctrl-", $key)
+    };
+}
+
+/// The quick switcher's shortcut, shown in buttons that open it.
+pub const QUICK_SWITCH_KEY: &str = primary!("k");
+
+pub const ZOOM_IN_KEY: &str = primary!("=");
+pub const ZOOM_OUT_KEY: &str = primary!("-");
+pub const RESET_ZOOM_KEY: &str = primary!("0");
+
+/// How the platform writes a shortcut such as [`QUICK_SWITCH_KEY`]:
+/// `⌘K` on macOS, `Ctrl+K` elsewhere.
+pub fn shortcut_label(keystroke: &'static str) -> String {
+    Keystroke::parse(keystroke)
+        .map(|keystroke| Kbd::format(&keystroke))
+        .unwrap_or_else(|_| keystroke.to_string())
+}
+
 /// The key context of the signed-in workspace.
 pub const WORKSPACE_CONTEXT: &str = "Workspace";
 
 pub fn init(cx: &mut App) {
     // Bind before building the menu bar: the menus read the keymap once.
     cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-k", QuickSwitch, None),
-        KeyBinding::new("cmd-t", QuickSwitch, None),
+        KeyBinding::new(primary!("q"), Quit, None),
+        KeyBinding::new(QUICK_SWITCH_KEY, QuickSwitch, None),
+        KeyBinding::new(primary!("t"), QuickSwitch, None),
         KeyBinding::new("alt-down", NextChannel, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("alt-up", PreviousChannel, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("alt-shift-down", NextUnreadChannel, Some(WORKSPACE_CONTEXT)),
@@ -66,13 +98,13 @@ pub fn init(cx: &mut App) {
             PreviousUnreadChannel,
             Some("Workspace > Input"),
         ),
-        KeyBinding::new("cmd-w", CloseConversation, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("cmd-l", FocusComposer, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("cmd-=", ZoomIn, None),
-        KeyBinding::new("cmd-+", ZoomIn, None),
-        KeyBinding::new("cmd--", ZoomOut, None),
-        KeyBinding::new("cmd-0", ResetZoom, None),
-        KeyBinding::new("cmd-/", ShowShortcuts, None),
+        KeyBinding::new(primary!("w"), CloseConversation, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new(primary!("l"), FocusComposer, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new(ZOOM_IN_KEY, ZoomIn, None),
+        KeyBinding::new(primary!("+"), ZoomIn, None),
+        KeyBinding::new(ZOOM_OUT_KEY, ZoomOut, None),
+        KeyBinding::new(RESET_ZOOM_KEY, ResetZoom, None),
+        KeyBinding::new(primary!("/"), ShowShortcuts, None),
     ]);
 
     cx.on_action(|_: &Quit, cx| cx.quit());
