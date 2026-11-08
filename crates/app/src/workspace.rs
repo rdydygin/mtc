@@ -23,7 +23,8 @@ use session::{Session, SessionEvent, TimelineKind};
 use crate::{
     actions::{
         CloseConversation, Dismiss, FocusComposer, NextChannel, NextUnreadChannel, PreviousChannel,
-        PreviousUnreadChannel, QuickSwitch, ShowShortcuts, ToggleFavorite, WORKSPACE_CONTEXT,
+        PreviousUnreadChannel, QuickSwitch, RESET_ZOOM_KEY, ShowShortcuts, ToggleFavorite,
+        WORKSPACE_CONTEXT, ZOOM_IN_KEY, ZOOM_OUT_KEY, shortcut_label,
     },
     extensions, persist,
     sidebar::{SidebarEvent, SidebarView, sections},
@@ -388,12 +389,13 @@ impl Workspace {
                 ("Close thread or mark channel read", Box::new(Dismiss)),
             ];
             let theme = cx.theme();
+            let zoom = [ZOOM_IN_KEY, ZOOM_OUT_KEY, RESET_ZOOM_KEY].map(shortcut_label);
             let fixed = [
-                ("Send", "Enter"),
-                ("New line", "Shift-Enter"),
-                ("Edit your last message", "Up"),
-                ("Complete a slash command", "Tab"),
-                ("Zoom in, out, actual size", "⌘= ⌘- ⌘0"),
+                ("Send", "Enter".to_string()),
+                ("New line", "Shift-Enter".to_string()),
+                ("Edit your last message", "Up".to_string()),
+                ("Complete a slash command", "Tab".to_string()),
+                ("Zoom in, out, actual size", zoom.join(" ")),
             ];
             // Dialog accepts pixels and clamps this rem-derived width to the viewport.
             dialog

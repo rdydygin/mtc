@@ -23,8 +23,8 @@ use session::{ChannelEntry, Connection, Session};
 
 use crate::{
     actions::{
-        QuickSwitch, ShowShortcuts, SignOut, UseDarkAppearance, UseLightAppearance,
-        UseSystemAppearance,
+        QUICK_SWITCH_KEY, QuickSwitch, ShowShortcuts, SignOut, UseDarkAppearance,
+        UseLightAppearance, UseSystemAppearance, shortcut_label,
     },
     http::avatar_url,
     persist::{self, Appearance},
@@ -424,7 +424,7 @@ impl SidebarView {
                                     .rounded(cx.theme().radius)
                                     .border_1()
                                     .border_color(cx.theme().border)
-                                    .child("⌘K"),
+                                    .child(shortcut_label(QUICK_SWITCH_KEY)),
                             ),
                     )
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(QuickSwitch), cx)),

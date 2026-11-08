@@ -30,6 +30,12 @@ script/bundle-macos --install   # builds mtc.app into ~/Applications and registe
 open ~/Applications/mtc.app
 ```
 
+On Linux and Windows mtc registers the links itself each time it starts, pointing them
+at the executable you ran. On Linux that's a hidden `mtc-sso-callback.desktop` entry in
+`~/.local/share/applications`, set as the handler with `xdg-mime`. On Windows it's a
+per-user key under `HKEY_CURRENT_USER\Software\Classes`. When the browser opens a link,
+the new mtc process passes it to the window that's already running and exits.
+
 If the browser can't hand control back, copy the address of the page it ends on
 (`…/login/desktop?client_token=…&server_token=…`) and paste it into mtc. On older
 servers, copy the "click here" link on the final page (`mmauth://callback?…`) instead. Servers
@@ -37,6 +43,8 @@ without a license hide some providers from their public settings;
 `MTC_SSO_PROVIDERS=gitlab,saml` shows them anyway.
 
 ## Using it
+
+On Linux and Windows, use Ctrl where the table says ⌘, Alt for ⌥, and Shift for ⇧.
 
 | Shortcut | Action |
 | --- | --- |
@@ -109,7 +117,7 @@ Dependencies point downward. The app depends on `gpui-kit` alone for UI.
 Posts send optimistically, with Retry or Discard if a send fails. Drafts are kept per
 conversation, and a "New messages" divider marks where you left off. You also get
 typing indicators, presence dots, and mention badges. Native notifications cover
-mentions and DMs when the conversation isn't in view (the app must run as a `.app`
+mentions and DMs when the conversation isn't in view (on macOS the app must run as a `.app`
 bundle for these). The app restores your session, team, last channel, zoom, appearance,
 and sidebar width on launch, and follows the system light/dark setting.
 
@@ -128,8 +136,11 @@ notifications) is itself registered as the `Core` extension.
 
 ## Notes
 
-- The session token is stored in `~/Library/Application Support/mtc/state.json` with
-  owner-only permissions. Moving it to the Keychain is a natural next step.
+- The session token is stored in `state.json` in the platform config directory
+  (`~/Library/Application Support/mtc` on macOS, `~/.config/mtc` on Linux,
+  `%APPDATA%\mtc` on Windows). On macOS and Linux the file is owner-only; on Windows
+  it relies on your profile folder's permissions. Moving it to the system keychain is a
+  natural next step.
 - Not implemented yet: message search, @mention autocomplete, multiple
   servers.
 

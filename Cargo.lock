@@ -4477,6 +4477,7 @@ dependencies = [
  "dirs 6.0.0",
  "env_logger",
  "futures",
+ "getrandom 0.3.4",
  "gpui-kit",
  "log",
  "mattermost",
@@ -4484,6 +4485,7 @@ dependencies = [
  "serde_json",
  "session",
  "url",
+ "windows-registry 0.6.1",
 ]
 
 [[package]]

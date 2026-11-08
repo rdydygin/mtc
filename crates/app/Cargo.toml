@@ -15,6 +15,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 dirs = "6"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 futures.workspace = true
+getrandom = "0.3"
 gpui-kit = { workspace = true, features = ["default", "syntect"] }
 log.workspace = true
 mattermost.workspace = true
@@ -22,6 +23,9 @@ serde.workspace = true
 serde_json.workspace = true
 session.workspace = true
 url.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.6"
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
