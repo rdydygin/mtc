@@ -8,6 +8,8 @@ mod client;
 mod events;
 pub mod runtime;
 pub mod sso;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 pub mod types;
 
 pub use client::{ApiError, Client, FetchedResource, normalize_server_url};

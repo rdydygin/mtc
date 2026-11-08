@@ -3,7 +3,7 @@
 //! Recently opened channel views stay alive, so switching back is instant
 //! and keeps scroll position, parsed Markdown, and the unsent draft.
 
-use std::{collections::HashMap, ops::Range, rc::Rc};
+use std::{collections::HashMap, ops::Range, rc::Rc, sync::Arc};
 
 use gpui_kit::base::{ResizeHandleContext, ResizeHandleRenderer, ResizeHandleState};
 use gpui_kit::component::{
@@ -15,7 +15,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     Action, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
     Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use mattermost::{ChannelId, Client, PostId, TeamId, User};
 use session::{Session, SessionEvent, TimelineKind};
@@ -28,7 +28,7 @@ use crate::{
     },
     extensions, persist,
     sidebar::{SidebarEvent, SidebarView, sections},
-    switcher,
+    skeleton, switcher,
     timeline_view::{TimelineView, TimelineViewEvent},
 };
 
@@ -88,6 +88,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let session = cx.new(|cx| Session::new(client, me, team, cx));
+        // The conversation open last time reopens once the channel list
+        // confirms it still exists. Fetch its posts now, alongside that
+        // list, so they are there when it does.
+        let last_channel = persist::read_with(|state| state.last_channel.clone());
+        if let Some(id) = &last_channel {
+            session.update(cx, |s, cx| {
+                s.timeline(TimelineKind::Channel(ChannelId::from(id.as_str())), cx);
+            });
+        }
         let sidebar = cx.new(|cx| SidebarView::new(session.clone(), cx));
         let subscriptions = vec![
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
@@ -137,6 +146,11 @@ impl Workspace {
         self.session.read(cx).client().clone()
     }
 
+    /// Confirm a restored session with the server; see [`Session::refresh_me`].
+    pub fn refresh_me(&mut self, cx: &mut Context<Self>) -> Task<anyhow::Result<Arc<User>>> {
+        self.session.update(cx, |s, cx| s.refresh_me(cx))
+    }
+
     pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, cx| s.set_window_active(active, cx));
@@ -161,18 +175,24 @@ impl Workspace {
         if still_exists {
             return;
         }
-        let saved = persist::load();
-        let initial = saved
-            .last_channel
+        let initial = persist::read_with(|state| state.last_channel.clone())
             .map(ChannelId::from)
             .filter(|id| session_ref.channel(id).is_some());
         if let Some(team) = session_ref.team() {
             let team = team.id.to_string();
-            persist::update(|state| {
-                if let Some(saved) = state.session.as_mut() {
-                    saved.team_id = Some(team);
-                }
+            let changed = persist::read_with(|state| {
+                state
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.team_id.as_deref() != Some(team.as_str()))
             });
+            if changed {
+                persist::update(|state| {
+                    if let Some(saved) = state.session.as_mut() {
+                        saved.team_id = Some(team);
+                    }
+                });
+            }
         }
         if let Some(id) = initial {
             self.open_channel(&id, window, cx);
@@ -489,11 +509,11 @@ impl Render for Workspace {
         let rem = window.rem_size();
         let viewport = window.viewport_size().width;
         let channel_min = rem * CHANNEL_MIN_WIDTH;
-        let saved = persist::load();
-        let preferred_sidebar = saved
-            .sidebar_width_rem
+        let (sidebar_width_rem, sidebar_width_px) =
+            persist::read_with(|state| (state.sidebar_width_rem, state.sidebar_width));
+        let preferred_sidebar = sidebar_width_rem
             .map(|width| rem * width)
-            .or(saved.sidebar_width.map(px))
+            .or(sidebar_width_px.map(px))
             .unwrap_or(rem * SIDEBAR_WIDTH)
             .clamp(rem * SIDEBAR_RANGE.start, rem * SIDEBAR_RANGE.end);
         // What the window leaves the sidebar beside the channel. Below the
@@ -642,6 +662,13 @@ impl Render for Workspace {
                                     .size_range(channel_min..Pixels::MAX)
                                     .child(panel(match content {
                                         Some(view) => view.into_any_element(),
+                                        // A conversation is about to reopen:
+                                        // show its shape, not the empty state.
+                                        None if !self.session.read(cx).is_loaded()
+                                            && persist::read_with(|s| s.last_channel.is_some()) =>
+                                        {
+                                            skeleton::conversation(cx).into_any_element()
+                                        }
                                         None => self.empty.clone().into_any_element(),
                                     })),
                             )

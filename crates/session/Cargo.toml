@@ -16,3 +16,4 @@ serde_json.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, default-features = false, features = ["test-support"] }
+mattermost = { workspace = true, features = ["test-support"] }

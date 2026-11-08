@@ -94,6 +94,22 @@ Dependencies point downward. The app depends on `gpui-kit` alone for UI.
 
 - **No I/O on the UI thread.** The client runs requests, JSON decoding, and the
   WebSocket on a private tokio runtime. Its futures can be awaited from GPUI's executor.
+  Saved state is read once and written by a background thread, so neither rendering
+  nor switching channels waits on the disk.
+- **Startup in one round trip.** A restored session opens the window from the profile
+  saved last time and sends every startup request at once: the remembered team's
+  channels, the last conversation's posts, favorites, emoji, and a check of the token.
+  (They used to wait on one another: profile, then teams, then channels, then posts.)
+  Profiles and presence for a page of authors arrive together, too.
+- **Compressed responses.** Requests accept gzip, Brotli, zstd, and deflate. Mattermost
+  compresses its JSON about fifteenfold (a team's 80-channel list: 70 KB → 4.6 KB).
+- **Built for slow links.** Timeouts measure silence, not size, so a large download
+  on a slow connection finishes while a dead connection fails within 30 seconds.
+  Startup loads that fail for reasons that may pass (a timeout, a 5xx) are retried
+  with backoff, and again once the socket reconnects.
+- **Skeletons while loading.** The window, sidebar, and conversation show their shape
+  while their content is on the way, with the same lanes as the real rows, so
+  nothing moves when it arrives.
 - **Virtualized timelines.** Posts render through `MessageScroller`. `Timeline` emits
   splice events (`Spliced { old, new_count }`, `Updated(ix)`), so a new post or an edit
   measures one row, not the whole list.
@@ -161,6 +177,31 @@ to a GitHub release.
 
 To run a throwaway server locally:
 `docker run --platform linux/amd64 -d --name mtc-mattermost -p 8065:8065 mattermost/mattermost-preview`.
+
+### Testing on a slow network
+
+`script/slow-network` sits between mtc and a server and adds latency and a bandwidth
+cap to everything that passes, WebSocket included. Sign in to `http://localhost:8066`
+instead of the server's address:
+
+```sh
+script/slow-network --upstream localhost:8065 --profile slow-3g --log   # 400 ms, 400 kbit/s
+script/slow-network --upstream localhost:8065 --rtt 800 --kbps 120      # your own numbers
+```
+
+`--log` prints each request as it passes, so the order and overlap of startup requests
+is visible. The automated tests do the same in-process: `mattermost::testing::SlowServer`
+(feature `test-support`) is a stand-in server with latency and bandwidth, used to check
+that startup takes one round trip, that slow downloads finish and stalled ones fail,
+and that startup survives failed requests.
+
+Measured against a real server with an 80-channel team, from the first request until
+the last conversation's messages are on screen:
+
+| Link | Before | After |
+| --- | --- | --- |
+| Slow 3G: 400 ms, 400 kbit/s | 3.8 s | 0.5 s |
+| EDGE: 800 ms, 120 kbit/s | 11.5 s | 1.0 s |
 
 ## License
 

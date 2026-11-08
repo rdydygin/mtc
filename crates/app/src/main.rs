@@ -19,6 +19,7 @@ mod palette;
 mod persist;
 mod post_row;
 mod sidebar;
+mod skeleton;
 mod sso;
 mod status;
 mod switcher;
@@ -69,6 +70,12 @@ fn main() {
         actions::init(cx);
         extensions::init(cx);
         sso::register_callback_schemes(cx);
+        // State is saved in the background; finish before the process ends.
+        cx.on_app_quit(|_| {
+            persist::flush();
+            async {}
+        })
+        .detach();
         cx.spawn(async move |cx| {
             use futures::StreamExt as _;
             while let Some(urls) = urls_rx.next().await {

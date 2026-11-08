@@ -353,6 +353,7 @@ impl SidebarView {
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let session = self.session.read(cx);
+        let teams_pending = !session.teams_loaded();
         let team_name: SharedString = session
             .team()
             .map(|t| t.display_name.clone())
@@ -378,7 +379,13 @@ impl SidebarView {
                 h_flex()
                     .w_full()
                     .gap_2()
-                    .child(div().flex_1().min_w_0().truncate().child(team_name))
+                    .map(|this| {
+                        if teams_pending {
+                            this.child(div().flex_1().child(crate::skeleton::team_name(cx)))
+                        } else {
+                            this.child(div().flex_1().min_w_0().truncate().child(team_name))
+                        }
+                    })
                     .when(has_choice, |this| {
                         this.child(Icon::new(IconName::ChevronsUpDown).small())
                     }),
@@ -779,6 +786,9 @@ impl Render for SidebarView {
             .filter_map(|id| self.channel_item(id, cx))
             .collect();
         let has_favorites = !favorites.is_empty();
+        // Until the channel list arrives, each section shows rows in the
+        // shape of the conversations about to fill it.
+        let loading = !self.session.read(cx).is_loaded();
         let theme = cx.theme().clone();
         // The workspace paints the backdrop; the sidebar is one of its
         // inset panels.
@@ -839,7 +849,11 @@ impl Render for SidebarView {
                                     },
                                 )),
                             )
-                            .when(!self.channels_collapsed, |this| this.children(channels))
+                            .when(!self.channels_collapsed, |this| {
+                                this.children(channels).when(loading, |this| {
+                                    this.child(crate::skeleton::conversation_rows(6, 0, cx))
+                                })
+                            })
                             .child(
                                 Self::section_header(
                                     "direct-section",
@@ -856,7 +870,11 @@ impl Render for SidebarView {
                                     },
                                 )),
                             )
-                            .when(!self.direct_collapsed, |this| this.children(direct)),
+                            .when(!self.direct_collapsed, |this| {
+                                this.children(direct).when(loading, |this| {
+                                    this.child(crate::skeleton::conversation_rows(4, 6, cx))
+                                })
+                            }),
                     )
                     .pb_2(),
             )

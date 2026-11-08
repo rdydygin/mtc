@@ -709,13 +709,9 @@ impl TimelineView {
         let timeline = self.timeline.read(cx);
         let is_empty = timeline.entries().is_empty();
         match timeline.state() {
-            LoadState::NotLoaded | LoadState::Loading if is_empty => div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(Spinner::new())
-                .into_any_element(),
+            LoadState::NotLoaded | LoadState::Loading if is_empty => {
+                crate::skeleton::posts(cx).into_any_element()
+            }
             LoadState::Failed(error) if is_empty => v_flex()
                 .flex_1()
                 .items_center()
