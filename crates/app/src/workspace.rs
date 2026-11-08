@@ -30,6 +30,7 @@ use crate::{
     sidebar::{SidebarEvent, SidebarView, sections},
     skeleton, switcher,
     timeline_view::{TimelineView, TimelineViewEvent},
+    update,
 };
 
 /// Channel views kept alive for instant switching.
@@ -111,6 +112,8 @@ impl Workspace {
                 extensions::dispatch_session_event(event, session, window, cx);
             }),
             cx.observe_in(&session, window, Self::on_session_changed),
+            // The title bar offers a restart once an update is installed.
+            cx.observe(&update::updater(cx), |_, _, cx| cx.notify()),
             // A focused control can leave the tree: a row scrolled out of the
             // virtual list, or the channel replaced by its thread in a narrow
             // window. Typing should still land in the visible conversation.
@@ -449,14 +452,16 @@ impl Workspace {
             .and_then(|id| session.channel(id))
             .map(|e| session.channel_label(e, cx))
             .unwrap_or_else(|| "Conversations".into());
-        TitleBar::new().child(
-            h_flex()
-                .flex_1()
-                .justify_center()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child(format!("mtc  /  {title}")),
-        )
+        TitleBar::new()
+            .child(
+                h_flex()
+                    .flex_1()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("mtc  /  {title}")),
+            )
+            .children(update::title_bar_button(cx).map(|button| div().pr_2().child(button)))
     }
 }
 

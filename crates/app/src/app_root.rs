@@ -4,7 +4,7 @@
 use gpui_kit::component::{ActiveTheme as _, TitleBar, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, Window, prelude::FluentBuilder as _,
+    Render, SharedString, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _,
 };
 use mattermost::{ApiError, Client, TeamId, User};
 
@@ -14,7 +14,7 @@ use crate::{
     http::ServerHttpClient,
     login::{LoginEvent, LoginView},
     persist::{self, SavedSession},
-    skeleton,
+    skeleton, update,
     workspace::{Workspace, WorkspaceEvent},
 };
 
@@ -36,6 +36,10 @@ impl AppRoot {
             cx.observe_window_appearance(window, |_, window, cx| {
                 appearance::system_appearance_changed(window, cx);
             }),
+            cx.subscribe_in(&update::updater(cx), window, |_, _, event, window, cx| {
+                update::notify(event, window, cx);
+            }),
+            cx.observe(&update::updater(cx), |_, _, cx| cx.notify()),
             cx.observe_window_activation(window, |this, window, cx| {
                 if let Screen::SignedIn(workspace) = &this.screen {
                     let active = window.is_window_active();
@@ -194,7 +198,13 @@ impl Render for AppRoot {
                 // The shape of the workspace about to open, so nothing
                 // jumps when it does.
                 Screen::Restoring => this.child(skeleton::workspace(cx)),
-                Screen::SignedOut(login) => this.child(TitleBar::new()).child(login.clone()),
+                Screen::SignedOut(login) => this
+                    .child(
+                        TitleBar::new()
+                            .child(div().flex_1())
+                            .children(update::title_bar_button(cx).map(|b| div().pr_2().child(b))),
+                    )
+                    .child(login.clone()),
                 Screen::SignedIn(workspace) => this.child(workspace.clone()),
             })
     }

@@ -66,6 +66,32 @@ jobs:
           shasum -a 256 "$ZIP" > "$ZIP.sha256"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
 
+      - name: Write the update feed
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          # Installed copies read releases/latest/download/latest.json to find
+          # and verify updates (crates/app/src/update/manifest.rs).
+          python3 - <<'PY'
+          import json, os
+          tag, zip_name, repo = os.environ["TAG"], os.environ["ZIP"], os.environ["GITHUB_REPOSITORY"]
+          sha256 = open(zip_name + ".sha256").read().split()[0]
+          feed = {
+              "version": tag.removeprefix("v"),
+              "page": f"https://github.com/{repo}/releases/tag/{tag}",
+              "downloads": {
+                  "macos-universal": {
+                      "url": f"https://github.com/{repo}/releases/download/{tag}/{zip_name}",
+                      "sha256": sha256,
+                  },
+              },
+          }
+          with open("latest.json", "w") as f:
+              json.dump(feed, f, indent=2)
+          PY
+          cat latest.json
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -74,8 +100,8 @@ jobs:
         run: |
           # --target creates the tag at this commit when the run was started by hand;
           # for a pushed tag it already exists and is used as is.
-          gh release create "$TAG" "$ZIP" "$ZIP.sha256" \
+          gh release create "$TAG" "$ZIP" "$ZIP.sha256" latest.json \
             --target "$GITHUB_SHA" \
             --title "mtc $TAG" \
             --generate-notes \
-            --notes "Runs on Apple Silicon and Intel Macs (macOS 12 or later). The app is ad-hoc signed, not notarized. After unzipping, run \`xattr -dr com.apple.quarantine mtc.app\` or right-click → Open the first time."
+            --notes "Runs on Apple Silicon and Intel Macs (macOS 12 or later). The app is ad-hoc signed, not notarized. After unzipping, move mtc.app to Applications, then run \`xattr -dr com.apple.quarantine /Applications/mtc.app\` or right-click → Open the first time. Later versions install themselves."
