@@ -17,6 +17,7 @@ use mattermost::{
 
 use crate::{
     CustomEmojis, Delivery, Directory, Timeline, TimelineKind,
+    retry::{is_transient, retry},
     timeline::{LoadState, now_millis},
 };
 
@@ -114,6 +115,7 @@ pub struct Session {
     team: Option<TeamId>,
     channels: HashMap<ChannelId, ChannelEntry>,
     channels_loaded: bool,
+    teams_loaded: bool,
     /// Favorite channels in every team; the server keeps them as
     /// preferences, synced across the user's devices.
     favorites: HashSet<ChannelId>,
@@ -130,6 +132,8 @@ pub struct Session {
     last_typing_sent: HashMap<(ChannelId, PostId), Instant>,
     connection: Connection,
     has_connected: bool,
+    /// A load gave up while the network was down; repeat it on reconnect.
+    load_failed: bool,
     stream: EventStream,
     _event_task: Task<()>,
     _channels_task: Option<Task<()>>,
@@ -167,6 +171,7 @@ impl Session {
             team: preferred_team,
             channels: HashMap::new(),
             channels_loaded: false,
+            teams_loaded: false,
             favorites: HashSet::new(),
             group_members: HashMap::new(),
             custom_emoji: CustomEmojis::default(),
@@ -178,6 +183,7 @@ impl Session {
             last_typing_sent: HashMap::new(),
             connection: Connection::Connecting,
             has_connected: false,
+            load_failed: false,
             stream,
             _event_task,
             _channels_task: None,
@@ -225,8 +231,15 @@ impl Session {
         self.channels.get(id)
     }
 
+    /// Whether the current team's channels have arrived.
     pub fn is_loaded(&self) -> bool {
         self.channels_loaded
+    }
+
+    /// Whether the team list has arrived. At startup the remembered team's
+    /// channels can arrive first.
+    pub fn teams_loaded(&self) -> bool {
+        self.teams_loaded
     }
 
     pub fn active_channel(&self) -> Option<&ChannelId> {
@@ -272,11 +285,20 @@ impl Session {
     // ----- Loading ---------------------------------------------------------
 
     fn load_teams(&mut self, cx: &mut Context<Self>) {
+        // The remembered team is almost always still ours, so its channels
+        // load alongside the team list rather than after it: the sidebar
+        // fills one round trip sooner. The list corrects a stale guess.
+        let guess = self.team.clone();
+        if guess.is_some() {
+            self.load_channels(cx);
+        }
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
-            let result = client.my_teams().await;
+            let executor = cx.background_executor().clone();
+            let result = retry(&executor, || client.my_teams()).await;
             let _ = this.update(cx, |this, cx| match result {
                 Ok(teams) => {
+                    this.teams_loaded = true;
                     this.teams = teams.into_iter().filter(|t| t.delete_at == 0).collect();
                     this.teams.sort_by_key(|t| t.display_name.to_lowercase());
                     let keep = this
@@ -286,7 +308,11 @@ impl Session {
                     if !keep {
                         this.team = this.teams.first().map(|t| t.id.clone());
                     }
-                    this.load_channels(cx);
+                    if this.team != guess || guess.is_none() {
+                        this.channels.clear();
+                        this.channels_loaded = false;
+                        this.load_channels(cx);
+                    }
                     cx.notify();
                 }
                 Err(err) => this.handle_error(err, cx),
@@ -315,8 +341,11 @@ impl Session {
         };
         let client = self.client.clone();
         self._channels_task = Some(cx.spawn(async move |this, cx| {
-            let (channels, members) =
-                futures::join!(client.my_channels(&team), client.my_channel_members(&team));
+            let executor = cx.background_executor().clone();
+            let (channels, members) = futures::join!(
+                retry(&executor, || client.my_channels(&team)),
+                retry(&executor, || client.my_channel_members(&team))
+            );
             let _ = this.update(cx, |this, cx| match (channels, members) {
                 (Ok(channels), Ok(members)) => {
                     let mut members: HashMap<ChannelId, ChannelMember> = members
@@ -385,7 +414,15 @@ impl Session {
     fn load_favorites(&mut self, cx: &mut Context<Self>) {
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
-            let result = client.my_preferences(FAVORITE_CHANNEL).await;
+            let executor = cx.background_executor().clone();
+            let result = retry(&executor, || client.my_preferences(FAVORITE_CHANNEL)).await;
+            // The server answers 404 for a category the user has never used.
+            let result = match result {
+                Err(err) if err.downcast_ref::<ApiError>() == Some(&ApiError::Status(404)) => {
+                    Ok(Vec::new())
+                }
+                result => result,
+            };
             let _ = this.update(cx, |this, cx| match result {
                 Ok(preferences) => {
                     this.favorites = preferences
@@ -447,7 +484,38 @@ impl Session {
             cx.emit(SessionEvent::SignedOut);
         } else {
             log::warn!("{err:#}");
+            // Only a failure that may pass is worth repeating on reconnect.
+            if is_transient(&err) {
+                self.load_failed = true;
+            }
         }
+    }
+
+    /// Read the signed-in user again. A session restored from disk opens
+    /// with the profile saved last time, so the window doesn't wait on the
+    /// network; this confirms the token still works (signing out if not)
+    /// and picks up changes made elsewhere.
+    pub fn refresh_me(&mut self, cx: &mut Context<Self>) -> Task<Result<Arc<User>>> {
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let result = retry(&executor, || client.me()).await;
+            this.update(cx, |this, cx| match result {
+                Ok(me) => {
+                    let me = Arc::new(me);
+                    this.directory
+                        .update(cx, |d, cx| d.insert([(*me).clone()], cx));
+                    this.me = me.clone();
+                    cx.notify();
+                    Ok(me)
+                }
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    this.handle_error(err, cx);
+                    Err(anyhow::anyhow!(message))
+                }
+            })?
+        })
     }
 
     // ----- Timelines -------------------------------------------------------
@@ -873,9 +941,14 @@ impl Session {
         match event {
             Event::Connected => {
                 self.connection = Connection::Online;
-                if self.has_connected {
-                    // Anything could have happened while we were away.
-                    self.load_channels(cx);
+                // Anything could have happened while we were away, and a
+                // load that gave up while the network was down can now work.
+                if self.has_connected || std::mem::take(&mut self.load_failed) {
+                    if self.teams.is_empty() {
+                        self.load_teams(cx);
+                    } else {
+                        self.load_channels(cx);
+                    }
                     self.load_favorites(cx);
                     for timeline in self.live_timelines() {
                         timeline.update(cx, |t, cx| t.catch_up(cx));
@@ -1104,5 +1177,195 @@ impl Session {
         self.live_timelines()
             .iter()
             .all(|t| matches!(t.read(cx).state(), LoadState::Loaded | LoadState::Failed(_)))
+    }
+}
+
+/// Startup against a server behind a slow link: every response takes one
+/// round trip, and what can overlap must.
+#[cfg(test)]
+mod slow_network_tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    use gpui_kit::{AppContext as _, Entity, TestAppContext};
+    use mattermost::{
+        Client, TeamId, User,
+        testing::{Network, Reply, Request, SlowServer},
+    };
+    use serde_json::json;
+
+    use super::Session;
+    use crate::{LoadState, TimelineKind};
+
+    /// One round trip on a poor mobile or satellite link.
+    const ROUND_TRIP: Duration = Duration::from_millis(400);
+
+    fn route(request: &Request) -> Reply {
+        let path = request.path().split('?').next().unwrap_or_default();
+        match path {
+            "/api/v4/users/me" => Reply::json(json!({ "id": "me", "username": "me" })),
+            "/api/v4/users/me/teams" => {
+                Reply::json(json!([{ "id": "team", "name": "team", "display_name": "Team" }]))
+            }
+            "/api/v4/users/me/teams/team/channels" => Reply::json(json!([
+                { "id": "town", "team_id": "team", "type": "O", "name": "town-square",
+                  "display_name": "Town Square" },
+            ])),
+            "/api/v4/users/me/teams/team/channels/members" => {
+                Reply::json(json!([{ "channel_id": "town", "user_id": "me" }]))
+            }
+            "/api/v4/channels/town/posts" => Reply::json(json!({
+                "order": ["p1"],
+                "posts": { "p1": { "id": "p1", "channel_id": "town", "user_id": "ann",
+                                   "message": "hello", "create_at": 1 } },
+            })),
+            "/api/v4/users/ids" => Reply::json(json!([{ "id": "ann", "username": "ann" }])),
+            "/api/v4/users/status/ids" => {
+                Reply::json(json!([{ "user_id": "ann", "status": "online" }]))
+            }
+            "/api/v4/users/me/preferences/favorite_channel" | "/api/v4/emoji" => {
+                Reply::json(json!([]))
+            }
+            _ => Reply::not_found(),
+        }
+    }
+
+    fn me() -> User {
+        let mut me = User::default();
+        me.id = "me".into();
+        me
+    }
+
+    fn start(server: &SlowServer, cx: &mut TestAppContext) -> Entity<Session> {
+        cx.executor().allow_parking();
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        cx.new(|cx| Session::new(client, me(), Some(TeamId::from("team")), cx))
+    }
+
+    /// Run GPUI's work and let real network I/O happen until `done`, or
+    /// fail after a real-time deadline. GPUI's clock (batching windows,
+    /// retry backoff) moves forward while waiting.
+    fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting");
+            cx.executor().advance_clock(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn arrival(server: &SlowServer, path: &str) -> Duration {
+        server
+            .requests()
+            .iter()
+            .find(|r| r.path().split('?').next() == Some(path))
+            .unwrap_or_else(|| panic!("{path} was never requested"))
+            .at()
+    }
+
+    #[gpui_kit::test]
+    fn the_sidebar_fills_in_one_round_trip(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(ROUND_TRIP), route);
+        let started = Instant::now();
+        let session = start(&server, cx);
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.is_loaded() && s.teams_loaded())
+        });
+        let elapsed = started.elapsed();
+
+        // The remembered team's channels were asked for before the team
+        // list came back, not after it.
+        let teams = arrival(&server, "/api/v4/users/me/teams");
+        let channels = arrival(&server, "/api/v4/users/me/teams/team/channels");
+        assert!(
+            channels < teams + ROUND_TRIP / 2,
+            "{channels:?} vs {teams:?}"
+        );
+        // One round trip and change, where it used to take two.
+        assert!(elapsed < ROUND_TRIP * 3 / 2, "loaded after {elapsed:?}");
+        session.read_with(cx, |s, _| {
+            assert!(s.channel(&"town".into()).is_some());
+            assert_eq!(s.team().map(|t| t.display_name.as_str()), Some("Team"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_last_conversation_loads_alongside_the_sidebar(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(ROUND_TRIP), route);
+        let started = Instant::now();
+        let session = start(&server, cx);
+        // What the workspace does at startup for the conversation open last.
+        let timeline = session.update(cx, |s, cx| {
+            s.timeline(TimelineKind::Channel("town".into()), cx)
+        });
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.is_loaded())
+                && timeline.read_with(cx, |t, _| t.state() == &LoadState::Loaded)
+        });
+        assert!(
+            started.elapsed() < ROUND_TRIP * 3 / 2,
+            "{:?}",
+            started.elapsed()
+        );
+        timeline.read_with(cx, |t, _| assert_eq!(t.entries().len(), 1));
+
+        // Then the authors: their profiles and presence in one round trip.
+        let directory = session.read_with(cx, |s, _| s.directory().clone());
+        wait_until(cx, |cx| {
+            directory.read_with(cx, |d, _| d.user(&"ann".into()).is_some())
+        });
+        let users = arrival(&server, "/api/v4/users/ids");
+        // The first presence request is the user's own, at startup.
+        let statuses = server
+            .requests()
+            .iter()
+            .filter(|r| r.path() == "/api/v4/users/status/ids")
+            .map(|r| r.at())
+            .max()
+            .unwrap();
+        assert!(
+            statuses.abs_diff(users) < ROUND_TRIP / 2,
+            "{users:?} vs {statuses:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn startup_survives_requests_that_fail_once(cx: &mut TestAppContext) {
+        // Every endpoint fails its first request, as on a flaky link.
+        let seen = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let failed = failures.clone();
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), move |request| {
+            let path = request
+                .path()
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if seen.lock().unwrap().insert(path) {
+                failed.fetch_add(1, Ordering::SeqCst);
+                return Reply::json(json!({ "message": "Bad gateway" })).status(502);
+            }
+            route(request)
+        });
+        let session = start(&server, cx);
+        let timeline = session.update(cx, |s, cx| {
+            s.timeline(TimelineKind::Channel("town".into()), cx)
+        });
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.is_loaded())
+                && timeline.read_with(cx, |t, _| t.state() == &LoadState::Loaded)
+        });
+        assert!(failures.load(Ordering::SeqCst) >= 3);
+        session.read_with(cx, |s, _| assert!(s.channel(&"town".into()).is_some()));
     }
 }

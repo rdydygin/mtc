@@ -62,12 +62,47 @@ pub fn normalize_server_url(input: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn http_client() -> Result<reqwest::Client> {
+/// How long a JSON API request may take in total. Generous, because on a
+/// slow link a large channel list can take a while to arrive; a connection
+/// that stops sending entirely is caught sooner by [`Timeouts::read`].
+const API_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long requests may wait. Separate from the client so tests can shrink
+/// them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Timeouts {
+    /// Establishing the TCP and TLS connection. Covers a few round trips on
+    /// a high-latency link.
+    pub connect: Duration,
+    /// Silence between two reads of a response. This is what catches a dead
+    /// connection: a slow download that keeps making progress never trips
+    /// it, however long it takes in total.
+    pub read: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(15),
+            read: Duration::from_secs(30),
+        }
+    }
+}
+
+pub(crate) fn http_client(timeouts: Timeouts) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("mtc/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
+        .connect_timeout(timeouts.connect)
+        // No total timeout here: downloads and uploads are bounded by
+        // progress, not by size. JSON requests add `API_TIMEOUT` themselves.
+        .read_timeout(timeouts.read)
         .pool_idle_timeout(Duration::from_secs(90))
+        // Notice a half-open connection (laptop lid, Wi-Fi change) instead
+        // of waiting on it until the read timeout.
+        .tcp_keepalive(Duration::from_secs(30))
+        // Grow HTTP/2 flow-control windows to the link's bandwidth-delay
+        // product, so a high-latency link isn't capped by the default window.
+        .http2_adaptive_window(true)
         .build()
         .context("failed to build the HTTP client")
 }
@@ -87,10 +122,11 @@ impl Client {
             body["token"] = json!(code.trim());
         }
         runtime::run(async move {
-            let http = http_client()?;
+            let http = http_client(Timeouts::default())?;
             let url = server.join("api/v4/users/login")?;
             let response = http
                 .post(url)
+                .timeout(API_TIMEOUT)
                 .json(&body)
                 .send()
                 .await
@@ -126,9 +162,13 @@ impl Client {
     /// A client for `server` and `token` without contacting the server.
     /// Prefer [`Self::with_token`], which verifies the token.
     pub fn new_unverified(server: &str, token: &str) -> Result<Client> {
+        Self::with_timeouts(server, token, Timeouts::default())
+    }
+
+    pub(crate) fn with_timeouts(server: &str, token: &str, timeouts: Timeouts) -> Result<Client> {
         Ok(Client {
             inner: Arc::new(Inner {
-                http: http_client()?,
+                http: http_client(timeouts)?,
                 server: normalize_server_url(server)?,
                 token: token.trim().to_string(),
             }),
@@ -163,13 +203,14 @@ impl Client {
                 .http
                 .request(method, url)
                 .bearer_auth(&inner.token)
-                .header("X-Requested-With", "XMLHttpRequest");
+                .header("X-Requested-With", "XMLHttpRequest")
+                .timeout(API_TIMEOUT);
             if let Some(body) = body {
                 request = request.json(&body);
             }
             let response = check(request.send().await.map_err(connect_error)?).await?;
             // Decode from bytes so an empty body can stand in for `()`.
-            let bytes = response.bytes().await?;
+            let bytes = response.bytes().await.map_err(connect_error)?;
             let bytes = if bytes.is_empty() {
                 &b"null"[..]
             } else {
@@ -390,8 +431,10 @@ impl Client {
                 .post(inner.server.join("api/v4/files")?)
                 .bearer_auth(&inner.token)
                 .header("X-Requested-With", "XMLHttpRequest")
-                // Large files take longer than ordinary requests.
-                .timeout(Duration::from_secs(600))
+                // Sending the body produces no reads, so the read timeout
+                // can't tell a slow upload from a stuck one. Bound it in
+                // total, generously: large files on slow uplinks take time.
+                .timeout(Duration::from_secs(30 * 60))
                 .multipart(form)
                 .send()
                 .await
@@ -437,7 +480,12 @@ impl Client {
                 .send()
                 .await
                 .map_err(connect_error)?;
-            Ok(check(response).await?.bytes().await?.to_vec())
+            Ok(check(response)
+                .await?
+                .bytes()
+                .await
+                .map_err(connect_error)?
+                .to_vec())
         })
         .await
     }
@@ -461,7 +509,7 @@ impl Client {
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            let body = response.bytes().await?.to_vec();
+            let body = response.bytes().await.map_err(connect_error)?.to_vec();
             Ok(FetchedResource {
                 status,
                 content_type,
@@ -573,6 +621,8 @@ fn connect_error(err: reqwest::Error) -> anyhow::Error {
         anyhow!("The server took too long to respond.")
     } else if err.is_connect() {
         anyhow!("Couldn’t reach the server. Check the address and your connection.")
+    } else if err.is_body() || err.is_decode() {
+        anyhow!("The connection dropped before the server finished answering.")
     } else {
         anyhow!(err)
     }
@@ -642,7 +692,120 @@ impl std::error::Error for ApiError {}
 
 #[cfg(test)]
 mod tests {
+    use std::{io::Write as _, time::Instant};
+
+    use crate::testing::{Network, Reply, SlowServer};
+
     use super::*;
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        futures::executor::block_on(future)
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A channel list as large as a busy team's, which compresses well.
+    fn many_channels() -> serde_json::Value {
+        let channels: Vec<_> = (0..400)
+            .map(|i| {
+                json!({
+                    "id": format!("channel{i:022}"),
+                    "team_id": "team",
+                    "type": "O",
+                    "display_name": format!("Channel number {i}"),
+                    "name": format!("channel-{i}"),
+                    "header": "Discussion about the project and everything related to it",
+                    "purpose": "A place for the team to talk",
+                })
+            })
+            .collect();
+        json!(channels)
+    }
+
+    #[test]
+    fn asks_for_and_decodes_compressed_responses() {
+        let body = many_channels().to_string();
+        let compressed = gzip(body.as_bytes());
+        // Compression is what makes large lists bearable on a slow link.
+        assert!(compressed.len() * 5 < body.len());
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            if request
+                .header("accept-encoding")
+                .is_some_and(|v| v.contains("gzip"))
+            {
+                Reply::bytes(compressed.clone())
+                    .header("Content-Type", "application/json")
+                    .header("Content-Encoding", "gzip")
+            } else {
+                Reply::json(json!({"message": "send Accept-Encoding"})).status(400)
+            }
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let channels = block_on(client.my_channels(&TeamId::from("team"))).unwrap();
+        assert_eq!(channels.len(), 400);
+        let accept = server.requests()[0]
+            .header("accept-encoding")
+            .unwrap_or_default()
+            .to_string();
+        for encoding in ["gzip", "br", "zstd", "deflate"] {
+            assert!(accept.contains(encoding), "Accept-Encoding: {accept}");
+        }
+    }
+
+    #[test]
+    fn slow_downloads_finish_however_long_they_take() {
+        // 6 KB at 4 KB/s takes 1.5 s, five times the read timeout. A total
+        // timeout would cut it off; progress keeps it alive.
+        let file: Vec<u8> = (0..6 * 1024).map(|i| i as u8).collect();
+        let expected = file.clone();
+        let server = SlowServer::start(
+            Network::new(Duration::from_millis(50)).bandwidth(4 * 1024),
+            move |_| Reply::bytes(file.clone()),
+        );
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(5),
+            read: Duration::from_millis(300),
+        };
+        let client = Client::with_timeouts(&server.url(), "token", timeouts).unwrap();
+        let started = Instant::now();
+        let downloaded = block_on(client.download_file("file")).unwrap();
+        assert!(started.elapsed() > Duration::from_secs(1));
+        assert_eq!(downloaded, expected);
+    }
+
+    #[test]
+    fn a_stalled_response_fails_soon_with_a_readable_error() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |_| {
+            Reply::json(many_channels()).stall_after(1024)
+        });
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(5),
+            read: Duration::from_millis(300),
+        };
+        let client = Client::with_timeouts(&server.url(), "token", timeouts).unwrap();
+        let started = Instant::now();
+        let err = block_on(client.my_channels(&TeamId::from("team"))).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(err.to_string(), "The server took too long to respond.");
+    }
+
+    #[test]
+    fn a_silent_server_fails_with_a_readable_error() {
+        let server = SlowServer::start(Network::new(Duration::from_secs(30)), |_| {
+            Reply::json(json!({}))
+        });
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(5),
+            read: Duration::from_millis(300),
+        };
+        let client = Client::with_timeouts(&server.url(), "token", timeouts).unwrap();
+        let err = block_on(client.me()).unwrap_err();
+        assert_eq!(err.to_string(), "The server took too long to respond.");
+    }
 
     #[test]
     fn normalizes_bare_hosts() {

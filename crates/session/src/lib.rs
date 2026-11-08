@@ -11,6 +11,7 @@
 mod directory;
 mod emoji;
 mod prepare;
+mod retry;
 mod session;
 mod timeline;
 

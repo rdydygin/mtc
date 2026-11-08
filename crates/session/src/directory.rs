@@ -88,8 +88,11 @@ impl Directory {
         self.in_flight.extend(ids.iter().cloned());
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
-            let users = client.users_by_ids(ids.clone()).await;
-            let statuses = client.statuses_by_ids(ids.clone()).await;
+            // Independent requests: one round trip, not two.
+            let (users, statuses) = futures::join!(
+                client.users_by_ids(ids.clone()),
+                client.statuses_by_ids(ids.clone())
+            );
             let _ = this.update(cx, |this, cx| {
                 for id in &ids {
                     this.in_flight.remove(id);

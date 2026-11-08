@@ -1,10 +1,10 @@
 //! The window's top-level view: restores a saved session, shows sign-in, or
 //! hosts the workspace.
 
-use gpui_kit::component::{ActiveTheme as _, TitleBar, spinner::Spinner, v_flex};
+use gpui_kit::component::{ActiveTheme as _, TitleBar, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _,
+    Render, SharedString, Styled as _, Subscription, Window, prelude::FluentBuilder as _,
 };
 use mattermost::{ApiError, Client, TeamId, User};
 
@@ -14,6 +14,7 @@ use crate::{
     http::ServerHttpClient,
     login::{LoginEvent, LoginView},
     persist::{self, SavedSession},
+    skeleton,
     workspace::{Workspace, WorkspaceEvent},
 };
 
@@ -55,6 +56,31 @@ impl AppRoot {
     }
 
     fn restore(&mut self, saved: SavedSession, window: &mut Window, cx: &mut Context<Self>) {
+        // With the profile saved last time, the window opens at once and
+        // every startup request goes out together. The token is checked by
+        // those same requests: if the server rejects it, the session signs
+        // out and the sign-in screen says why.
+        if let Some(me) = saved.user.clone()
+            && let Ok(client) = Client::new_unverified(&saved.server, &saved.token)
+        {
+            let team = saved.team_id.map(TeamId::from);
+            self.sign_in(client, me, team, window, cx);
+            if let Screen::SignedIn(workspace) = &self.screen {
+                let refresh = workspace.update(cx, |w, cx| w.refresh_me(cx));
+                cx.spawn(async move |_, _| {
+                    if let Ok(me) = refresh.await {
+                        persist::update(|state| {
+                            if let Some(session) = state.session.as_mut() {
+                                session.user = Some((*me).clone());
+                            }
+                        });
+                    }
+                })
+                .detach();
+            }
+            return;
+        }
+        // Sessions saved by older versions have no profile: wait for it.
         self.screen = Screen::Restoring;
         cx.spawn_in(window, async move |this, cx| {
             let result = Client::with_token(&saved.server, &saved.token).await;
@@ -119,6 +145,7 @@ impl AppRoot {
                 server: server.clone(),
                 token: client.token().to_string(),
                 team_id,
+                user: Some(me.clone()),
             });
             state.last_server = server.clone();
         });
@@ -164,14 +191,9 @@ impl Render for AppRoot {
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::sign_out))
             .map(|this| match &self.screen {
-                Screen::Restoring => this.child(TitleBar::new()).child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(Spinner::new()),
-                ),
+                // The shape of the workspace about to open, so nothing
+                // jumps when it does.
+                Screen::Restoring => this.child(skeleton::workspace(cx)),
                 Screen::SignedOut(login) => this.child(TitleBar::new()).child(login.clone()),
                 Screen::SignedIn(workspace) => this.child(workspace.clone()),
             })

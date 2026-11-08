@@ -3,7 +3,7 @@ use std::{ops::Range, sync::Arc, time::SystemTime};
 use gpui_kit::{Context, Entity, EventEmitter, SharedString, Task};
 use mattermost::{ChannelId, Client, Millis, Post, PostId, PostList, Reaction, UserId};
 
-use crate::{CustomEmojis, Directory, PreparedMessage};
+use crate::{CustomEmojis, Directory, PreparedMessage, retry::retry};
 
 /// Posts requested per page. Large enough to fill a tall window, small
 /// enough to decode in well under a frame.
@@ -32,6 +32,51 @@ impl TimelineKind {
             Self::Thread { root, .. } => Some(root),
         }
     }
+
+    /// Whether `post` belongs in this conversation.
+    fn accepts(&self, post: &Post) -> bool {
+        match self {
+            Self::Channel(channel) => &post.channel_id == channel && !post.is_reply(),
+            Self::Thread { root, .. } => &post.id == root || &post.root_id == root,
+        }
+    }
+}
+
+/// Posts of one page, filtered, ordered, and prepared for display.
+struct Prepared {
+    entries: Vec<Entry>,
+    /// The custom emoji the entries were prepared with.
+    custom_emoji: CustomEmojis,
+}
+
+/// Order, filter, and prepare a page of posts on a background thread, so a
+/// page of long messages never stalls a frame. Returns how many posts the
+/// server sent, before filtering, for paging decisions.
+async fn prepare_off_thread(
+    executor: &gpui_kit::BackgroundExecutor,
+    list: PostList,
+    kind: &TimelineKind,
+    custom_emoji: CustomEmojis,
+) -> (usize, Prepared) {
+    let kind = kind.clone();
+    executor
+        .spawn(async move {
+            let posts = list.into_chronological();
+            let fetched = posts.len();
+            let entries = posts
+                .into_iter()
+                .filter(|p| kind.accepts(p))
+                .map(|p| Entry::new(p, Delivery::Sent, &custom_emoji))
+                .collect();
+            (
+                fetched,
+                Prepared {
+                    entries,
+                    custom_emoji,
+                },
+            )
+        })
+        .await
 }
 
 /// Whether the server has accepted a post.
@@ -219,13 +264,22 @@ impl Timeline {
         cx.notify();
         let client = self.client.clone();
         let kind = self.kind.clone();
+        let custom = self.custom_emoji.clone();
         self._load_task = Some(cx.spawn(async move |this, cx| {
-            let result = match &kind {
-                TimelineKind::Channel(channel) => client.latest_posts(channel, PAGE_SIZE).await,
-                TimelineKind::Thread { root, .. } => client.thread(root).await,
+            let executor = cx.background_executor().clone();
+            let result = retry(&executor, || async {
+                match &kind {
+                    TimelineKind::Channel(channel) => client.latest_posts(channel, PAGE_SIZE).await,
+                    TimelineKind::Thread { root, .. } => client.thread(root).await,
+                }
+            })
+            .await;
+            let result = match result {
+                Ok(list) => Ok(prepare_off_thread(&executor, list, &kind, custom).await),
+                Err(err) => Err(err),
             };
             let _ = this.update(cx, |this, cx| match result {
-                Ok(list) => this.replace_all(list, cx),
+                Ok((count, entries)) => this.replace_all(count, entries, cx),
                 Err(err) => {
                     // Keep showing what we had; surface the failure.
                     this.state = LoadState::Failed(format!("{err:#}").into());
@@ -235,25 +289,33 @@ impl Timeline {
         }));
     }
 
-    fn replace_all(&mut self, list: PostList, cx: &mut Context<Self>) {
-        let posts = list.into_chronological();
-        self.has_older = matches!(self.kind, TimelineKind::Channel(_)) && posts.len() >= PAGE_SIZE;
+    /// `fetched` is how many posts the server returned, before filtering.
+    fn replace_all(&mut self, fetched: usize, prepared: Prepared, cx: &mut Context<Self>) {
+        self.has_older = matches!(self.kind, TimelineKind::Channel(_)) && fetched >= PAGE_SIZE;
         // Optimistic posts survive a reload until the server answers.
         let pending: Vec<Entry> = self
             .entries
             .drain(..)
             .filter(|e| e.delivery != Delivery::Sent)
             .collect();
-        self.entries = posts
-            .into_iter()
-            .filter(|p| self.accepts(p))
-            .map(|p| Entry::new(p, Delivery::Sent, &self.custom_emoji))
-            .collect();
+        self.entries = self.adopt(prepared);
         self.entries.extend(pending);
         self.state = LoadState::Loaded;
         self.request_authors(0..self.entries.len(), cx);
         cx.emit(TimelineEvent::Reset);
         cx.notify();
+    }
+
+    /// Entries prepared off the UI thread, brought up to date with custom
+    /// emoji that arrived while they were being prepared.
+    fn adopt(&self, prepared: Prepared) -> Vec<Entry> {
+        let mut entries = prepared.entries;
+        if prepared.custom_emoji != self.custom_emoji {
+            for entry in &mut entries {
+                entry.reprepare(&self.custom_emoji);
+            }
+        }
+        entries
     }
 
     /// Fetch the page before the oldest loaded post.
@@ -272,25 +334,30 @@ impl Timeline {
         let client = self.client.clone();
         let channel = channel.clone();
         let before = oldest.id().clone();
+        let kind = self.kind.clone();
+        let custom = self.custom_emoji.clone();
         cx.spawn(async move |this, cx| {
-            let result = client.posts_before(&channel, &before, PAGE_SIZE).await;
+            let executor = cx.background_executor().clone();
+            let result = retry(&executor, || {
+                client.posts_before(&channel, &before, PAGE_SIZE)
+            })
+            .await;
+            let result = match result {
+                Ok(list) => Ok(prepare_off_thread(&executor, list, &kind, custom).await.1),
+                Err(err) => Err(err),
+            };
             let _ = this.update(cx, |this, cx| {
                 this.loading_older = false;
                 match result {
-                    Ok(list) => {
-                        let posts: Vec<Post> = list
-                            .into_chronological()
+                    Ok(prepared) => {
+                        let posts: Vec<Entry> = this
+                            .adopt(prepared)
                             .into_iter()
-                            .filter(|p| this.accepts(p) && this.position(&p.id).is_none())
+                            .filter(|e| this.position(e.id()).is_none())
                             .collect();
                         this.has_older = posts.len() >= PAGE_SIZE / 2;
                         let count = posts.len();
-                        this.entries.splice(
-                            0..0,
-                            posts
-                                .into_iter()
-                                .map(|p| Entry::new(p, Delivery::Sent, &this.custom_emoji)),
-                        );
+                        this.entries.splice(0..0, posts);
                         this.request_authors(0..count, cx);
                         cx.emit(TimelineEvent::Spliced {
                             old: 0..0,
@@ -308,8 +375,11 @@ impl Timeline {
     /// Catch up after a reconnect: apply everything that changed while the
     /// socket was down.
     pub fn catch_up(&mut self, cx: &mut Context<Self>) {
-        if self.state != LoadState::Loaded {
-            return;
+        match self.state {
+            LoadState::Loaded => {}
+            // The first load gave up while the network was down.
+            LoadState::Failed(_) => return self.reload(cx),
+            LoadState::NotLoaded | LoadState::Loading => return,
         }
         let TimelineKind::Channel(channel) = &self.kind else {
             // A thread is small; reloading it is simpler than merging.
@@ -340,10 +410,7 @@ impl Timeline {
     }
 
     fn accepts(&self, post: &Post) -> bool {
-        match &self.kind {
-            TimelineKind::Channel(channel) => &post.channel_id == channel && !post.is_reply(),
-            TimelineKind::Thread { root, .. } => &post.id == root || &post.root_id == root,
-        }
+        self.kind.accepts(post)
     }
 
     /// Insert a new post or replace a known one, keeping chronological order.

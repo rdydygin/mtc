@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Put a slow network between mtc and a Mattermost server.
+
+    script/slow-network --upstream localhost:8065 --listen 8066 --rtt 400 --kbps 256
+
+Then sign in to http://localhost:8066 instead of the server's own address.
+Every byte in both directions (REST and WebSocket) waits half the round trip
+on its way through, and bytes towards mtc are paced to the given bandwidth,
+so mtc behaves as it would on a poor mobile, hotel, or satellite link.
+
+Presets: --profile 3g (300 ms, 750 kbit/s), --profile slow-3g (400 ms,
+400 kbit/s), --profile satellite (700 ms, 2 Mbit/s), --profile edge
+(800 ms, 120 kbit/s).
+
+With --log, each HTTP request is printed as it passes, with the time since
+the proxy started and the response size, so you can see the order and
+overlap of requests at startup. Plain HTTP upstreams only (TLS is passed
+through untouched but can't be logged).
+"""
+
+import argparse
+import asyncio
+import signal
+import sys
+import time
+
+PROFILES = {
+    "3g": (300, 750),
+    "slow-3g": (400, 400),
+    "satellite": (700, 2000),
+    "edge": (800, 120),
+}
+
+START = time.monotonic()
+
+
+def now_ms():
+    return (time.monotonic() - START) * 1000
+
+
+class Totals:
+    def __init__(self):
+        self.down = 0
+        self.up = 0
+        self.connections = 0
+
+
+async def pipe(reader, writer, one_way, bytes_per_sec, on_chunk):
+    """Copy bytes, holding each chunk for `one_way` seconds and pacing
+    them to `bytes_per_sec` (None for unlimited). Chunks keep their order."""
+    queue = asyncio.Queue()
+
+    async def read():
+        try:
+            while True:
+                chunk = await reader.read(16384)
+                await queue.put((time.monotonic(), chunk))
+                if not chunk:
+                    return
+        except (ConnectionError, OSError):
+            await queue.put((time.monotonic(), b""))
+
+    async def write():
+        try:
+            while True:
+                arrived, chunk = await queue.get()
+                delay = arrived + one_way - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if not chunk:
+                    break
+                on_chunk(chunk)
+                if bytes_per_sec:
+                    # Send in slices so the pacing is smooth, like a real link.
+                    step = max(1, bytes_per_sec // 50)
+                    for i in range(0, len(chunk), step):
+                        piece = chunk[i : i + step]
+                        writer.write(piece)
+                        await writer.drain()
+                        await asyncio.sleep(len(piece) / bytes_per_sec)
+                else:
+                    writer.write(chunk)
+                    await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    await asyncio.gather(read(), write())
+
+
+def request_logger(conn_id, log):
+    """Print request lines seen in the client-to-server stream."""
+    buffer = bytearray()
+
+    def on_chunk(chunk):
+        if not log:
+            return
+        buffer.extend(chunk)
+        while True:
+            end = buffer.find(b"\r\n\r\n")
+            if end < 0:
+                if len(buffer) > 65536:
+                    buffer.clear()
+                return
+            head = bytes(buffer[:end]).decode("latin-1")
+            del buffer[: end + 4]
+            first = head.split("\r\n", 1)[0]
+            parts = first.split(" ")
+            if len(parts) == 3 and parts[2].startswith("HTTP/"):
+                length = 0
+                for line in head.split("\r\n")[1:]:
+                    name, _, value = line.partition(":")
+                    if name.strip().lower() == "content-length":
+                        length = int(value.strip() or 0)
+                print(f"{now_ms():8.0f} ms  #{conn_id:<3} {parts[0]} {parts[1]}", flush=True)
+                # Skip the request body; it isn't another request head.
+                skip = min(length, len(buffer))
+                del buffer[:skip]
+
+    return on_chunk
+
+
+async def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--upstream", default="localhost:8065", help="host:port of the real server")
+    parser.add_argument("--listen", type=int, default=8066, help="local port for mtc to use")
+    parser.add_argument("--rtt", type=float, help="round-trip time in milliseconds")
+    parser.add_argument("--kbps", type=float, help="downstream bandwidth in kilobits per second")
+    parser.add_argument("--profile", choices=sorted(PROFILES), help="a preset rtt and bandwidth")
+    parser.add_argument("--log", action="store_true", help="print each HTTP request")
+    args = parser.parse_args()
+
+    rtt, kbps = PROFILES.get(args.profile, (0, None))
+    rtt = args.rtt if args.rtt is not None else rtt
+    kbps = args.kbps if args.kbps is not None else kbps
+    one_way = rtt / 2000
+    bytes_per_sec = int(kbps * 1000 / 8) if kbps else None
+    host, _, port = args.upstream.rpartition(":")
+    totals = Totals()
+
+    async def handle(client_reader, client_writer):
+        totals.connections += 1
+        conn_id = totals.connections
+        # Opening a TCP connection costs a round trip.
+        await asyncio.sleep(rtt / 1000)
+        try:
+            server_reader, server_writer = await asyncio.open_connection(host or "localhost", int(port))
+        except OSError as err:
+            print(f"upstream: {err}", file=sys.stderr)
+            client_writer.close()
+            return
+
+        def count_up(chunk, log=request_logger(conn_id, args.log)):
+            totals.up += len(chunk)
+            log(chunk)
+
+        def count_down(chunk):
+            totals.down += len(chunk)
+
+        await asyncio.gather(
+            pipe(client_reader, server_writer, one_way, None, count_up),
+            pipe(server_reader, client_writer, one_way, bytes_per_sec, count_down),
+        )
+
+    server = await asyncio.start_server(handle, "127.0.0.1", args.listen)
+    # Stop cleanly, with the totals, when run in the background and killed.
+    stop = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+    speed = f"{kbps:g} kbit/s" if kbps else "unlimited"
+    print(
+        f"slow network: 127.0.0.1:{args.listen} -> {args.upstream}, "
+        f"{rtt:g} ms round trip, {speed} down",
+        flush=True,
+    )
+    try:
+        async with server:
+            await stop.wait()
+    finally:
+        print(
+            f"{totals.connections} connections, {totals.down / 1024:.1f} KiB down, "
+            f"{totals.up / 1024:.1f} KiB up",
+            flush=True,
+        )
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
