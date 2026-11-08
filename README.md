@@ -93,7 +93,9 @@ with "Add to favorites" in ⌘K. Favorites sit in their own section at the top o
 sidebar and sync with your other Mattermost apps.
 
 The server's custom emoji show up inline in messages, in reactions, and in custom statuses,
-next to the standard ones.
+next to the standard ones. The emoji on screen are looked up by name as they appear, so
+they show even on servers with thousands of custom emoji, or where the full list can't
+be read.
 
 ## Architecture
 
@@ -133,9 +135,10 @@ Dependencies point downward. The app depends on `gpui-kit` alone for UI.
   splice events (`Spliced { old, new_count }`, `Updated(ix)`), so a new post or an edit
   measures one row, not the whole list.
 - **Work happens once, at ingest.** Emoji shortcodes, autolinks, and the plain vs rich
-  decision run when a post arrives, never during render. Custom emoji load in the
-  background at sign-in; when they arrive, open timelines re-prepare only the posts that
-  name one. Most chat messages are plain
+  decision run when a post arrives, never during render. Custom emoji are looked
+  up by name as posts, reactions, and statuses name them, batched like users, while the
+  full list loads in the background; when they arrive, open timelines re-prepare only
+  the posts that name one. Most chat messages are plain
   text and skip Markdown entirely. Rich posts keep their parsed state per post, so
   scrolling back never re-parses.
 - **Instant switching.** The 8 most recent channel views stay alive with their scroll

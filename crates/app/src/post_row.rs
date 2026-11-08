@@ -802,7 +802,7 @@ impl RenderOnce for PostRow {
                         .and_then(|u| u.custom_status(&time::now_rfc3339())),
                     |this, status| {
                         let tooltip: SharedString = if status.text.is_empty() {
-                            format!(":{}:", status.emoji).into()
+                            format!(":{}:", session::emoji_name(&status.emoji)).into()
                         } else {
                             status.text.clone().into()
                         };
@@ -1179,7 +1179,7 @@ mod tests {
         MouseUpEvent, Pixels, Render, TestAppContext, WindowBounds, WindowOptions, point, size,
     };
     use mattermost::{Post, Reaction};
-    use session::{Directory, Timeline, TimelineKind};
+    use session::{Directory, EmojiStore, Timeline, TimelineKind};
 
     use super::*;
 
@@ -1213,12 +1213,14 @@ mod tests {
         let client = Client::new_unverified("http://localhost:1", "token").unwrap();
         let mut me = User::default();
         me.id = "me".into();
-        let directory = cx.new(|_| Directory::new(client.clone(), me));
+        let emoji = cx.new(|_| EmojiStore::new(client.clone()));
+        let directory = cx.new(|_| Directory::new(client.clone(), me, emoji.clone()));
         let timeline = cx.new(|_| {
             Timeline::new(
                 TimelineKind::Channel("c".into()),
                 client,
                 directory,
+                emoji,
                 CustomEmojis::default(),
             )
         });

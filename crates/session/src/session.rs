@@ -7,7 +7,8 @@ use std::{
 use anyhow::Result;
 use futures::StreamExt as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, SharedString, Task, WeakEntity,
+    App, AppContext as _, Context, Entity, EventEmitter, SharedString, Subscription, Task,
+    WeakEntity,
 };
 use mattermost::{
     ApiError, Channel, ChannelId, ChannelMember, ChannelType, Client, CustomStatus, Event,
@@ -16,7 +17,7 @@ use mattermost::{
 };
 
 use crate::{
-    CustomEmojis, Delivery, Directory, Timeline, TimelineKind,
+    CustomEmojis, Delivery, Directory, EmojiStore, Timeline, TimelineKind,
     retry::{is_transient, retry},
     timeline::{LoadState, now_millis},
 };
@@ -27,8 +28,6 @@ const TYPING_TTL: Duration = Duration::from_secs(6);
 const TYPING_THROTTLE: Duration = Duration::from_secs(3);
 /// Timelines kept alive after their view closes, for instant switching.
 const TIMELINE_CACHE: usize = 24;
-/// Custom emoji requested per page; the server's maximum.
-const EMOJI_PAGE_SIZE: usize = 200;
 
 /// A channel together with the current user's read state in it.
 #[derive(Clone, Debug)]
@@ -121,6 +120,8 @@ pub struct Session {
     favorites: HashSet<ChannelId>,
     /// The other members of each group message, for naming it.
     group_members: HashMap<ChannelId, Vec<UserId>>,
+    emoji: Entity<EmojiStore>,
+    /// The latest snapshot of [`Self::emoji`], shared with timelines.
     custom_emoji: CustomEmojis,
     active_channel: Option<ChannelId>,
     window_active: bool,
@@ -138,6 +139,7 @@ pub struct Session {
     _event_task: Task<()>,
     _channels_task: Option<Task<()>>,
     _typing_expiry: Option<Task<()>>,
+    _emoji_subscription: Subscription,
 }
 
 impl EventEmitter<SessionEvent> for Session {}
@@ -150,7 +152,19 @@ impl Session {
         cx: &mut Context<Self>,
     ) -> Self {
         let me_arc = Arc::new(me.clone());
-        let directory = cx.new(|_| Directory::new(client.clone(), me));
+        let emoji = cx.new(|cx| {
+            let mut emoji = EmojiStore::new(client.clone());
+            if let Some(status) = me.custom_status("") {
+                emoji.ensure([status.emoji.as_str()], cx);
+            }
+            emoji.load_all(cx);
+            emoji
+        });
+        let _emoji_subscription = cx.observe(&emoji, |this, emoji, cx| {
+            let custom = emoji.read(cx).custom().clone();
+            this.set_custom_emoji(custom, cx);
+        });
+        let directory = cx.new(|_| Directory::new(client.clone(), me, emoji.clone()));
         let (stream, mut events) = EventStream::connect(client.clone());
         let _event_task = cx.spawn(async move |this, cx| {
             while let Some(event) = events.next().await {
@@ -174,6 +188,7 @@ impl Session {
             teams_loaded: false,
             favorites: HashSet::new(),
             group_members: HashMap::new(),
+            emoji,
             custom_emoji: CustomEmojis::default(),
             active_channel: None,
             window_active: true,
@@ -188,10 +203,10 @@ impl Session {
             _event_task,
             _channels_task: None,
             _typing_expiry: None,
+            _emoji_subscription,
         };
         this.load_teams(cx);
         this.load_favorites(cx);
-        this.load_custom_emoji(cx);
         let me_id = this.me.id.clone();
         this.directory
             .update(cx, |d, cx| d.refresh_statuses(vec![me_id], cx));
@@ -437,39 +452,6 @@ impl Session {
         .detach();
     }
 
-    /// Load every custom emoji, page by page, then show them all at once so
-    /// open timelines re-prepare their messages only once.
-    fn load_custom_emoji(&mut self, cx: &mut Context<Self>) {
-        let client = self.client.clone();
-        cx.spawn(async move |this, cx| {
-            let mut emoji = Vec::new();
-            for page in 0.. {
-                match client.custom_emoji(page, EMOJI_PAGE_SIZE).await {
-                    Ok(batch) => {
-                        let done = batch.len() < EMOJI_PAGE_SIZE;
-                        emoji.extend(batch);
-                        if done {
-                            break;
-                        }
-                    }
-                    // Most often the server has custom emoji turned off.
-                    Err(err) => {
-                        log::debug!("loading custom emoji: {err:#}");
-                        break;
-                    }
-                }
-            }
-            let custom = CustomEmojis::new(
-                emoji
-                    .into_iter()
-                    .filter(|e| e.delete_at == 0)
-                    .map(|e| (e.name.clone(), client.custom_emoji_url(&e.id))),
-            );
-            let _ = this.update(cx, |this, cx| this.set_custom_emoji(custom, cx));
-        })
-        .detach();
-    }
-
     fn set_custom_emoji(&mut self, custom: CustomEmojis, cx: &mut Context<Self>) {
         self.custom_emoji = custom;
         for timeline in self.live_timelines() {
@@ -527,9 +509,10 @@ impl Session {
             None => {
                 let client = self.client.clone();
                 let directory = self.directory.clone();
+                let emoji = self.emoji.clone();
                 let custom_emoji = self.custom_emoji.clone();
                 let timeline =
-                    cx.new(|_| Timeline::new(kind.clone(), client, directory, custom_emoji));
+                    cx.new(|_| Timeline::new(kind.clone(), client, directory, emoji, custom_emoji));
                 self.timelines.insert(kind, timeline.downgrade());
                 timeline
             }
@@ -1006,9 +989,8 @@ impl Session {
             }
             Event::ChannelsChanged => self.load_channels(cx),
             Event::EmojiAdded(emoji) => {
-                let mut custom = self.custom_emoji.clone();
-                custom.insert(emoji.name.clone(), self.client.custom_emoji_url(&emoji.id));
-                self.set_custom_emoji(custom, cx);
+                self.emoji
+                    .update(cx, |store, cx| store.add(vec![emoji], cx));
             }
             Event::PreferencesChanged(preferences) => {
                 let mut changed = false;
@@ -1200,7 +1182,7 @@ mod slow_network_tests {
     use serde_json::json;
 
     use super::Session;
-    use crate::{LoadState, TimelineKind};
+    use crate::{EmojiStore, LoadState, TimelineKind};
 
     /// One round trip on a poor mobile or satellite link.
     const ROUND_TRIP: Duration = Duration::from_millis(400);
@@ -1376,5 +1358,105 @@ mod slow_network_tests {
         });
         assert!(failures.load(Ordering::SeqCst) >= 3);
         session.read_with(cx, |s, _| assert!(s.channel(&"town".into()).is_some()));
+    }
+
+    /// The server of a company with custom emoji, where the full list can't
+    /// be read (as when requests are rate-limited) and only `lookup` finds
+    /// emoji by name.
+    fn emoji_route(request: &Request, lookup: &str) -> Reply {
+        let path = request.path().split('?').next().unwrap_or_default();
+        let happy_cat = json!({ "id": "e1", "name": "happy_cat" });
+        let pepe = json!({ "id": "e2", "name": "pepe-privet" });
+        match path {
+            "/api/v4/emoji" => Reply::json(json!({ "message": "Forbidden" })).status(403),
+            "/api/v4/emoji/names" if lookup == "batch" => Reply::json(json!([happy_cat, pepe])),
+            "/api/v4/emoji/name/happy_cat" if lookup == "one" => Reply::json(happy_cat),
+            "/api/v4/emoji/name/pepe-privet" if lookup == "one" => Reply::json(pepe),
+            "/api/v4/channels/town/posts" => Reply::json(json!({
+                "order": ["p1"],
+                "posts": { "p1": { "id": "p1", "channel_id": "town", "user_id": "ann",
+                                   "message": "meow :happy_cat:", "create_at": 1 } },
+            })),
+            // A status set by a client that stores the shortcode.
+            "/api/v4/users/ids" => Reply::json(json!([{
+                "id": "ann", "username": "ann",
+                "props": { "customStatus": r#"{"emoji":":pepe-privet:","text":""}"# },
+            }])),
+            _ => route(request),
+        }
+    }
+
+    fn emoji_on_screen_load(lookup: &'static str, cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), move |request| {
+            emoji_route(request, lookup)
+        });
+        let session = start(&server, cx);
+        let timeline = session.update(cx, |s, cx| {
+            s.timeline(TimelineKind::Channel("town".into()), cx)
+        });
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.custom_emoji().len() == 2)
+                && timeline.read_with(cx, |t, _| {
+                    t.entries()
+                        .first()
+                        .is_some_and(|e| e.message().text().contains("/api/v4/emoji/e1/image"))
+                })
+        });
+        session.read_with(cx, |s, _| {
+            let status = s.custom_emoji().image_url(":pepe-privet:").unwrap();
+            assert!(status.ends_with("/api/v4/emoji/e2/image"), "{status}");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn custom_emoji_on_screen_load_without_the_full_list(cx: &mut TestAppContext) {
+        emoji_on_screen_load("batch", cx);
+    }
+
+    #[gpui_kit::test]
+    fn older_servers_look_up_custom_emoji_one_by_one(cx: &mut TestAppContext) {
+        emoji_on_screen_load("one", cx);
+    }
+
+    #[gpui_kit::test]
+    fn failed_emoji_lookups_are_tried_again(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        // The first lookup fails through all of its retries.
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let seen = lookups.clone();
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), move |_request| {
+            if seen.fetch_add(1, Ordering::SeqCst) < 4 {
+                return Reply::json(json!({ "message": "Bad gateway" })).status(502);
+            }
+            Reply::json(json!([{ "id": "e1", "name": "happy_cat" }]))
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let store = cx.new(|_| EmojiStore::new(client));
+        store.update(cx, |s, cx| s.ensure(["happy_cat"], cx));
+        wait_until(cx, |_| lookups.load(Ordering::SeqCst) >= 4);
+        store.read_with(cx, |s, _| assert!(s.custom().is_empty()));
+
+        // Asking again once the failure is known looks the name up anew.
+        wait_until(cx, |cx| {
+            store.update(cx, |s, cx| s.ensure(["happy_cat"], cx));
+            store.read_with(cx, |s, _| s.custom().len() == 1)
+        });
+        assert_eq!(lookups.load(Ordering::SeqCst), 5);
+    }
+
+    #[gpui_kit::test]
+    fn a_recreated_emoji_replaces_the_old_image(cx: &mut TestAppContext) {
+        let client = Client::new_unverified("http://localhost:1", "token").unwrap();
+        let store = cx.new(|_| EmojiStore::new(client));
+        let emoji = |id: &str| {
+            serde_json::from_value::<mattermost::Emoji>(json!({ "id": id, "name": "happy_cat" }))
+                .unwrap()
+        };
+        store.update(cx, |s, cx| s.add(vec![emoji("e1")], cx));
+        store.update(cx, |s, cx| s.add(vec![emoji("e2")], cx));
+        store.read_with(cx, |s, _| {
+            let url = s.custom().image_url("happy_cat").unwrap();
+            assert!(url.ends_with("/emoji/e2/image"), "{url}");
+        });
     }
 }

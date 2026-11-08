@@ -651,7 +651,12 @@ impl SidebarView {
                                 Some(status) if !status.text.is_empty() => {
                                     format!("Change status: {}", status.text)
                                 }
-                                Some(status) => format!("Change status: :{}:", status.emoji),
+                                Some(status) => {
+                                    format!(
+                                        "Change status: :{}:",
+                                        session::emoji_name(&status.emoji)
+                                    )
+                                }
                                 None => "Set a status".to_string(),
                             })
                             .child(match &custom {

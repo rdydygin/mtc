@@ -550,6 +550,18 @@ impl Client {
             .await
     }
 
+    /// The custom emoji among `names` (at most 200 per request); names
+    /// the server doesn't know are left out.
+    pub async fn custom_emoji_by_names(&self, names: Vec<String>) -> Result<Vec<Emoji>> {
+        self.post("emoji/names".into(), names).await
+    }
+
+    /// One custom emoji by name, for servers without the batch lookup.
+    /// Fails with [`ApiError::Status`] 404 when there is no such emoji.
+    pub async fn custom_emoji_by_name(&self, name: &str) -> Result<Emoji> {
+        self.get(format!("emoji/name/{name}")).await
+    }
+
     /// The image of a custom emoji. Served to the image cache by `fetch`.
     pub fn custom_emoji_url(&self, emoji: &EmojiId) -> String {
         format!("{}api/v4/emoji/{emoji}/image", self.inner.server)
