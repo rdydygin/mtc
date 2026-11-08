@@ -16,7 +16,7 @@ dirs = "6"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 futures.workspace = true
 getrandom = "0.3"
-gpui-kit = { workspace = true, features = ["default", "syntect"] }
+gpui-kit = { workspace = true, default-features = true, features = ["syntect"] }
 log.workspace = true
 mattermost.workspace = true
 serde.workspace = true
@@ -28,4 +28,4 @@ url.workspace = true
 windows-registry = "0.6"
 
 [dev-dependencies]
-gpui-kit = { workspace = true, features = ["test-support"] }
+gpui-kit = { workspace = true, default-features = true, features = ["test-support"] }

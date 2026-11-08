@@ -153,6 +153,12 @@ cargo clippy --workspace --all-targets
 MTC_SSO_SERVER=… MTC_SSO_CALLBACK='…/login/desktop?…' cargo test -p mattermost -- --ignored
 ```
 
+CI (`.github/workflows/ci.yml`) runs rustfmt, clippy with warnings denied, and the tests on
+every pull request and push to `main`. To publish a release, bump `version` in `Cargo.toml`,
+then push a matching tag (`git tag v0.1.0 && git push origin v0.1.0`):
+`.github/workflows/release.yml` builds `mtc.app` with `script/bundle-macos` and attaches it
+to a GitHub release.
+
 To run a throwaway server locally:
 `docker run --platform linux/amd64 -d --name mtc-mattermost -p 8065:8065 mattermost/mattermost-preview`.
 
