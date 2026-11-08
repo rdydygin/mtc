@@ -37,6 +37,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Only main saves the cache (about 1.2 GB). A cache saved on a PR branch
+      # can only be read by that branch, and each one pushes main's cache
+      # toward eviction under the repository's 10 GB limit. PRs restore main's.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked
       - run: cargo test --workspace --locked

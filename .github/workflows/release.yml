@@ -28,7 +28,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
+      # A cache saved by a run on a pushed tag is visible only to that tag, so
+      # nothing could restore it. Save from runs started on main; tag runs
+      # restore that.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Resolve release tag
         id: tag
