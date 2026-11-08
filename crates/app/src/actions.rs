@@ -6,7 +6,11 @@
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::{App, KeyBinding, Keystroke, Menu, MenuItem, actions};
 
-use crate::{appearance, persist::Appearance};
+use crate::{
+    appearance,
+    persist::Appearance,
+    update::{self, UpdateStatus},
+};
 
 actions!(
     mtc,
@@ -33,6 +37,11 @@ actions!(
         UseDarkAppearance,
         ShowShortcuts,
         SignOut,
+        CheckForUpdates,
+        /// Quit and open the update that was installed in the background.
+        RestartToUpdate,
+        /// Turn checking for and installing updates on a schedule on or off.
+        ToggleAutomaticUpdates,
     ]
 );
 
@@ -114,14 +123,28 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &UseSystemAppearance, cx| appearance::set(Appearance::System, cx));
     cx.on_action(|_: &UseLightAppearance, cx| appearance::set(Appearance::Light, cx));
     cx.on_action(|_: &UseDarkAppearance, cx| appearance::set(Appearance::Dark, cx));
+    cx.on_action(|_: &CheckForUpdates, cx| update::check(cx));
+    cx.on_action(|_: &RestartToUpdate, cx| update::restart(cx));
+    cx.on_action(|_: &ToggleAutomaticUpdates, cx| {
+        update::set_automatic(!update::is_automatic(), cx)
+    });
 
     set_menus(cx);
 }
 
+/// Build the menu bar. Call again when an item's state changes.
 pub fn set_menus(cx: &mut App) {
+    let update = match update::status(cx) {
+        UpdateStatus::Ready { .. } => MenuItem::action("Restart to Update", RestartToUpdate),
+        _ => MenuItem::action("Check for Updates", CheckForUpdates),
+    };
     cx.set_menus([
         Menu::new("mtc").items([
             MenuItem::action("Keyboard Shortcuts…", ShowShortcuts),
+            MenuItem::separator(),
+            update,
+            MenuItem::action("Update Automatically", ToggleAutomaticUpdates)
+                .checked(update::is_automatic()),
             MenuItem::separator(),
             MenuItem::action("Sign Out", SignOut),
             MenuItem::separator(),

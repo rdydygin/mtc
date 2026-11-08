@@ -19,10 +19,16 @@ getrandom = "0.3"
 gpui-kit = { workspace = true, default-features = true, features = ["syntect"] }
 log.workspace = true
 mattermost.workspace = true
+reqwest.workspace = true
+semver = { version = "1", features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 session.workspace = true
+sha2 = "0.10"
 url.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.6"

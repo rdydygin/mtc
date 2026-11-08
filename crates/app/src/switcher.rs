@@ -176,8 +176,29 @@ pub fn open(
             IconName::Keyboard,
             actions::ShowShortcuts,
         ),
-        action_item("Sign out", IconName::LogOut, actions::SignOut),
     ]);
+    commands.push(match crate::update::status(cx) {
+        crate::update::UpdateStatus::Ready { .. } => action_item(
+            "Restart to update",
+            IconName::CircleArrowUp,
+            actions::RestartToUpdate,
+        ),
+        _ => action_item(
+            "Check for updates",
+            IconName::RefreshCw,
+            actions::CheckForUpdates,
+        ),
+    });
+    commands.push(action_item(
+        if crate::update::is_automatic() {
+            "Turn off automatic updates"
+        } else {
+            "Turn on automatic updates"
+        },
+        IconName::Settings,
+        actions::ToggleAutomaticUpdates,
+    ));
+    commands.push(action_item("Sign out", IconName::LogOut, actions::SignOut));
 
     let groups: Vec<Group> = [
         Group {

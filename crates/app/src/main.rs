@@ -25,6 +25,7 @@ mod status;
 mod switcher;
 mod time;
 mod timeline_view;
+mod update;
 mod workspace;
 
 use gpui_kit::component::TitleBar;
@@ -67,6 +68,7 @@ fn main() {
     app.run(move |cx| {
         gpui_kit::init(cx);
         appearance::restore(cx);
+        update::init(cx);
         actions::init(cx);
         extensions::init(cx);
         sso::register_callback_schemes(cx);

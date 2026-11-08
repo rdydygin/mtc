@@ -13,6 +13,23 @@ cargo run --release -p mtc
 Sign in with your server address and a password, a personal access token, or your
 company's single sign-on.
 
+### Updates
+
+mtc keeps itself up to date. A few seconds after launch, and every six hours while it
+runs, it looks for a new release. On macOS it downloads the new `mtc.app` in the
+background, checks it against the release's SHA-256 checksum, its bundle identifier,
+version, and signature, and puts it in place of the running copy. The new version
+starts the next time you open mtc, or right away with **Restart to update** in the
+title bar.
+
+To install itself, mtc must run from a folder it can write to, such as `/Applications`
+or `~/Applications`. A copy opened straight from Downloads runs from a read-only
+location until it is moved; that copy, builds you made yourself, and Linux and Windows
+show **Update available** instead, linking to the release.
+
+**Check for Updates** in the mtc menu (or ⌘K) checks right away. Uncheck **Update
+Automatically** in the same menu to only check when you ask.
+
 ### Single sign-on (SAML, OpenID, Microsoft, Google, GitLab)
 
 Type your server address and mtc shows a "Continue with …" button for each SSO method
@@ -177,6 +194,16 @@ then either run the Release workflow from the Actions tab (it tags the branch as
 `v<version>`) or push a matching tag (`git tag v0.1.0 && git push origin v0.1.0`):
 `.github/workflows/release.yml` builds a universal (Apple Silicon and Intel) `mtc.app` with
 `script/bundle-macos --universal` and attaches it to a GitHub release.
+
+The release also carries `latest.json`, the update feed: the version, the release page,
+and each download's URL and SHA-256. Installed copies read it from
+`https://github.com/rdydygin/mtc/releases/latest/download/latest.json`, which GitHub
+redirects to the newest release that isn't a draft or pre-release, so publishing a
+release is all it takes to ship an update. Release downloads, unlike the GitHub API,
+aren't rate-limited per address. To try an update end to end, bump the version, bundle
+it, serve a `latest.json` that points at its zip, and start an older build with
+`MTC_UPDATE_FEED=http://…/latest.json` (debug builds only check on their own when it is
+set).
 
 To run a throwaway server locally:
 `docker run --platform linux/amd64 -d --name mtc-mattermost -p 8065:8065 mattermost/mattermost-preview`.

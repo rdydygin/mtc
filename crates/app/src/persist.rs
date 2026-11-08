@@ -37,6 +37,15 @@ pub enum Appearance {
     Dark,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Updates {
+    /// Check for new releases on a schedule and install them in the background.
+    #[default]
+    Automatic,
+    /// Only when asked, with Check for Updates.
+    Manual,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
@@ -53,6 +62,7 @@ pub struct State {
     /// Sidebar width in rems, so it follows the interface zoom.
     pub sidebar_width_rem: Option<f32>,
     pub last_channel: Option<String>,
+    pub updates: Updates,
 }
 
 fn path() -> Option<PathBuf> {
