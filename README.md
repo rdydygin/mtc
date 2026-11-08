@@ -4,6 +4,8 @@
 
 A fast, keyboard-first Mattermost desktop client built with [GPUI Kit](https://gpui-kit.com).
 
+Download `mtc.app` for macOS from [Releases](https://github.com/rdydygin/mtc/releases), or build it:
+
 ```sh
 cargo run --release -p mtc
 ```
@@ -171,9 +173,10 @@ MTC_SSO_SERVER=… MTC_SSO_CALLBACK='…/login/desktop?…' cargo test -p matter
 
 CI (`.github/workflows/ci.yml`) runs rustfmt, clippy with warnings denied, and the tests on
 every pull request and push to `main`. To publish a release, bump `version` in `Cargo.toml`,
-then push a matching tag (`git tag v0.1.0 && git push origin v0.1.0`):
-`.github/workflows/release.yml` builds `mtc.app` with `script/bundle-macos` and attaches it
-to a GitHub release.
+then either run the Release workflow from the Actions tab (it tags the branch as
+`v<version>`) or push a matching tag (`git tag v0.1.0 && git push origin v0.1.0`):
+`.github/workflows/release.yml` builds a universal (Apple Silicon and Intel) `mtc.app` with
+`script/bundle-macos --universal` and attaches it to a GitHub release.
 
 To run a throwaway server locally:
 `docker run --platform linux/amd64 -d --name mtc-mattermost -p 8065:8065 mattermost/mattermost-preview`.

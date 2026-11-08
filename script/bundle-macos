@@ -4,20 +4,40 @@
 # so SSO sign-in can return from the browser
 # (and system notifications work).
 #
-#   script/bundle-macos            # builds target/release/bundle/mtc.app
-#   script/bundle-macos --install  # also copies it to ~/Applications
+#   script/bundle-macos              # builds target/release/bundle/mtc.app
+#   script/bundle-macos --universal  # one binary for Apple Silicon and Intel Macs
+#   script/bundle-macos --install    # also copies it to ~/Applications
 set -euo pipefail
+
+UNIVERSAL=0
+INSTALL=0
+for arg in "$@"; do
+  case "$arg" in
+    --universal) UNIVERSAL=1 ;;
+    --install) INSTALL=1 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
 
 cd "$(dirname "$0")/.."
 VERSION=$(cargo metadata --no-deps --format-version 1 \
   | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="mtc"))')
 
-cargo build --release -p mtc
-
 APP=target/release/bundle/mtc.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/mtc "$APP/Contents/MacOS/mtc"
+
+if [[ $UNIVERSAL == 1 ]]; then
+  # Needs both targets: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+  cargo build --release -p mtc --target aarch64-apple-darwin
+  cargo build --release -p mtc --target x86_64-apple-darwin
+  lipo -create -output "$APP/Contents/MacOS/mtc" \
+    target/aarch64-apple-darwin/release/mtc \
+    target/x86_64-apple-darwin/release/mtc
+else
+  cargo build --release -p mtc
+  cp target/release/mtc "$APP/Contents/MacOS/mtc"
+fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -49,7 +69,7 @@ PLIST
 codesign --force --deep --sign - "$APP" >/dev/null
 echo "Built $APP"
 
-if [[ "${1:-}" == "--install" ]]; then
+if [[ $INSTALL == 1 ]]; then
   mkdir -p "$HOME/Applications"
   rm -rf "$HOME/Applications/mtc.app"
   cp -R "$APP" "$HOME/Applications/mtc.app"
