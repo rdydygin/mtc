@@ -1,0 +1,57 @@
+name: Release
+
+# Push a tag matching the workspace version to publish a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: Build mtc.app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check tag matches the crate version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="mtc"))')
+          if [[ "${GITHUB_REF_NAME}" != "v${VERSION}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo version v${VERSION}"
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Bundle
+        run: script/bundle-macos
+
+      - name: Package
+        id: package
+        run: |
+          ARCH=$(uname -m)
+          ZIP="mtc-${GITHUB_REF_NAME}-macos-${ARCH}.zip"
+          # ditto keeps the bundle's symlinks, permissions and signature intact.
+          ditto -c -k --keepParent target/release/bundle/mtc.app "$ZIP"
+          shasum -a 256 "$ZIP" > "$ZIP.sha256"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" \
+            --title "mtc $GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "The app is ad-hoc signed, not notarized. After unzipping, run \`xattr -dr com.apple.quarantine mtc.app\` or right-click → Open the first time."
