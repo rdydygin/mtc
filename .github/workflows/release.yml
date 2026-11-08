@@ -1,13 +1,20 @@
 name: Release
 
-# Push a tag matching the workspace version to publish a release:
-#   git tag v0.1.0 && git push origin v0.1.0
+# Publish a release in either of two ways:
+#   - Actions → Release → Run workflow: tags the chosen branch as v<version> (the
+#     workspace version in Cargo.toml) and publishes it.
+#   - Push a tag matching the workspace version: git tag v0.1.0 && git push origin v0.1.0
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,28 +26,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check tag matches the crate version
+      - name: Resolve release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="mtc"))')
-          if [[ "${GITHUB_REF_NAME}" != "v${VERSION}" ]]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo version v${VERSION}"
+          TAG="v${VERSION}"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" != "${TAG}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo version ${TAG}"
             exit 1
           fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release ${TAG} already exists. Bump version in Cargo.toml first."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Test
         run: cargo test --workspace --locked
 
       - name: Bundle
-        run: script/bundle-macos
+        run: script/bundle-macos --universal
 
       - name: Package
         id: package
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          ARCH=$(uname -m)
-          ZIP="mtc-${GITHUB_REF_NAME}-macos-${ARCH}.zip"
+          lipo -info target/release/bundle/mtc.app/Contents/MacOS/mtc
+          ZIP="mtc-${TAG}-macos-universal.zip"
           # ditto keeps the bundle's symlinks, permissions and signature intact.
           ditto -c -k --keepParent target/release/bundle/mtc.app "$ZIP"
           shasum -a 256 "$ZIP" > "$ZIP.sha256"
@@ -49,9 +69,13 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
           ZIP: ${{ steps.package.outputs.zip }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" \
-            --title "mtc $GITHUB_REF_NAME" \
+          # --target creates the tag at this commit when the run was started by hand;
+          # for a pushed tag it already exists and is used as is.
+          gh release create "$TAG" "$ZIP" "$ZIP.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "mtc $TAG" \
             --generate-notes \
-            --notes "The app is ad-hoc signed, not notarized. After unzipping, run \`xattr -dr com.apple.quarantine mtc.app\` or right-click → Open the first time."
+            --notes "Runs on Apple Silicon and Intel Macs (macOS 12 or later). The app is ad-hoc signed, not notarized. After unzipping, run \`xattr -dr com.apple.quarantine mtc.app\` or right-click → Open the first time."
