@@ -1,0 +1,58 @@
+#!/bin/bash
+# Build mtc.app: a release build wrapped in a bundle that declares the
+# `mattermost-dev://` and `mmauth://` URL schemes (newer and older servers),
+# so SSO sign-in can return from the browser
+# (and system notifications work).
+#
+#   script/bundle-macos            # builds target/release/bundle/mtc.app
+#   script/bundle-macos --install  # also copies it to ~/Applications
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+VERSION=$(cargo metadata --no-deps --format-version 1 \
+  | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="mtc"))')
+
+cargo build --release -p mtc
+
+APP=target/release/bundle/mtc.app
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp target/release/mtc "$APP/Contents/MacOS/mtc"
+
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>mtc</string>
+  <key>CFBundleDisplayName</key><string>mtc</string>
+  <key>CFBundleIdentifier</key><string>dev.mtc.desktop</string>
+  <key>CFBundleExecutable</key><string>mtc</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+  <key>CFBundleVersion</key><string>${VERSION}</string>
+  <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>Mattermost SSO callback</string>
+      <key>CFBundleURLSchemes</key><array><string>mattermost-dev</string><string>mmauth</string></array>
+    </dict>
+  </array>
+</dict>
+</plist>
+PLIST
+
+# Ad-hoc signature so macOS treats the bundle as one app.
+codesign --force --deep --sign - "$APP" >/dev/null
+echo "Built $APP"
+
+if [[ "${1:-}" == "--install" ]]; then
+  mkdir -p "$HOME/Applications"
+  rm -rf "$HOME/Applications/mtc.app"
+  cp -R "$APP" "$HOME/Applications/mtc.app"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$HOME/Applications/mtc.app"
+  echo "Installed ~/Applications/mtc.app"
+fi

@@ -1,0 +1,27 @@
+[package]
+name = "mtc"
+description = "A fast, keyboard-first Mattermost desktop client built with GPUI Kit"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mtc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "6"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+futures.workspace = true
+gpui-kit = { workspace = true, features = ["syntect"] }
+log.workspace = true
+mattermost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+session.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }

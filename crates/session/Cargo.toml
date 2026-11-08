@@ -1,0 +1,18 @@
+[package]
+name = "session"
+description = "The signed-in Mattermost session as GPUI entities: channels, users, timelines"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+emojis = "0.9"
+futures.workspace = true
+gpui-kit = { workspace = true, default-features = false }
+log.workspace = true
+mattermost.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, default-features = false, features = ["test-support"] }

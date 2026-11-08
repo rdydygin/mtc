@@ -1,0 +1,909 @@
+//! A channel or thread: header, virtualized posts, typing line, composer.
+
+use std::{collections::HashMap, rc::Rc};
+
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{
+    ActiveTheme as _, Sizable as _, StyledExt as _, WindowExt as _,
+    button::{Button, ButtonVariant, ButtonVariants as _},
+    h_flex,
+    message_scroller::{MessageScroller, MessageScrollerState},
+    popover::Popover,
+    spinner::Spinner,
+    text::{TextView, TextViewState},
+    v_flex,
+};
+use gpui_kit::{
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription,
+    WeakEntity, Window, div, prelude::FluentBuilder as _,
+};
+use mattermost::{ChannelId, ChannelType, FileInfo, Millis, Post, PostId};
+use session::{Delivery, LoadState, Session, Timeline, TimelineEvent, TimelineKind};
+
+use crate::{
+    composer::{Composer, ComposerEvent, UploadTarget},
+    extensions::{self, CommandContext, CommandOutcome},
+    http::avatar_url,
+    post_row::{PostAction, PostActionHandler, PostRow},
+    time,
+};
+
+/// Posts by one author closer together than this form one group.
+const GROUP_WINDOW: Millis = 5 * 60 * 1000;
+/// Start loading older posts when the top of the viewport is this close to
+/// the oldest loaded post.
+const PREFETCH_ROWS: usize = 8;
+
+pub enum TimelineViewEvent {
+    OpenThread(PostId),
+    OpenChannel(ChannelId),
+    Close,
+}
+
+pub struct TimelineView {
+    kind: TimelineKind,
+    session: Entity<Session>,
+    timeline: Entity<Timeline>,
+    scroller: Entity<MessageScrollerState>,
+    composer: Entity<Composer>,
+    /// Parsed Markdown for rich posts, kept for the life of the view so
+    /// scrolling back never re-parses.
+    rich_text: HashMap<PostId, Entity<TextViewState>>,
+    /// The first post the user hasn't seen.
+    unread_ix: Option<usize>,
+    editing: Option<PostId>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<TimelineViewEvent> for TimelineView {}
+
+impl TimelineView {
+    pub fn new(
+        kind: TimelineKind,
+        session: Entity<Session>,
+        draft: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let timeline = session.update(cx, |s, cx| s.timeline(kind.clone(), cx));
+        let count = timeline.read(cx).entries().len();
+        let scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
+        let placeholder = Self::placeholder(&kind, &session, cx);
+        let target = UploadTarget {
+            client: session.read(cx).client().clone(),
+            channel: kind.channel().clone(),
+        };
+        let composer = cx.new(|cx| Composer::new(placeholder, draft, target, window, cx));
+        let directory = session.read(cx).directory().clone();
+
+        let subscriptions = vec![
+            cx.subscribe(&timeline, Self::on_timeline_event),
+            cx.observe(&timeline, |_, _, cx| cx.notify()),
+            cx.observe(&directory, |_, _, cx| cx.notify()),
+            cx.observe(&session, |_, _, cx| cx.notify()),
+            cx.observe(&scroller, Self::on_scroll),
+            cx.subscribe_in(&composer, window, Self::on_composer_event),
+        ];
+
+        let mut this = Self {
+            kind,
+            session,
+            timeline,
+            scroller,
+            composer,
+            rich_text: HashMap::new(),
+            unread_ix: None,
+            editing: None,
+            _subscriptions: subscriptions,
+        };
+        this.rebuild(cx);
+        this
+    }
+
+    fn placeholder(kind: &TimelineKind, session: &Entity<Session>, cx: &App) -> SharedString {
+        if kind.root().is_some() {
+            return "Reply…".into();
+        }
+        let session = session.read(cx);
+        match session.channel(kind.channel()) {
+            Some(entry) if entry.kind().is_direct_or_group() => {
+                format!("Message {}", session.channel_label(entry, cx)).into()
+            }
+            Some(entry) => format!("Message #{}", session.channel_label(entry, cx)).into(),
+            None => "Message".into(),
+        }
+    }
+
+    pub fn kind(&self) -> &TimelineKind {
+        &self.kind
+    }
+
+    pub fn draft(&self, cx: &App) -> Option<String> {
+        let text = self.composer.read(cx).text(cx);
+        (!text.trim().is_empty() && !self.composer.read(cx).is_editing()).then_some(text)
+    }
+
+    pub fn focus_composer(&self, window: &mut Window, cx: &mut App) {
+        self.composer.focus_handle(cx).focus(window, cx);
+    }
+
+    // ----- Mirroring the timeline -------------------------------------------
+
+    fn rebuild(&mut self, cx: &mut Context<Self>) {
+        let entries = self.timeline.read(cx).entries().to_vec();
+        let live: std::collections::HashSet<&PostId> = entries.iter().map(|e| e.id()).collect();
+        self.rich_text.retain(|id, _| live.contains(id));
+        for ix in 0..entries.len() {
+            self.sync_rich_text(ix, cx);
+        }
+        self.unread_ix = self.find_unread(cx);
+        let count = entries.len();
+        self.scroller.update(cx, |s, cx| s.reset(count, cx));
+    }
+
+    fn on_timeline_event(
+        &mut self,
+        _: Entity<Timeline>,
+        event: &TimelineEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TimelineEvent::Reset => self.rebuild(cx),
+            TimelineEvent::Spliced { old, new_count } => {
+                for ix in old.start..old.start + new_count {
+                    self.sync_rich_text(ix, cx);
+                }
+                let (old, new_count) = (old.clone(), *new_count);
+                let count = self.timeline.read(cx).entries().len();
+                self.scroller.update(cx, |s, cx| {
+                    s.splice(old.clone(), new_count, cx);
+                    // The next row may gain or lose its author header or
+                    // day divider.
+                    let next = old.start + new_count;
+                    if next < count {
+                        s.remeasure_items(next..next + 1, cx);
+                    }
+                });
+                self.unread_ix = self.find_unread(cx);
+            }
+            TimelineEvent::Updated(ix) => {
+                let ix = *ix;
+                self.sync_rich_text(ix, cx);
+                self.scroller.update(cx, |s, cx| {
+                    s.remeasure_items(ix..ix + 1, cx);
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    fn sync_rich_text(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.timeline.read(cx).entries().get(ix).cloned() else {
+            return;
+        };
+        let message = entry.message();
+        if !message.is_rich() {
+            self.rich_text.remove(entry.id());
+            return;
+        }
+        let text = message.text().clone();
+        match self.rich_text.get(entry.id()) {
+            Some(state) => state.update(cx, |state, cx| state.set_text(&text, cx)),
+            None => {
+                let state = cx.new(|cx| TextViewState::markdown(&text, cx).selectable(true));
+                self.rich_text.insert(entry.id().clone(), state);
+            }
+        }
+    }
+
+    fn find_unread(&self, cx: &App) -> Option<usize> {
+        let timeline = self.timeline.read(cx);
+        let after = timeline.unread_after()?;
+        let me = &self.session.read(cx).me().id;
+        let entries = timeline.entries();
+        let ix = entries
+            .iter()
+            .position(|e| e.post().create_at > after && &e.post().user_id != me)?;
+        Some(ix)
+    }
+
+    fn on_scroll(&mut self, scroller: Entity<MessageScrollerState>, cx: &mut Context<Self>) {
+        let top = scroller.read(cx).logical_scroll_top().item_ix;
+        let timeline = self.timeline.read(cx);
+        if top < PREFETCH_ROWS && timeline.has_older() && !timeline.is_loading_older() {
+            self.timeline.update(cx, |t, cx| t.load_older(cx));
+        }
+    }
+
+    // ----- Commands ---------------------------------------------------------
+
+    fn on_composer_event(
+        &mut self,
+        _: &Entity<Composer>,
+        event: &ComposerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ComposerEvent::Submit { text, files } => {
+                self.submit(text.clone(), files.clone(), window, cx)
+            }
+            ComposerEvent::EditLast => self.edit_last(window, cx),
+            ComposerEvent::CancelEdit => self.editing = None,
+            ComposerEvent::Typing => {
+                let kind = self.kind.clone();
+                self.session.update(cx, |s, _| s.notify_typing(&kind));
+            }
+        }
+    }
+
+    fn submit(
+        &mut self,
+        text: String,
+        files: Vec<FileInfo>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(post) = self.editing.take() {
+            self.session
+                .update(cx, |s, cx| s.edit_post(&post, text, cx));
+            return;
+        }
+        // Attachments always go out as a post; a slash command can't carry them.
+        if !files.is_empty() {
+            self.send(text, files, cx);
+            return;
+        }
+        let context = CommandContext::new(self.session.clone(), self.kind.clone());
+        match extensions::run_slash_command(&text, &context, window, cx) {
+            CommandOutcome::Send(message) => self.send(message, Vec::new(), cx),
+            CommandOutcome::Handled => {}
+            CommandOutcome::Pass if text.starts_with('/') => {
+                let channel = self.kind.channel().clone();
+                let task = self
+                    .session
+                    .update(cx, |s, cx| s.execute_command(&channel, text.clone(), cx));
+                cx.spawn_in(window, async move |_, cx| {
+                    if let Err(err) = task.await {
+                        let _ = cx.update(|window, cx| {
+                            window.push_notification(
+                                gpui_kit::component::notification::Notification::error(format!(
+                                    "Couldn’t run {}. {err:#}",
+                                    text.split_whitespace().next().unwrap_or_default()
+                                )),
+                                cx,
+                            );
+                        });
+                    }
+                })
+                .detach();
+            }
+            CommandOutcome::Pass => self.send(text, Vec::new(), cx),
+        }
+    }
+
+    fn send(&mut self, message: String, files: Vec<FileInfo>, cx: &mut Context<Self>) {
+        let kind = self.kind.clone();
+        self.session
+            .update(cx, |s, cx| s.send_post(&kind, message, files, cx));
+        self.scroller.update(cx, |s, cx| s.scroll_to_end(cx));
+    }
+
+    fn edit_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let me = self.session.read(cx).me().id.clone();
+        let last = self
+            .timeline
+            .read(cx)
+            .entries()
+            .iter()
+            .rev()
+            .find(|e| {
+                e.post().user_id == me && e.delivery() == Delivery::Sent && !e.post().is_system()
+            })
+            .map(|e| e.post().clone());
+        if let Some(post) = last {
+            self.start_editing(&post, window, cx);
+        }
+    }
+
+    fn start_editing(&mut self, post: &Post, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing = Some(post.id.clone());
+        let message = post.message.clone();
+        self.composer
+            .update(cx, |c, cx| c.set_editing(Some(&message), window, cx));
+    }
+
+    fn handle_post_action(
+        &mut self,
+        id: &PostId,
+        action: PostAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(post) = self
+            .timeline
+            .read(cx)
+            .position(id)
+            .map(|ix| self.timeline.read(cx).entries()[ix].post().clone())
+        else {
+            return;
+        };
+        match action {
+            PostAction::OpenThread => {
+                if self.kind.root().is_none() {
+                    cx.emit(TimelineViewEvent::OpenThread(post.id.clone()));
+                } else {
+                    self.focus_composer(window, cx);
+                }
+            }
+            PostAction::ToggleReaction(name) => {
+                self.session
+                    .update(cx, |s, cx| s.toggle_reaction(&post, &name, cx));
+            }
+            PostAction::CopyText => {
+                cx.write_to_clipboard(ClipboardItem::new_string(post.message.clone()));
+            }
+            PostAction::Edit => self.start_editing(&post, window, cx),
+            PostAction::Delete => {
+                let session = self.session.clone();
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let session = session.clone();
+                    let post = post.clone();
+                    alert
+                        .title("Delete this message?")
+                        .description("It will be removed for everyone. This can’t be undone.")
+                        .confirm()
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger)
+                        .on_ok(move |_, _, cx| {
+                            session.update(cx, |s, cx| s.delete_post(&post, cx));
+                            true
+                        })
+                });
+            }
+            PostAction::Retry => {
+                let kind = self.kind.clone();
+                self.session
+                    .update(cx, |s, cx| s.retry_post(&kind, &post.id, cx));
+            }
+            PostAction::Discard => {
+                let kind = self.kind.clone();
+                self.session
+                    .update(cx, |s, cx| s.discard_post(&kind, &post.id, cx));
+            }
+            PostAction::OpenFile(file) => self.open_file(file, window, cx),
+            PostAction::MessageAuthor => {
+                let task = self
+                    .session
+                    .update(cx, |s, cx| s.open_direct_channel(post.user_id.clone(), cx));
+                cx.spawn_in(window, async move |this, cx| match task.await {
+                    Ok(channel) => {
+                        let _ = this
+                            .update(cx, |_, cx| cx.emit(TimelineViewEvent::OpenChannel(channel)));
+                    }
+                    Err(err) => {
+                        let _ = cx.update(|window, cx| {
+                            window.push_notification(
+                                gpui_kit::component::notification::Notification::error(format!(
+                                    "Couldn’t open the conversation. {err:#}"
+                                )),
+                                cx,
+                            )
+                        });
+                    }
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// Download an attachment into Downloads and open it with its default
+    /// app. The name gets a numeric suffix rather than overwriting a file.
+    fn open_file(&mut self, file: FileInfo, window: &mut Window, cx: &mut Context<Self>) {
+        let client = self.session.read(cx).client().clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = async {
+                let bytes = client.download_file(&file.id).await?;
+                let name = file.name.clone();
+                cx.background_spawn(async move {
+                    let dir = dirs::download_dir()
+                        .or_else(dirs::home_dir)
+                        .ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
+                    let path = unique_path(&dir, &name);
+                    std::fs::write(&path, bytes)?;
+                    anyhow::Ok(path)
+                })
+                .await
+            }
+            .await;
+            let _ = cx.update(|window, cx| match result {
+                Ok(path) => cx.open_with_system(&path),
+                Err(err) => window.push_notification(
+                    gpui_kit::component::notification::Notification::error(format!(
+                        "Couldn’t download {}. {err:#}",
+                        file.name
+                    )),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    // ----- Rendering --------------------------------------------------------
+
+    fn render_row(&self, ix: usize, view: &WeakEntity<Self>, cx: &App) -> AnyElement {
+        let timeline = self.timeline.read(cx);
+        let entries = timeline.entries();
+        let Some(entry) = entries.get(ix) else {
+            return div().into_any_element();
+        };
+        let session = self.session.read(cx);
+        let directory = session.directory().read(cx);
+        let post = entry.post();
+        let previous = ix
+            .checked_sub(1)
+            .and_then(|p| entries.get(p))
+            .map(|e| e.post());
+
+        let same_day =
+            previous.is_some_and(|p| time::day(p.create_at) == time::day(post.create_at));
+        let unread_divider = self.unread_ix == Some(ix);
+        let continuation = !unread_divider
+            && same_day
+            && previous.is_some_and(|p| {
+                p.user_id == post.user_id
+                    && post.create_at - p.create_at < GROUP_WINDOW
+                    && !p.is_system()
+                    && !post.is_system()
+                    && p.override_username() == post.override_username()
+            });
+        let day_label = (!same_day).then(|| SharedString::from(time::day_label(post.create_at)));
+
+        let author = directory.user(&post.user_id).cloned();
+        let avatar = author.as_ref().map(|user| {
+            SharedString::from(avatar_url(
+                session.client(),
+                user.id.as_str(),
+                user.last_picture_update,
+            ))
+        });
+
+        let id = post.id.clone();
+        let view = view.clone();
+        let on_action: PostActionHandler = Rc::new(move |action, window, cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.handle_post_action(&id, action, window, cx)
+            });
+        });
+
+        PostRow::new(entry.clone(), session.me().id.clone(), on_action)
+            .author(author, avatar)
+            .author_status(directory.status(&post.user_id))
+            .continuation(continuation)
+            .day_label(day_label)
+            .unread_divider(unread_divider)
+            .rich_text(self.rich_text.get(entry.id()).cloned())
+            .thread_entry(self.kind.root().is_none())
+            .client(session.client().clone())
+            .custom_emoji(session.custom_emoji().clone())
+            .into_any_element()
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let session = self.session.read(cx);
+        // The bar shows one truncated line of each; `details` keeps the full
+        // text for the details popover.
+        let mut details: Vec<HeaderDetail> = Vec::new();
+        let (icon, title, subtitle, details_label) = match &self.kind {
+            TimelineKind::Thread { channel, .. } => {
+                let channel_name = session
+                    .channel(channel)
+                    .map(|e| session.channel_label(e, cx))
+                    .unwrap_or_default();
+                if !channel_name.is_empty() {
+                    details.push(HeaderDetail::plain("Channel", channel_name.clone()));
+                }
+                (
+                    IconName::MessageSquare,
+                    SharedString::from("Thread"),
+                    channel_name,
+                    "Thread details",
+                )
+            }
+            TimelineKind::Channel(channel) => match session.channel(channel) {
+                Some(entry) => {
+                    let icon = match entry.kind() {
+                        ChannelType::Open => IconName::Hash,
+                        ChannelType::Private => IconName::Lock,
+                        ChannelType::Direct => IconName::AtSign,
+                        ChannelType::Group => IconName::Users,
+                    };
+                    let details_label = match entry.kind() {
+                        ChannelType::Open | ChannelType::Private => "Channel details",
+                        ChannelType::Direct | ChannelType::Group => "Conversation details",
+                    };
+                    let header = entry.channel().header.trim();
+                    let purpose = entry.channel().purpose.trim();
+                    let subtitle = if header.is_empty() { purpose } else { header };
+                    let mut subtitle = subtitle.lines().next().unwrap_or_default().to_string();
+                    // A direct message shows the other person's status.
+                    if let Some(status) = entry
+                        .channel()
+                        .direct_partner(&session.me().id)
+                        .and_then(|partner| session.directory().read(cx).user(&partner).cloned())
+                        .and_then(|user| user.custom_status(&time::now_rfc3339()))
+                    {
+                        subtitle = format!(
+                            "{} {}",
+                            crate::status::emoji_char(&status.emoji),
+                            status.text
+                        );
+                        details.push(HeaderDetail::plain("Status", subtitle.clone().into()));
+                    }
+                    if !header.is_empty() {
+                        details.push(HeaderDetail::markdown("Header", header.to_string().into()));
+                    }
+                    if !purpose.is_empty() {
+                        details.push(HeaderDetail::plain("Purpose", purpose.to_string().into()));
+                    }
+                    (
+                        icon,
+                        session.channel_label(entry, cx),
+                        subtitle.into(),
+                        details_label,
+                    )
+                }
+                None => (
+                    IconName::Hash,
+                    SharedString::from(""),
+                    SharedString::default(),
+                    "Channel details",
+                ),
+            },
+        };
+        let is_thread = self.kind.root().is_some();
+        let favorite = match &self.kind {
+            TimelineKind::Channel(channel) if session.channel(channel).is_some() => {
+                Some((channel.clone(), session.is_favorite(channel)))
+            }
+            _ => None,
+        };
+        // The title block is the trigger: a quiet Button keeps the compact bar
+        // while giving the full text a keyboard-reachable home.
+        let trigger = Button::new("channel-details-trigger")
+            .ghost()
+            .large()
+            .w_full()
+            .h_auto()
+            .px_2()
+            .py_1()
+            .accessibility_label(if title.is_empty() {
+                SharedString::from(details_label)
+            } else {
+                SharedString::from(format!("{details_label}: {title}"))
+            })
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_3()
+                    .child(
+                        gpui_kit::component::Icon::new(icon)
+                            .small()
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .font_semibold()
+                                            .text_color(theme.foreground)
+                                            .truncate()
+                                            .child(title.clone()),
+                                    )
+                                    .child(
+                                        gpui_kit::component::Icon::new(IconName::ChevronDown)
+                                            .xsmall()
+                                            .flex_none()
+                                            .text_color(theme.muted_foreground),
+                                    ),
+                            )
+                            .when(!subtitle.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(subtitle),
+                                )
+                            }),
+                    ),
+            );
+        let details = Rc::new(details);
+        let details_popover = Popover::new("channel-details")
+            .anchor(gpui_kit::Anchor::TopLeft)
+            .trigger_style(StyleRefinement::default().flex_1().min_w_0())
+            .trigger(trigger)
+            .content(move |_, _, cx| render_header_details(&title, &details, cx));
+        h_flex()
+            .flex_none()
+            .h_16()
+            .pl_2()
+            .pr_4()
+            .gap_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(details_popover)
+            .when_some(favorite, |this, (channel, favorite)| {
+                // A toggle: the filled star and pressed state show it's on.
+                this.child(
+                    Button::new("favorite")
+                        .small()
+                        .ghost()
+                        .icon(if favorite {
+                            IconName::StarFill
+                        } else {
+                            IconName::Star
+                        })
+                        .toggled(favorite)
+                        .accessibility_label("Favorite")
+                        .tooltip(crate::sidebar::favorite_label(favorite))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.session
+                                .update(cx, |s, cx| s.set_favorite(&channel, !favorite, cx));
+                        })),
+                )
+            })
+            .when(is_thread, |this| {
+                this.child(
+                    Button::new("close-thread")
+                        .small()
+                        .ghost()
+                        .icon(IconName::X)
+                        .accessibility_label("Close thread")
+                        .tooltip("Close thread")
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(TimelineViewEvent::Close))),
+                )
+            })
+    }
+
+    fn render_typing(&self, cx: &App) -> impl IntoElement {
+        let session = self.session.read(cx);
+        let directory = session.directory().read(cx);
+        let names: Vec<SharedString> = session
+            .typing_users(&self.kind)
+            .iter()
+            .map(|id| directory.display_name(id))
+            .collect();
+        let text = match names.as_slice() {
+            [] => String::new(),
+            [one] => format!("{one} is typing…"),
+            [a, b] => format!("{a} and {b} are typing…"),
+            _ => "Several people are typing…".to_string(),
+        };
+        // Fixed height: the composer must not jump when someone types.
+        div()
+            .flex_none()
+            .h_5()
+            .px_5()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .truncate()
+            .child(text)
+    }
+
+    fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let timeline = self.timeline.read(cx);
+        let is_empty = timeline.entries().is_empty();
+        match timeline.state() {
+            LoadState::NotLoaded | LoadState::Loading if is_empty => div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Spinner::new())
+                .into_any_element(),
+            LoadState::Failed(error) if is_empty => v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .text_sm()
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(error.clone()),
+                )
+                .child(
+                    Button::new("retry-load")
+                        .label("Try again")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.timeline.update(cx, |t, cx| t.reload(cx));
+                        })),
+                )
+                .into_any_element(),
+            _ if is_empty => div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(if self.kind.root().is_some() {
+                    "No replies yet."
+                } else {
+                    "No messages yet. Start the conversation."
+                })
+                .into_any_element(),
+            _ => {
+                let view = cx.entity().downgrade();
+                let loading_older = timeline.is_loading_older();
+                let row_style = {
+                    let mut style = StyleRefinement::default();
+                    style.padding.left = Some(gpui_kit::px(0.).into());
+                    style.padding.right = Some(gpui_kit::px(0.).into());
+                    style.padding.bottom = Some(gpui_kit::px(0.).into());
+                    style
+                };
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        MessageScroller::new("posts", self.scroller.clone(), move |ix, _, cx| {
+                            view.upgrade()
+                                .map(|v| v.read(cx).render_row(ix, &v.downgrade(), cx))
+                                .unwrap_or_else(|| div().into_any_element())
+                        })
+                        .with_row_style(row_style)
+                        .with_bottom_fade(theme.background),
+                    )
+                    .when(loading_older, |this| {
+                        this.child(
+                            h_flex()
+                                .absolute()
+                                .top_2()
+                                .left_0()
+                                .right_0()
+                                .justify_center()
+                                .child(Spinner::new().small()),
+                        )
+                    })
+                    .into_any_element()
+            }
+        }
+    }
+}
+
+/// One labeled field of the header details popover.
+struct HeaderDetail {
+    label: &'static str,
+    text: SharedString,
+    /// Channel headers are Markdown; purposes and statuses are plain text.
+    markdown: bool,
+}
+
+impl HeaderDetail {
+    fn plain(label: &'static str, text: SharedString) -> Self {
+        Self {
+            label,
+            text,
+            markdown: false,
+        }
+    }
+
+    fn markdown(label: &'static str, text: SharedString) -> Self {
+        Self {
+            label,
+            text,
+            markdown: true,
+        }
+    }
+}
+
+/// The full, wrapped title and fields the header bar truncates.
+fn render_header_details(title: &SharedString, details: &[HeaderDetail], cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    v_flex()
+        .id("channel-details-body")
+        .w_80()
+        .max_h_96()
+        .overflow_y_scroll()
+        .gap_3()
+        .whitespace_normal()
+        .text_sm()
+        .when(!title.is_empty(), |this| {
+            this.child(
+                div()
+                    .font_semibold()
+                    .text_color(theme.foreground)
+                    .child(title.clone()),
+            )
+        })
+        .children(details.iter().map(|detail| {
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(theme.muted_foreground)
+                        .child(detail.label),
+                )
+                .child(if detail.markdown {
+                    TextView::markdown(
+                        SharedString::from(format!("channel-details-{}", detail.label)),
+                        detail.text.clone(),
+                    )
+                    .selectable(true)
+                    .into_any_element()
+                } else {
+                    div()
+                        .text_color(theme.foreground)
+                        .child(detail.text.clone())
+                        .into_any_element()
+                })
+        }))
+        .into_any_element()
+}
+
+impl Focusable for TimelineView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.composer.focus_handle(cx)
+    }
+}
+
+impl Render for TimelineView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let drop_tint = cx.theme().primary.opacity(0.06);
+        v_flex()
+            .id("timeline-view")
+            .size_full()
+            .min_w_0()
+            // Drop files anywhere on the conversation to attach them.
+            .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_tint))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.composer.update(cx, |composer, cx| {
+                    composer.attach_paths(paths.paths().to_vec(), cx)
+                });
+                this.focus_composer(window, cx);
+            }))
+            .child(self.render_header(cx))
+            .child(self.render_body(cx))
+            .child(self.render_typing(cx))
+            .child(self.composer.clone())
+    }
+}
+
+/// `dir/name`, or `dir/name (2)` and so on if that file exists.
+fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let name = std::path::Path::new(name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".into());
+    let candidate = dir.join(&name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+        _ => (name.clone(), String::new()),
+    };
+    (2..)
+        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !p.exists())
+        .expect("an unused name exists")
+}
