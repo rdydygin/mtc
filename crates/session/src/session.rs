@@ -1182,7 +1182,7 @@ mod slow_network_tests {
     use serde_json::json;
 
     use super::Session;
-    use crate::{LoadState, TimelineKind};
+    use crate::{EmojiStore, LoadState, TimelineKind};
 
     /// One round trip on a poor mobile or satellite link.
     const ROUND_TRIP: Duration = Duration::from_millis(400);
@@ -1416,5 +1416,47 @@ mod slow_network_tests {
     #[gpui_kit::test]
     fn older_servers_look_up_custom_emoji_one_by_one(cx: &mut TestAppContext) {
         emoji_on_screen_load("one", cx);
+    }
+
+    #[gpui_kit::test]
+    fn failed_emoji_lookups_are_tried_again(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        // The first lookup fails through all of its retries.
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let seen = lookups.clone();
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), move |request| {
+            if seen.fetch_add(1, Ordering::SeqCst) < 4 {
+                return Reply::json(json!({ "message": "Bad gateway" })).status(502);
+            }
+            Reply::json(json!([{ "id": "e1", "name": "happy_cat" }]))
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let store = cx.new(|_| EmojiStore::new(client));
+        store.update(cx, |s, cx| s.ensure(["happy_cat"], cx));
+        wait_until(cx, |_| lookups.load(Ordering::SeqCst) >= 4);
+        store.read_with(cx, |s, _| assert!(s.custom().is_empty()));
+
+        // Asking again once the failure is known looks the name up anew.
+        wait_until(cx, |cx| {
+            store.update(cx, |s, cx| s.ensure(["happy_cat"], cx));
+            store.read_with(cx, |s, _| s.custom().len() == 1)
+        });
+        assert_eq!(lookups.load(Ordering::SeqCst), 5);
+    }
+
+    #[gpui_kit::test]
+    fn a_recreated_emoji_replaces_the_old_image(cx: &mut TestAppContext) {
+        let client = Client::new_unverified("http://localhost:1", "token").unwrap();
+        let store = cx.new(|_| EmojiStore::new(client));
+        let emoji = |id: &str| {
+            serde_json::from_value::<mattermost::Emoji>(json!({ "id": id, "name": "happy_cat" }))
+                .unwrap()
+        };
+        store.update(cx, |s, cx| s.add(vec![emoji("e1")], cx));
+        store.update(cx, |s, cx| s.add(vec![emoji("e2")], cx));
+        store.read_with(cx, |s, _| {
+            let url = s.custom().image_url("happy_cat").unwrap();
+            assert!(url.ends_with("/emoji/e2/image"), "{url}");
+        });
     }
 }

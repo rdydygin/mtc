@@ -144,6 +144,9 @@ impl EmojiStore {
         cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
             let mut found = Vec::new();
+            // Names whose lookup failed, rather than found missing, so a
+            // later `ensure` can try them again.
+            let mut failed = Vec::new();
             let mut batch_missing = false;
             if !one_by_one {
                 for chunk in names.chunks(NAMES_PER_REQUEST) {
@@ -155,22 +158,38 @@ impl EmojiStore {
                             batch_missing = true;
                             break;
                         }
-                        Err(err) => log::warn!("looking up custom emoji: {err:#}"),
+                        Err(err) => {
+                            log::warn!("looking up custom emoji: {err:#}");
+                            failed.extend(chunk);
+                        }
                     }
                 }
             }
             if one_by_one || batch_missing {
-                let lookups = names.iter().map(|name| client.custom_emoji_by_name(name));
-                for result in futures::future::join_all(lookups).await {
+                let lookups = names.iter().map(|name| {
+                    let executor = &executor;
+                    let client = &client;
+                    async move {
+                        let result = retry(executor, || client.custom_emoji_by_name(name)).await;
+                        (name, result)
+                    }
+                });
+                for (name, result) in futures::future::join_all(lookups).await {
                     match result {
                         Ok(emoji) => found.push(emoji),
                         Err(err) if is_status(&err, &[404]) => {}
-                        Err(err) => log::warn!("looking up custom emoji: {err:#}"),
+                        Err(err) => {
+                            log::warn!("looking up custom emoji: {err:#}");
+                            failed.push(name.clone());
+                        }
                     }
                 }
             }
             let _ = this.update(cx, |this, cx| {
                 this.one_by_one |= batch_missing;
+                for name in &failed {
+                    this.requested.remove(name);
+                }
                 this.add(found, cx);
             });
         })
@@ -218,13 +237,15 @@ impl EmojiStore {
         .detach();
     }
 
-    /// Add emoji found by a lookup or announced by the server.
+    /// Add emoji found by a lookup or announced by the server. An emoji
+    /// recreated under a known name replaces the old one's image.
     pub fn add(&mut self, emoji: Vec<Emoji>, cx: &mut Context<Self>) {
         let client = &self.client;
         let new: Vec<_> = emoji
             .into_iter()
-            .filter(|e| e.delete_at == 0 && !e.name.is_empty() && !self.custom.contains(&e.name))
+            .filter(|e| e.delete_at == 0 && !e.name.is_empty())
             .map(|e| (e.name.clone(), client.custom_emoji_url(&e.id)))
+            .filter(|(name, url)| self.custom.image_url(name).map(|u| &**u) != Some(url.as_str()))
             .collect();
         if new.is_empty() {
             return;
