@@ -65,8 +65,15 @@ pub struct State {
     pub updates: Updates,
 }
 
+#[cfg(not(test))]
 fn path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("mtc").join("state.json"))
+}
+
+/// Tests keep state in memory, away from the real file.
+#[cfg(test)]
+fn path() -> Option<PathBuf> {
+    None
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(read()));

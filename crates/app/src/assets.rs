@@ -15,6 +15,7 @@ gpui_kit::assets::icon_assets!(
         ChevronsUpDown,
         Circle,
         CircleAlert,
+        CircleArrowUp,
         CircleDot,
         Ellipsis,
         GitFork,

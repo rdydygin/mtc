@@ -9,12 +9,12 @@ use gpui_kit::{
 use mattermost::{ApiError, Client, TeamId, User};
 
 use crate::{
-    actions::SignOut,
+    actions::{ShowSettings, SignOut},
     appearance,
     http::ServerHttpClient,
     login::{LoginEvent, LoginView},
     persist::{self, SavedSession},
-    skeleton, update,
+    settings, skeleton, update,
     workspace::{Workspace, WorkspaceEvent},
 };
 
@@ -172,6 +172,10 @@ impl AppRoot {
         cx.notify();
     }
 
+    fn show_settings(&mut self, _: &ShowSettings, window: &mut Window, cx: &mut Context<Self>) {
+        settings::open(window, cx);
+    }
+
     fn sign_out(&mut self, _: &SignOut, window: &mut Window, cx: &mut Context<Self>) {
         let Screen::SignedIn(workspace) = &self.screen else {
             return;
@@ -194,6 +198,7 @@ impl Render for AppRoot {
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::sign_out))
+            .on_action(cx.listener(Self::show_settings))
             .map(|this| match &self.screen {
                 // The shape of the workspace about to open, so nothing
                 // jumps when it does.

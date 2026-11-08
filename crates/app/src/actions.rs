@@ -36,6 +36,8 @@ actions!(
         UseLightAppearance,
         UseDarkAppearance,
         ShowShortcuts,
+        /// Appearance, zoom, updates, and the version of this build.
+        ShowSettings,
         SignOut,
         CheckForUpdates,
         /// Quit and open the update that was installed in the background.
@@ -114,6 +116,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(ZOOM_OUT_KEY, ZoomOut, None),
         KeyBinding::new(RESET_ZOOM_KEY, ResetZoom, None),
         KeyBinding::new(primary!("/"), ShowShortcuts, None),
+        KeyBinding::new(primary!(","), ShowSettings, None),
     ]);
 
     cx.on_action(|_: &Quit, cx| cx.quit());
@@ -140,6 +143,7 @@ pub fn set_menus(cx: &mut App) {
     };
     cx.set_menus([
         Menu::new("mtc").items([
+            MenuItem::action("Settings…", ShowSettings),
             MenuItem::action("Keyboard Shortcuts…", ShowShortcuts),
             MenuItem::separator(),
             update,

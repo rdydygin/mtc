@@ -171,6 +171,7 @@ pub fn open(
             IconName::SunMoon,
             actions::UseSystemAppearance,
         ),
+        action_item("Settings", IconName::Settings, actions::ShowSettings),
         action_item(
             "Keyboard shortcuts",
             IconName::Keyboard,

@@ -23,8 +23,8 @@ use session::{Session, SessionEvent, TimelineKind};
 use crate::{
     actions::{
         CloseConversation, Dismiss, FocusComposer, NextChannel, NextUnreadChannel, PreviousChannel,
-        PreviousUnreadChannel, QuickSwitch, RESET_ZOOM_KEY, ShowShortcuts, ToggleFavorite,
-        WORKSPACE_CONTEXT, ZOOM_IN_KEY, ZOOM_OUT_KEY, shortcut_label,
+        PreviousUnreadChannel, QuickSwitch, RESET_ZOOM_KEY, ShowSettings, ShowShortcuts,
+        ToggleFavorite, WORKSPACE_CONTEXT, ZOOM_IN_KEY, ZOOM_OUT_KEY, shortcut_label,
     },
     extensions, persist,
     sidebar::{SidebarEvent, SidebarView, sections},
@@ -401,7 +401,7 @@ impl Workspace {
 
     fn show_shortcuts(&mut self, _: &ShowShortcuts, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, |dialog, window, cx| {
-            let rows: [(&str, Box<dyn Action>); 8] = [
+            let rows: [(&str, Box<dyn Action>); 9] = [
                 ("Jump to a channel or person", Box::new(QuickSwitch)),
                 ("Next channel", Box::new(NextChannel)),
                 ("Previous channel", Box::new(PreviousChannel)),
@@ -410,6 +410,7 @@ impl Workspace {
                 ("Focus the message field", Box::new(FocusComposer)),
                 ("Close conversation", Box::new(CloseConversation)),
                 ("Close thread or mark channel read", Box::new(Dismiss)),
+                ("Settings", Box::new(ShowSettings)),
             ];
             let theme = cx.theme();
             let zoom = [ZOOM_IN_KEY, ZOOM_OUT_KEY, RESET_ZOOM_KEY].map(shortcut_label);

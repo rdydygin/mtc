@@ -23,7 +23,7 @@ use session::{ChannelEntry, Connection, Session};
 
 use crate::{
     actions::{
-        QUICK_SWITCH_KEY, QuickSwitch, ShowShortcuts, SignOut, UseDarkAppearance,
+        QUICK_SWITCH_KEY, QuickSwitch, ShowSettings, ShowShortcuts, SignOut, UseDarkAppearance,
         UseLightAppearance, UseSystemAppearance, shortcut_label,
     },
     http::avatar_url,
@@ -593,6 +593,7 @@ impl SidebarView {
                         crate::status::open(session.clone(), window, cx);
                     }
                 };
+                let settings = close.clone();
                 let shortcuts = close.clone();
                 let sign_out = close.clone();
                 let _ = window;
@@ -729,6 +730,25 @@ impl SidebarView {
                     .child(Separator::horizontal())
                     .child(
                         v_flex()
+                            .child(
+                                Button::new("account-settings")
+                                    .small()
+                                    .ghost()
+                                    .accessibility_label("Settings…")
+                                    .w_full()
+                                    .justify_start()
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .gap_2()
+                                            .child(Icon::new(IconName::Settings).small())
+                                            .child("Settings…"),
+                                    )
+                                    .on_click(move |_, window, cx| {
+                                        settings(cx);
+                                        window.dispatch_action(Box::new(ShowSettings), cx);
+                                    }),
+                            )
                             .child(
                                 Button::new("account-shortcuts")
                                     .small()
