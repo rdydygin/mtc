@@ -10,7 +10,7 @@ use std::{rc::Rc, sync::Arc};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, Selectable as _, Sizable as _, StyledExt as _,
+    ActiveTheme as _, GlobalState, Icon, Selectable as _, Sizable as _, StyledExt as _,
     attachment::{
         Attachment, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle,
     },
@@ -560,19 +560,23 @@ impl PostRow {
         )
     }
 
-    /// Reactions, with the reply count at the far end of the same line.
+    /// Reactions. A continuation has no header line for the reply count,
+    /// so it follows the reactions here instead.
     fn render_footer(&self) -> Option<AnyElement> {
         let reactions = self.render_reactions();
-        let thread = self.render_thread_summary();
+        let thread = self
+            .continuation
+            .then(|| self.render_thread_summary())
+            .flatten();
         if reactions.is_none() && thread.is_none() {
             return None;
         }
         Some(
             h_flex()
-                .w_full()
-                .items_start()
-                .gap_2()
-                .child(div().flex_1().min_w_0().children(reactions))
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .children(reactions)
                 .children(thread)
                 .into_any_element(),
         )
@@ -728,7 +732,9 @@ impl RenderOnce for PostRow {
         );
         let actions_revealed = *actions_open.read(cx) || actions_focus.is_focused(window);
         // Whether the current press began on a control inside the row, which
-        // handles it; buttons mark their presses with `prevent_default`.
+        // handles it. Controls claim their presses by suppressing text
+        // selection; `prevent_default` alone can't tell, because the message
+        // text is focusable and focusing it on press prevents default too.
         let pressed_control = window.use_keyed_state(
             SharedString::from(format!("post-pressed-control-{}", post.id)),
             cx,
@@ -835,6 +841,9 @@ impl RenderOnce for PostRow {
                             Tooltip::new(full_time.clone()).build(window, cx)
                         }),
                 )
+                // The reply count rides on the header rather than taking a
+                // line of its own under the message.
+                .children(self.render_thread_summary())
         });
 
         let on_action = self.on_action.clone();
@@ -863,8 +872,13 @@ impl RenderOnce for PostRow {
             .when(self.thread_entry && sent && !is_system, |this| {
                 let on_action = self.on_action.clone();
                 let pressed = pressed_control.clone();
-                this.on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    let on_control = window.default_prevented();
+                // Start each press unclaimed, before any control below sees it.
+                this.capture_any_mouse_down(|_, _, cx| {
+                    GlobalState::init(cx);
+                    GlobalState::reset_text_selection_suppression(cx);
+                })
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    let on_control = GlobalState::is_text_selection_suppressed(cx);
                     pressed.update(cx, |pressed, _| *pressed = on_control);
                 })
                 .on_click(move |event, window, cx| {
@@ -1157,7 +1171,188 @@ fn post_menu(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{
+        AppContext as _, Bounds, Context, InputEvent as _, MouseDownEvent, MouseMoveEvent,
+        MouseUpEvent, Pixels, Render, TestAppContext, WindowBounds, WindowOptions, point, size,
+    };
+    use mattermost::{Post, Reaction};
+    use session::{Directory, Timeline, TimelineKind};
+
     use super::*;
+
+    /// A thread root with a reply and a reaction, rendered as the channel
+    /// timeline renders it.
+    struct OneRow {
+        entry: Entry,
+        rich_text: Entity<TextViewState>,
+        actions: Rc<RefCell<Vec<PostAction>>>,
+    }
+
+    impl Render for OneRow {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let actions = self.actions.clone();
+            div().w(px(600.)).child(
+                PostRow::new(
+                    self.entry.clone(),
+                    "me".into(),
+                    Rc::new(move |action, _, _| actions.borrow_mut().push(action)),
+                )
+                .rich_text(Some(self.rich_text.clone()))
+                .thread_entry(true),
+            )
+        }
+    }
+
+    fn open_row(
+        cx: &mut TestAppContext,
+    ) -> (gpui_kit::AnyWindowHandle, Rc<RefCell<Vec<PostAction>>>) {
+        cx.update(gpui_kit::init);
+        let client = Client::new_unverified("http://localhost:1", "token").unwrap();
+        let mut me = User::default();
+        me.id = "me".into();
+        let directory = cx.new(|_| Directory::new(client.clone(), me));
+        let timeline = cx.new(|_| {
+            Timeline::new(
+                TimelineKind::Channel("c".into()),
+                client,
+                directory,
+                CustomEmojis::default(),
+            )
+        });
+        let mut post = Post::default();
+        post.id = "root".into();
+        post.channel_id = "c".into();
+        post.user_id = "them".into();
+        post.create_at = 1;
+        post.message = "ku, **1x1**?".into();
+        post.reply_count = 1;
+        let mut reaction = Reaction::default();
+        reaction.user_id = "them".into();
+        reaction.post_id = "root".into();
+        reaction.emoji_name = "+1".into();
+        post.metadata.reactions.push(reaction);
+        timeline.update(cx, |t, cx| t.upsert(post, cx));
+        let entry = timeline.read_with(cx, |t, _| t.entries()[0].clone());
+        assert!(entry.message().is_rich());
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.update(|cx| {
+            let text = entry.message().text().clone();
+            let actions = actions.clone();
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: point(px(0.), px(0.)),
+                        size: size(px(800.), px(400.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                move |_, cx| {
+                    let rich_text =
+                        cx.new(|cx| TextViewState::markdown(&text, cx).selectable(true));
+                    cx.new(|_| OneRow {
+                        entry,
+                        rich_text,
+                        actions,
+                    })
+                },
+            )
+            .unwrap()
+            .0
+        });
+        cx.run_until_parked();
+        (window, actions)
+    }
+
+    fn opened_thread(actions: &RefCell<Vec<PostAction>>) -> usize {
+        actions
+            .borrow()
+            .iter()
+            .filter(|action| matches!(action, PostAction::OpenThread))
+            .count()
+    }
+
+    /// A plain left click at a window position, through native dispatch.
+    fn click_point(window: &mut Window, position: gpui_kit::Point<Pixels>, cx: &mut App) {
+        window.dispatch_event(
+            MouseMoveEvent {
+                position,
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseDownEvent {
+                position,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    }
+
+    #[gpui_kit::test]
+    fn clicking_the_message_text_opens_its_thread(cx: &mut TestAppContext) {
+        let (window, actions) = open_row(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            // The message sits between the header and the reactions.
+            let header = window.find("thread").bounds();
+            let reactions = window.find("reaction-+1").bounds();
+            let y = (header.bottom() + reactions.top()) / 2.;
+            click_point(window, point(reactions.left() + px(4.), y), cx);
+        })
+        .unwrap();
+        assert_eq!(opened_thread(&actions), 1);
+    }
+
+    #[gpui_kit::test]
+    fn the_reply_count_shares_the_header_and_opens_the_thread_once(cx: &mut TestAppContext) {
+        let (window, actions) = open_row(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let thread = window.find("thread").bounds();
+            let reactions = window.find("reaction-+1").bounds();
+            // Above the message on the author's line, not under it.
+            assert!(thread.bottom() < reactions.top());
+            assert!(thread.left() > reactions.left());
+            window.click("thread", cx);
+        })
+        .unwrap();
+        assert_eq!(opened_thread(&actions), 1);
+    }
+
+    #[gpui_kit::test]
+    fn pressing_a_reaction_does_not_open_the_thread(cx: &mut TestAppContext) {
+        let (window, actions) = open_row(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("reaction-+1", cx);
+        })
+        .unwrap();
+        assert_eq!(opened_thread(&actions), 0);
+        assert!(matches!(
+            actions.borrow().as_slice(),
+            [PostAction::ToggleReaction(name)] if name == "+1"
+        ));
+    }
 
     fn labels(entries: &[PostMenuEntry]) -> Vec<&str> {
         entries
