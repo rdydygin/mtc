@@ -796,7 +796,7 @@ impl RenderOnce for PostRow {
                         .and_then(|u| u.custom_status(&time::now_rfc3339())),
                     |this, status| {
                         let tooltip: SharedString = if status.text.is_empty() {
-                            format!(":{}:", status.emoji).into()
+                            format!(":{}:", session::emoji_name(&status.emoji)).into()
                         } else {
                             status.text.clone().into()
                         };

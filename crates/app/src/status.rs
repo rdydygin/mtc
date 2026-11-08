@@ -73,7 +73,9 @@ pub fn presence_color(status: Status, cx: &App) -> Hsla {
     }
 }
 
+/// An emoji as text: the character, or `:name:` when there is none.
 pub fn emoji_char(name: &str) -> SharedString {
+    let name = session::emoji_name(name);
     session::emoji_for(name)
         .map(SharedString::from)
         .unwrap_or_else(|| SharedString::from(format!(":{name}:")))
@@ -82,6 +84,7 @@ pub fn emoji_char(name: &str) -> SharedString {
 /// An emoji as drawn beside text: the character, or the server's image for
 /// a custom emoji, sized to the surrounding text.
 pub fn emoji_element(name: &str, custom: &CustomEmojis) -> AnyElement {
+    let name = session::emoji_name(name);
     match custom.image_url(name) {
         Some(url) if session::emoji_for(name).is_none() => img(SharedString::from(url.clone()))
             .flex_none()

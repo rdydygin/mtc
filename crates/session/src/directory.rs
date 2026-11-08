@@ -4,8 +4,10 @@ use std::{
     time::Duration,
 };
 
-use gpui_kit::{Context, SharedString, Task};
+use gpui_kit::{Context, Entity, SharedString, Task};
 use mattermost::{Client, Status, User, UserId};
+
+use crate::EmojiStore;
 
 /// Users and their presence, fetched on demand.
 ///
@@ -14,6 +16,8 @@ use mattermost::{Client, Status, User, UserId};
 /// posts by forty authors costs one request, not forty.
 pub struct Directory {
     client: Client,
+    /// Where the custom emoji in users' statuses are looked up.
+    emoji: Entity<EmojiStore>,
     users: HashMap<UserId, Arc<User>>,
     statuses: HashMap<UserId, Status>,
     queued: HashSet<UserId>,
@@ -24,11 +28,13 @@ pub struct Directory {
 const BATCH_WINDOW: Duration = Duration::from_millis(16);
 
 impl Directory {
-    pub fn new(client: Client, me: User) -> Self {
+    /// `emoji` should already be asked for `me`'s status emoji.
+    pub fn new(client: Client, me: User, emoji: Entity<EmojiStore>) -> Self {
         let mut users = HashMap::new();
         users.insert(me.id.clone(), Arc::new(me));
         Self {
             client,
+            emoji,
             users,
             statuses: HashMap::new(),
             queued: HashSet::new(),
@@ -99,6 +105,7 @@ impl Directory {
                 }
                 match users {
                     Ok(users) => {
+                        this.request_status_emoji(&users, cx);
                         for user in users {
                             this.users.insert(user.id.clone(), Arc::new(user));
                         }
@@ -143,15 +150,39 @@ impl Directory {
     ) {
         if let Some(user) = self.users.get_mut(id) {
             change(Arc::make_mut(user));
+            let user = user.clone();
+            self.request_status_emoji([user.as_ref()], cx);
             cx.notify();
         }
     }
 
     /// Insert users learned elsewhere, such as from a search.
     pub fn insert(&mut self, users: impl IntoIterator<Item = User>, cx: &mut Context<Self>) {
+        let users: Vec<User> = users.into_iter().collect();
+        self.request_status_emoji(&users, cx);
         for user in users {
             self.users.insert(user.id.clone(), Arc::new(user));
         }
         cx.notify();
+    }
+
+    /// Look up the custom emoji in `users`' statuses, so they draw as
+    /// images rather than `:name:`.
+    fn request_status_emoji<'a>(
+        &self,
+        users: impl IntoIterator<Item = &'a User>,
+        cx: &mut Context<Self>,
+    ) {
+        // Expired statuses are looked up too; a spare lookup is harmless.
+        let names: Vec<String> = users
+            .into_iter()
+            .filter_map(|user| user.custom_status(""))
+            .map(|status| status.emoji)
+            .collect();
+        if !names.is_empty() {
+            self.emoji.update(cx, |emoji, cx| {
+                emoji.ensure(names.iter().map(String::as_str), cx)
+            });
+        }
     }
 }

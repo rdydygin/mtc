@@ -3,7 +3,9 @@ use std::{ops::Range, sync::Arc, time::SystemTime};
 use gpui_kit::{Context, Entity, EventEmitter, SharedString, Task};
 use mattermost::{ChannelId, Client, Millis, Post, PostId, PostList, Reaction, UserId};
 
-use crate::{CustomEmojis, Directory, PreparedMessage, retry::retry};
+use crate::{
+    CustomEmojis, Directory, EmojiStore, PreparedMessage, prepare::custom_emoji_names, retry::retry,
+};
 
 /// Posts requested per page. Large enough to fill a tall window, small
 /// enough to decode in well under a frame.
@@ -174,6 +176,9 @@ pub struct Timeline {
     kind: TimelineKind,
     client: Client,
     directory: Entity<Directory>,
+    /// Where custom emoji in messages and reactions are looked up; the
+    /// session hands their images back through [`Self::set_custom_emoji`].
+    emoji: Entity<EmojiStore>,
     custom_emoji: CustomEmojis,
     entries: Vec<Entry>,
     state: LoadState,
@@ -197,12 +202,14 @@ impl Timeline {
         kind: TimelineKind,
         client: Client,
         directory: Entity<Directory>,
+        emoji: Entity<EmojiStore>,
         custom_emoji: CustomEmojis,
     ) -> Self {
         Self {
             kind,
             client,
             directory,
+            emoji,
             custom_emoji,
             entries: Vec::new(),
             state: LoadState::NotLoaded,
@@ -301,7 +308,7 @@ impl Timeline {
         self.entries = self.adopt(prepared);
         self.entries.extend(pending);
         self.state = LoadState::Loaded;
-        self.request_authors(0..self.entries.len(), cx);
+        self.request_missing(0..self.entries.len(), cx);
         cx.emit(TimelineEvent::Reset);
         cx.notify();
     }
@@ -358,7 +365,7 @@ impl Timeline {
                         this.has_older = posts.len() >= PAGE_SIZE / 2;
                         let count = posts.len();
                         this.entries.splice(0..0, posts);
-                        this.request_authors(0..count, cx);
+                        this.request_missing(0..count, cx);
                         cx.emit(TimelineEvent::Spliced {
                             old: 0..0,
                             new_count: count,
@@ -419,6 +426,7 @@ impl Timeline {
         if !self.accepts(&post) {
             return;
         }
+        self.request_emoji([&post], cx);
         if let Some(ix) = self.position(&post.id) {
             self.entries[ix] = Entry::new(post, Delivery::Sent, &self.custom_emoji);
             cx.emit(TimelineEvent::Updated(ix));
@@ -502,6 +510,10 @@ impl Timeline {
     }
 
     pub fn apply_reaction(&mut self, reaction: &Reaction, added: bool, cx: &mut Context<Self>) {
+        if added {
+            let name = reaction.emoji_name.as_str();
+            self.emoji.update(cx, |emoji, cx| emoji.ensure([name], cx));
+        }
         self.update_post(&reaction.post_id, cx, |post| {
             let reactions = &mut post.metadata.reactions;
             let existing = reactions
@@ -545,12 +557,29 @@ impl Timeline {
         });
     }
 
-    fn request_authors(&self, range: Range<usize>, cx: &mut Context<Self>) {
-        let ids: Vec<UserId> = self.entries[range]
-            .iter()
-            .map(|e| e.post.user_id.clone())
-            .collect();
+    /// Look up the authors and custom emoji of the entries in `range`.
+    fn request_missing(&self, range: Range<usize>, cx: &mut Context<Self>) {
+        let entries = &self.entries[range];
+        let ids: Vec<UserId> = entries.iter().map(|e| e.post.user_id.clone()).collect();
         self.directory.update(cx, |d, cx| d.ensure(ids, cx));
+        self.request_emoji(entries.iter().map(|e| e.post.as_ref()), cx);
+    }
+
+    /// Look up the custom emoji that `posts` use in messages and reactions.
+    fn request_emoji<'a>(&self, posts: impl IntoIterator<Item = &'a Post>, cx: &mut Context<Self>) {
+        let mut names = Vec::new();
+        for post in posts {
+            names.extend(custom_emoji_names(&post.message));
+            names.extend(
+                post.metadata
+                    .reactions
+                    .iter()
+                    .map(|r| r.emoji_name.as_str()),
+            );
+        }
+        if !names.is_empty() {
+            self.emoji.update(cx, |emoji, cx| emoji.ensure(names, cx));
+        }
     }
 }
 
@@ -577,12 +606,14 @@ mod tests {
         let client = Client::new_unverified("http://localhost:1", "token").unwrap();
         let mut me = User::default();
         me.id = "me".into();
-        let directory = cx.new(|_| Directory::new(client.clone(), me));
+        let emoji = cx.new(|_| EmojiStore::new(client.clone()));
+        let directory = cx.new(|_| Directory::new(client.clone(), me, emoji.clone()));
         let timeline = cx.new(|_| {
             Timeline::new(
                 TimelineKind::Channel("c".into()),
                 client,
                 directory,
+                emoji,
                 CustomEmojis::default(),
             )
         });
