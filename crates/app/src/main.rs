@@ -18,6 +18,7 @@ mod login;
 mod palette;
 mod persist;
 mod post_row;
+mod settings;
 mod sidebar;
 mod skeleton;
 mod sso;

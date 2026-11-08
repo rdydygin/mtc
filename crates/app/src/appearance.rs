@@ -8,9 +8,9 @@ use gpui_kit::{App, Window, px};
 
 use crate::persist::{self, Appearance};
 
-const DEFAULT_FONT_SIZE: f32 = 14.;
-const MIN_FONT_SIZE: f32 = 11.;
-const MAX_FONT_SIZE: f32 = 22.;
+pub const DEFAULT_FONT_SIZE: f32 = 14.;
+pub const MIN_FONT_SIZE: f32 = 11.;
+pub const MAX_FONT_SIZE: f32 = 22.;
 
 /// Apply the saved appearance and zoom at startup.
 pub fn restore(cx: &mut App) {
@@ -20,6 +20,11 @@ pub fn restore(cx: &mut App) {
     Theme::update(cx, |theme| {
         theme.font_size = px(size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE))
     });
+}
+
+/// The appearance the user chose.
+pub fn current() -> Appearance {
+    persist::read_with(|state| state.appearance)
 }
 
 pub fn set(appearance: Appearance, cx: &mut App) {
@@ -55,6 +60,22 @@ pub fn zoom(step: f32, cx: &mut App) {
     let next = (current + step).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
     Theme::update(cx, |theme| theme.font_size = px(next));
     persist::update(|state| state.font_size = Some(next));
+}
+
+/// The interface zoom, as the base font size in pixels.
+pub fn font_size(cx: &App) -> f32 {
+    Theme::global(cx).font_size.as_f32()
+}
+
+/// Zoom to a base font size, within the supported range.
+pub fn set_font_size(size: f32, cx: &mut App) {
+    if size.round() == DEFAULT_FONT_SIZE {
+        reset_zoom(cx);
+        return;
+    }
+    let size = size.round().clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+    Theme::update(cx, |theme| theme.font_size = px(size));
+    persist::update(|state| state.font_size = Some(size));
 }
 
 pub fn reset_zoom(cx: &mut App) {

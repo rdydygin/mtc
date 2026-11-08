@@ -86,6 +86,10 @@ pub struct Updater {
     /// when there is nothing new.
     manual: bool,
     last_check: Option<SystemTime>,
+    /// When a check last reached the feed.
+    checked_at: Option<SystemTime>,
+    /// Why the last check failed, until the next one starts.
+    error: Option<SharedString>,
     /// The newest version already announced, so later automatic checks
     /// don't announce it again.
     announced: Option<Version>,
@@ -136,6 +140,13 @@ pub fn set_automatic(automatic: bool, cx: &mut App) {
         }
     });
     crate::actions::set_menus(cx);
+    // Settings and ⌘K read the preference while rendering.
+    cx.refresh_windows();
+}
+
+/// The version of this build, such as `0.1.0`.
+pub fn version() -> Version {
+    current_version()
 }
 
 /// Whether mtc checks for updates on its own.
@@ -149,6 +160,12 @@ fn feed_override() -> Option<String> {
     std::env::var("MTC_UPDATE_FEED")
         .ok()
         .filter(|feed| !feed.is_empty())
+}
+
+/// Whether this copy can install updates itself, rather than only say a new
+/// version is out.
+pub fn can_install(cx: &App) -> bool {
+    installable_bundle(cx).is_some()
 }
 
 /// The app bundle this copy runs from, when it can replace itself.
@@ -185,10 +202,26 @@ impl Updater {
             feed: feed_override().unwrap_or_else(|| manifest::FEED_URL.to_owned()),
             manual: false,
             last_check: None,
+            checked_at: None,
+            error: None,
             announced: None,
             _check: None,
             _schedule: schedule,
         }
+    }
+
+    pub fn status(&self) -> &UpdateStatus {
+        &self.status
+    }
+
+    /// When a check last reached the release feed, whatever it found.
+    pub fn checked_at(&self) -> Option<SystemTime> {
+        self.checked_at
+    }
+
+    /// Why the last check failed, if it did.
+    pub fn error(&self) -> Option<&SharedString> {
+        self.error.as_ref()
     }
 
     fn is_due(&self) -> bool {
@@ -224,6 +257,7 @@ impl Updater {
         }
         self.manual = manual;
         self.last_check = Some(SystemTime::now());
+        self.error = None;
         let previous = std::mem::replace(&mut self.status, UpdateStatus::Checking);
         cx.notify();
 
@@ -279,6 +313,7 @@ impl Updater {
 
     fn up_to_date(&mut self, cx: &mut Context<Self>) {
         self.status = UpdateStatus::Idle;
+        self.checked_at = Some(SystemTime::now());
         if std::mem::take(&mut self.manual) {
             cx.emit(UpdateEvent::UpToDate);
         }
@@ -293,6 +328,7 @@ impl Updater {
         cx: &mut Context<Self>,
     ) {
         let page = SharedString::from(page);
+        self.checked_at = Some(SystemTime::now());
         self.status = UpdateStatus::Available {
             version: version.clone(),
             page: page.clone(),
@@ -309,8 +345,9 @@ impl Updater {
         cx.notify();
     }
 
-    fn installed(&mut self, version: Version, cx: &mut Context<Self>) {
+    pub(crate) fn installed(&mut self, version: Version, cx: &mut Context<Self>) {
         log::info!("installed mtc {version}; it starts on the next launch");
+        self.checked_at = Some(SystemTime::now());
         self.status = UpdateStatus::Ready {
             version: version.clone(),
         };
@@ -326,6 +363,8 @@ impl Updater {
     fn failed(&mut self, previous: UpdateStatus, err: anyhow::Error, cx: &mut Context<Self>) {
         log::warn!("checking for updates: {err:#}");
         self.status = previous;
+        // Settings has room for the gist; the log has the details.
+        self.error = Some(as_sentence(err.to_string()).into());
         if std::mem::take(&mut self.manual) {
             cx.emit(UpdateEvent::Failed {
                 message: sentence(&err).into(),
@@ -337,7 +376,10 @@ impl Updater {
 
 /// An error as a sentence: capitalized, with a final period.
 fn sentence(err: &anyhow::Error) -> String {
-    let text = format!("{err:#}");
+    as_sentence(format!("{err:#}"))
+}
+
+fn as_sentence(text: String) -> String {
     let mut chars = text.chars();
     let mut sentence: String = chars
         .next()

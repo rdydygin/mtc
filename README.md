@@ -27,8 +27,10 @@ or `~/Applications`. A copy opened straight from Downloads runs from a read-only
 location until it is moved; that copy, builds you made yourself, and Linux and Windows
 show **Update available** instead, linking to the release.
 
-**Check for Updates** in the mtc menu (or ⌘K) checks right away. Uncheck **Update
-Automatically** in the same menu to only check when you ask.
+**Settings** (⌘,) shows the version you're running under **Updates**, with a **Check for
+updates** button that reports the result in place: up to date, a new version, or why the
+check failed. **Check for Updates** in the mtc menu (or ⌘K) checks too. Turn off **Update
+automatically** in Settings, or uncheck it in the mtc menu, to only check when you ask.
 
 ### Single sign-on (SAML, OpenID, Microsoft, Google, GitLab)
 
@@ -78,6 +80,7 @@ On Linux and Windows, use Ctrl where the table says ⌘, Alt for ⌥, and Shift 
 | ⌘W | Close the conversation (keeps its draft) |
 | ⌘= / ⌘- / ⌘0 | Zoom in / out / actual size |
 | ⌘/ | All shortcuts |
+| ⌘, | Settings: appearance, text size, updates, version |
 
 Attach files with the paperclip, by dropping them on a conversation, or by pasting an
 image; they upload right away and send with the message. Click an attachment to download
