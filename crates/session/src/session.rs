@@ -1272,26 +1272,33 @@ mod slow_network_tests {
             .at()
     }
 
+    // These tests check when the server saw each request, not how long the
+    // whole startup took: a request sent less than a round trip after
+    // another cannot have waited for its answer. Wall-clock totals would
+    // also count client setup (reading the system's certificates is slow on
+    // macOS) and the test machine's load, and so flake.
+
     #[gpui_kit::test]
     fn the_sidebar_fills_in_one_round_trip(cx: &mut TestAppContext) {
         let server = SlowServer::start(Network::new(ROUND_TRIP), route);
-        let started = Instant::now();
         let session = start(&server, cx);
         wait_until(cx, |cx| {
             session.read_with(cx, |s, _| s.is_loaded() && s.teams_loaded())
         });
-        let elapsed = started.elapsed();
 
-        // The remembered team's channels were asked for before the team
-        // list came back, not after it.
+        // The remembered team's channels and read state were asked for
+        // before the team list came back, not after it.
         let teams = arrival(&server, "/api/v4/users/me/teams");
-        let channels = arrival(&server, "/api/v4/users/me/teams/team/channels");
-        assert!(
-            channels < teams + ROUND_TRIP / 2,
-            "{channels:?} vs {teams:?}"
-        );
-        // One round trip and change, where it used to take two.
-        assert!(elapsed < ROUND_TRIP * 3 / 2, "loaded after {elapsed:?}");
+        for path in [
+            "/api/v4/users/me/teams/team/channels",
+            "/api/v4/users/me/teams/team/channels/members",
+        ] {
+            let at = arrival(&server, path);
+            assert!(
+                at < teams + ROUND_TRIP / 2,
+                "{path} at {at:?}, teams at {teams:?}"
+            );
+        }
         session.read_with(cx, |s, _| {
             assert!(s.channel(&"town".into()).is_some());
             assert_eq!(s.team().map(|t| t.display_name.as_str()), Some("Team"));
@@ -1301,7 +1308,6 @@ mod slow_network_tests {
     #[gpui_kit::test]
     fn the_last_conversation_loads_alongside_the_sidebar(cx: &mut TestAppContext) {
         let server = SlowServer::start(Network::new(ROUND_TRIP), route);
-        let started = Instant::now();
         let session = start(&server, cx);
         // What the workspace does at startup for the conversation open last.
         let timeline = session.update(cx, |s, cx| {
@@ -1311,10 +1317,13 @@ mod slow_network_tests {
             session.read_with(cx, |s, _| s.is_loaded())
                 && timeline.read_with(cx, |t, _| t.state() == &LoadState::Loaded)
         });
+        // Its posts were asked for alongside the channel list, not once the
+        // list had confirmed the channel.
+        let channels = arrival(&server, "/api/v4/users/me/teams/team/channels");
+        let posts = arrival(&server, "/api/v4/channels/town/posts");
         assert!(
-            started.elapsed() < ROUND_TRIP * 3 / 2,
-            "{:?}",
-            started.elapsed()
+            posts < channels + ROUND_TRIP / 2,
+            "posts at {posts:?}, channels at {channels:?}"
         );
         timeline.read_with(cx, |t, _| assert_eq!(t.entries().len(), 1));
 
