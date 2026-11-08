@@ -164,15 +164,17 @@ impl User {
         (!status.is_empty() && !status.is_expired_at(now_rfc3339)).then_some(status)
     }
 
-    /// The name shown beside posts: the full name when the user set one,
-    /// otherwise the username.
+    /// The name people know the user by: the full name, then the nickname,
+    /// then the username. The full name comes first because servers that
+    /// sync accounts from a directory often fill the nickname with the login.
     pub fn display_name(&self) -> String {
         let full = format!("{} {}", self.first_name.trim(), self.last_name.trim());
         let full = full.trim();
-        if !self.nickname.trim().is_empty() {
-            self.nickname.trim().to_string()
-        } else if !full.is_empty() {
+        let nickname = self.nickname.trim();
+        if !full.is_empty() {
             full.to_string()
+        } else if !nickname.is_empty() && !nickname.eq_ignore_ascii_case(&self.username) {
+            nickname.to_string()
         } else {
             self.username.clone()
         }
@@ -551,6 +553,25 @@ mod tests {
             serde_json::Value::String(String::new()),
         );
         assert!(user.custom_status("2026-11-07T17:30:00Z").is_none());
+    }
+
+    #[test]
+    fn display_name_prefers_full_name() {
+        let user = |first: &str, last: &str, nickname: &str| User {
+            username: "efkovalev".into(),
+            first_name: first.into(),
+            last_name: last.into(),
+            nickname: nickname.into(),
+            ..User::default()
+        };
+        assert_eq!(
+            user("Evgeniy", "Kovalev", "efkovalev").display_name(),
+            "Evgeniy Kovalev"
+        );
+        assert_eq!(user("Avito.People", "", "").display_name(), "Avito.People");
+        assert_eq!(user("", "", "Zhenya").display_name(), "Zhenya");
+        assert_eq!(user("", "", "EFKovalev").display_name(), "efkovalev");
+        assert_eq!(user(" ", "", "").display_name(), "efkovalev");
     }
 
     #[test]
