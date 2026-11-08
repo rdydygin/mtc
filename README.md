@@ -144,3 +144,7 @@ MTC_SSO_SERVER=… MTC_SSO_CALLBACK='…/login/desktop?…' cargo test -p matter
 
 To run a throwaway server locally:
 `docker run --platform linux/amd64 -d --name mtc-mattermost -p 8065:8065 mattermost/mattermost-preview`.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
