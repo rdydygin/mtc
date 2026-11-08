@@ -172,6 +172,11 @@ pub fn can_install(cx: &App) -> bool {
 fn installable_bundle(cx: &App) -> Option<PathBuf> {
     // Without a build for this platform there is nothing to install.
     manifest::PLATFORM?;
+    // GPUI's test platform doesn't implement `app_path`, and a test
+    // never runs from an installed bundle anyway.
+    if cfg!(test) {
+        return None;
+    }
     let path = cx.app_path().ok()?;
     // macOS runs an app opened straight from a download from a read-only
     // copy ("App Translocation") until it is moved, e.g. to Applications.
