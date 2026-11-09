@@ -426,9 +426,7 @@ pub fn register_callback_schemes(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use gpui_kit::test::TestWindowExt as _;
-    use gpui_kit::{
-        AppContext as _, Bounds, TestAppContext, WindowBounds, WindowOptions, point, px, size,
-    };
+    use gpui_kit::{Bounds, TestAppContext, WindowBounds, WindowOptions, point, px, size};
 
     use super::*;
 
