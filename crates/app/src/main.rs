@@ -7,6 +7,7 @@ mod actions;
 mod app_root;
 mod appearance;
 mod assets;
+mod cache;
 mod composer;
 #[cfg(not(target_os = "macos"))]
 mod deep_link;

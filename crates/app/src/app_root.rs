@@ -10,7 +10,7 @@ use mattermost::{ApiError, Client, TeamId, User};
 
 use crate::{
     actions::{ShowSettings, SignOut},
-    appearance,
+    appearance, cache,
     http::ServerHttpClient,
     login::{LoginEvent, LoginView},
     persist::{self, SavedSession},
@@ -138,6 +138,8 @@ impl AppRoot {
     ) {
         // Lets avatars and thumbnails load through GPUI's image cache.
         cx.set_http_client(ServerHttpClient::new(client.clone()));
+        cx.background_spawn(async { cache::prune_images() })
+            .detach();
         let server = client.server().to_string();
         persist::update(|state| {
             let team_id = state
@@ -186,6 +188,9 @@ impl AppRoot {
         })
         .detach();
         persist::update(|state| state.session = None);
+        // The account's pictures, attachment previews, and contacts
+        // shouldn't outlast it on this computer.
+        cx.background_spawn(async { cache::clear() }).detach();
         self.show_login(None, window, cx);
     }
 }

@@ -306,6 +306,12 @@ impl Session {
         &self.custom_emoji
     }
 
+    /// Where custom emoji are looked up; [`Self::custom_emoji`] is its
+    /// latest snapshot.
+    pub fn emoji_store(&self) -> &Entity<EmojiStore> {
+        &self.emoji
+    }
+
     /// The name people know a channel by. Direct and group messages are
     /// named after the other participants.
     pub fn channel_label(&self, entry: &ChannelEntry, cx: &App) -> SharedString {
@@ -1839,5 +1845,80 @@ mod slow_network_tests {
             let url = s.custom().image_url("happy_cat").unwrap();
             assert!(url.ends_with("/emoji/e2/image"), "{url}");
         });
+    }
+
+    /// Emoji saved by an earlier run: one recreated since, one deleted.
+    fn remembered_emoji() -> Vec<(String, String)> {
+        vec![
+            (
+                "happy_cat".into(),
+                "http://old/api/v4/emoji/e0/image".into(),
+            ),
+            ("gone".into(), "http://old/api/v4/emoji/e9/image".into()),
+        ]
+    }
+
+    fn image(store: &Entity<EmojiStore>, name: &str, cx: &mut TestAppContext) -> Option<String> {
+        store.read_with(cx, |s, _| s.custom().image_url(name).map(|u| u.to_string()))
+    }
+
+    #[gpui_kit::test]
+    fn remembered_emoji_show_until_the_full_list_corrects_them(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let server =
+            SlowServer::start(
+                Network::new(Duration::from_millis(20)),
+                |request| match request.path().split('?').next().unwrap_or_default() {
+                    "/api/v4/emoji" => Reply::json(json!([{ "id": "e1", "name": "happy_cat" }])),
+                    _ => Reply::not_found(),
+                },
+            );
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let store = cx.new(|_| EmojiStore::new(client));
+        store.update(cx, |s, cx| s.remember(remembered_emoji(), cx));
+        assert!(image(&store, "gone", cx).is_some(), "shown at once");
+
+        store.update(cx, |s, cx| s.load_all(cx));
+        wait_until(cx, |cx| image(&store, "gone", cx).is_none());
+        let url = image(&store, "happy_cat", cx).unwrap();
+        assert!(url.ends_with("/emoji/e1/image"), "{url}");
+
+        // The complete list is newer than anything remembered.
+        store.update(cx, |s, cx| s.remember(remembered_emoji(), cx));
+        assert!(image(&store, "gone", cx).is_none());
+    }
+
+    #[gpui_kit::test]
+    fn remembered_emoji_are_confirmed_by_name_without_the_full_list(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let server =
+            SlowServer::start(
+                Network::new(Duration::from_millis(20)),
+                |request| match request.path().split('?').next().unwrap_or_default() {
+                    "/api/v4/emoji" => Reply::json(json!({ "message": "Forbidden" })).status(403),
+                    "/api/v4/emoji/names" => {
+                        Reply::json(json!([{ "id": "e1", "name": "happy_cat" }]))
+                    }
+                    _ => Reply::not_found(),
+                },
+            );
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let store = cx.new(|_| EmojiStore::new(client));
+        store.update(cx, |s, cx| {
+            s.remember(remembered_emoji(), cx);
+            s.load_all(cx);
+            s.ensure(["happy_cat", "gone"], cx);
+        });
+        assert!(image(&store, "gone", cx).is_some(), "shown at once");
+
+        wait_until(cx, |cx| image(&store, "gone", cx).is_none());
+        let url = image(&store, "happy_cat", cx).unwrap();
+        assert!(url.ends_with("/emoji/e1/image"), "{url}");
+        let lookups = server
+            .requests()
+            .iter()
+            .filter(|r| r.path() == "/api/v4/emoji/names")
+            .count();
+        assert_eq!(lookups, 1);
     }
 }

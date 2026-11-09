@@ -49,6 +49,17 @@ impl CustomEmojis {
         Arc::make_mut(&mut self.urls).insert(name, url.into());
     }
 
+    pub fn remove(&mut self, name: &str) {
+        if self.urls.contains_key(name) {
+            Arc::make_mut(&mut self.urls).remove(name);
+        }
+    }
+
+    /// Every `(name, image URL)` pair, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.urls.iter().map(|(name, url)| (name.as_str(), &**url))
+    }
+
     pub fn len(&self) -> usize {
         self.urls.len()
     }
@@ -70,12 +81,16 @@ const BATCH_WINDOW: Duration = Duration::from_millis(16);
 /// for the names they use with [`EmojiStore::ensure`], and names asked for
 /// within one short window cost a single request. Meanwhile the full list
 /// loads page by page; once it is complete, names it lacks are known not to
-/// exist and cost nothing.
+/// exist and cost nothing. Emoji remembered from an earlier run
+/// ([`EmojiStore::remember`]) show before either answers.
 ///
 /// Notifies whenever [`EmojiStore::custom`] changes.
 pub struct EmojiStore {
     client: Client,
     custom: CustomEmojis,
+    /// Names remembered from an earlier run that the server hasn't
+    /// confirmed yet.
+    remembered: HashSet<String>,
     /// Names to look up in the next batch.
     queued: HashSet<String>,
     /// Names looked up already, found or not, so each costs one request.
@@ -92,6 +107,7 @@ impl EmojiStore {
         Self {
             client,
             custom: CustomEmojis::default(),
+            remembered: HashSet::new(),
             queued: HashSet::new(),
             requested: HashSet::new(),
             complete: false,
@@ -106,6 +122,8 @@ impl EmojiStore {
 
     /// Look up any custom emoji among `names` not already known or asked
     /// for. Standard emoji names and malformed names are skipped.
+    /// Remembered emoji count as unknown, so each is confirmed the first
+    /// time it is needed.
     pub fn ensure<'a>(&mut self, names: impl IntoIterator<Item = &'a str>, cx: &mut Context<Self>) {
         if self.complete {
             return;
@@ -115,7 +133,7 @@ impl EmojiStore {
             let name = emoji_name(name);
             if !is_emoji_name(name)
                 || emoji_for(name).is_some()
-                || self.custom.contains(name)
+                || (self.custom.contains(name) && !self.remembered.contains(name))
                 || self.requested.contains(name)
                 || self.queued.contains(name)
             {
@@ -191,6 +209,8 @@ impl EmojiStore {
                     this.requested.remove(name);
                 }
                 this.add(found, cx);
+                let missing = names.into_iter().filter(|name| !failed.contains(name));
+                this.forget_missing(missing, cx);
             });
         })
         .detach();
@@ -231,6 +251,8 @@ impl EmojiStore {
                 this.complete = complete;
                 if complete {
                     this.queued.clear();
+                    let missing: Vec<String> = this.remembered.iter().cloned().collect();
+                    this.forget_missing(missing, cx);
                 }
             });
         })
@@ -241,10 +263,16 @@ impl EmojiStore {
     /// recreated under a known name replaces the old one's image.
     pub fn add(&mut self, emoji: Vec<Emoji>, cx: &mut Context<Self>) {
         let client = &self.client;
-        let new: Vec<_> = emoji
+        let found: Vec<_> = emoji
             .into_iter()
             .filter(|e| e.delete_at == 0 && !e.name.is_empty())
             .map(|e| (e.name.clone(), client.custom_emoji_url(&e.id)))
+            .collect();
+        for (name, _) in &found {
+            self.remembered.remove(name);
+        }
+        let new: Vec<_> = found
+            .into_iter()
             .filter(|(name, url)| self.custom.image_url(name).map(|u| &**u) != Some(url.as_str()))
             .collect();
         if new.is_empty() {
@@ -254,6 +282,52 @@ impl EmojiStore {
             self.custom.insert(name, url);
         }
         cx.notify();
+    }
+
+    /// Show `emoji`, `(name, image URL)` pairs saved by an earlier run,
+    /// until the server confirms them, so messages don't wait on a round
+    /// trip for their images. Names already known keep their newer image;
+    /// once the full list loads, remembered names it lacks are dropped.
+    pub fn remember(
+        &mut self,
+        emoji: impl IntoIterator<Item = (String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        // A complete list is newer than anything remembered.
+        if self.complete {
+            return;
+        }
+        let mut added = false;
+        for (name, url) in emoji {
+            // A name already asked about is answered by that lookup.
+            if is_emoji_name(&name)
+                && !self.custom.contains(&name)
+                && !self.requested.contains(&name)
+            {
+                self.remembered.insert(name.clone());
+                self.custom.insert(name, url);
+                added = true;
+            }
+        }
+        if added {
+            cx.notify();
+        }
+    }
+
+    /// Drop the remembered emoji among `names`, which the server was asked
+    /// about and didn't have: deleted since the earlier run. Call after
+    /// [`Self::add`], which confirms the ones it did have.
+    fn forget_missing(&mut self, names: impl IntoIterator<Item = String>, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for name in names {
+            if self.remembered.remove(&name) {
+                self.custom.remove(&name);
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
     }
 }
 
