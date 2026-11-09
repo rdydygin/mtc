@@ -3,9 +3,8 @@
 
 use gpui_kit::component::{ActiveTheme as _, TitleBar, v_flex};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div,
-    prelude::FluentBuilder as _,
+    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
+    Render, SharedString, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _,
 };
 use mattermost::{ApiError, Client, TeamId, User};
 
@@ -97,7 +96,7 @@ impl AppRoot {
                 Err(err) => {
                     let message = if err.downcast_ref::<ApiError>() == Some(&ApiError::Unauthorized)
                     {
-                        end_session(cx);
+                        end_session();
                         "Your session has expired. Sign in again.".to_string()
                     } else {
                         format!("{err:#}")
@@ -139,8 +138,7 @@ impl AppRoot {
     ) {
         // Lets avatars and thumbnails load through GPUI's image cache.
         cx.set_http_client(ServerHttpClient::new(client.clone()));
-        cx.background_spawn(async { cache::prune_images() })
-            .detach();
+        cx.background_spawn(async { cache::tidy() }).detach();
         let server = client.server().to_string();
         persist::update(|state| {
             let team_id = state
@@ -162,7 +160,7 @@ impl AppRoot {
             window,
             |this, _, event, window, cx| match event {
                 WorkspaceEvent::SignedOut => {
-                    end_session(cx);
+                    end_session();
                     this.show_login(
                         Some("Your session has expired. Sign in again.".into()),
                         window,
@@ -188,7 +186,7 @@ impl AppRoot {
             let _ = client.logout().await;
         })
         .detach();
-        end_session(cx);
+        end_session();
         self.show_login(None, window, cx);
     }
 }
@@ -197,9 +195,9 @@ impl AppRoot {
 /// signed out or the server ended the session. The account's pictures,
 /// attachment previews, and contacts shouldn't outlast it on this
 /// computer, nor greet whoever signs in next.
-fn end_session(cx: &App) {
+fn end_session() {
     persist::update(|state| state.session = None);
-    cache::clear(cx);
+    cache::clear();
 }
 
 impl Render for AppRoot {

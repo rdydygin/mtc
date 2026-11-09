@@ -5,8 +5,9 @@
 //! trips later.
 //!
 //! Kept in the platform cache directory, readable only by the user, and
-//! deleted when the session ends, by sign-out or by the server. Reads and writes block, so callers run them off the
-//! UI thread; [`remember_users`] and [`remember_emoji`] do that themselves.
+//! deleted when the session ends, by sign-out or by the server. Reads and
+//! writes block, so callers run them off the UI thread; [`remember_users`]
+//! and [`remember_emoji`] do that themselves.
 
 use std::{
     collections::HashMap,
@@ -14,9 +15,10 @@ use std::{
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
+    thread::JoinHandle,
     time::{Duration, SystemTime},
 };
 
@@ -38,24 +40,32 @@ const SAVE_DELAY: Duration = Duration::from_secs(5);
 /// hold it for reading while they check and write.
 static GENERATION: RwLock<u64> = RwLock::new(0);
 
+/// Caches of ended sessions being deleted, for [`flush`] to wait on.
+static DELETIONS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// The cache in use sits in this folder of [`root`]; an ended session's is
+/// renamed to `ended-…` beside it until it is deleted.
+const CURRENT: &str = "current";
+const ENDED: &str = "ended-";
+
 /// The current sign-in, for [`save_image`].
 pub fn generation() -> u64 {
     *GENERATION.read().unwrap_or_else(|e| e.into_inner())
 }
 
-fn next_generation() {
-    *GENERATION.write().unwrap_or_else(|e| e.into_inner()) += 1;
-}
-
 #[cfg(not(test))]
-fn dir() -> Option<PathBuf> {
+fn root() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("mtc"))
 }
 
 /// Tests never touch the real cache.
 #[cfg(test)]
-fn dir() -> Option<PathBuf> {
+fn root() -> Option<PathBuf> {
     None
+}
+
+fn dir() -> Option<PathBuf> {
+    Some(root()?.join(CURRENT))
 }
 
 fn key(text: &str) -> String {
@@ -84,27 +94,57 @@ pub fn save_image(generation: u64, url: &str, bytes: &[u8]) {
     }
 }
 
-/// Keep the saved images within [`IMAGE_LIMIT`].
-pub fn prune_images() {
-    if let Some(dir) = dir() {
-        prune(&dir.join("images"), IMAGE_LIMIT);
+/// Keep the saved images within [`IMAGE_LIMIT`], and finish deleting
+/// caches of sessions that ended in an earlier run.
+pub fn tidy() {
+    if let Some(root) = root() {
+        sweep_ended(&root, &format!("{ENDED}{}-", std::process::id()));
+        prune(&root.join(CURRENT).join("images"), IMAGE_LIMIT);
     }
 }
 
-/// Forget everything saved, as when a session ends. Writes begun before
-/// this call are dropped, even ones that finish after it; the files are
-/// deleted in the background.
-pub fn clear(cx: &App) {
-    next_generation();
-    cx.background_spawn(async {
-        if let Some(dir) = dir()
-            && let Err(err) = fs::remove_dir_all(dir)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            log::warn!("clearing the cache: {err}");
+/// Forget everything saved, as when a session ends. Nothing can read the
+/// cache once this returns, and writes begun before it are dropped, even
+/// ones that finish after it. The files are deleted on a thread that
+/// [`flush`] waits for.
+pub fn clear() {
+    // Held while the cache is moved, so no write is halfway into it.
+    let mut generation = GENERATION.write().unwrap_or_else(|e| e.into_inner());
+    *generation += 1;
+    let Some(root) = root() else {
+        return;
+    };
+    let name = format!("{ENDED}{}-{}", std::process::id(), *generation);
+    match set_aside(&root, &name) {
+        Ok(Some(ended)) => {
+            let deletion = std::thread::spawn(move || {
+                if let Err(err) = fs::remove_dir_all(&ended) {
+                    log::warn!("deleting the cache of an ended session: {err}");
+                }
+            });
+            DELETIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(deletion);
         }
-    })
-    .detach();
+        Ok(None) => {}
+        // Better a slow sign-out than another account reading this one's.
+        Err(err) => {
+            log::warn!("setting the cache aside: {err}");
+            if let Err(err) = fs::remove_dir_all(root.join(CURRENT)) {
+                log::warn!("deleting the cache: {err}");
+            }
+        }
+    }
+}
+
+/// Wait until the caches of ended sessions are deleted, such as before
+/// quitting.
+pub fn flush() {
+    let deletions = std::mem::take(&mut *DELETIONS.lock().unwrap_or_else(|e| e.into_inner()));
+    for deletion in deletions {
+        let _ = deletion.join();
+    }
 }
 
 /// Fill `directory` with the people saved last time on `server`, and save
@@ -222,6 +262,36 @@ impl SaveLater {
     }
 }
 
+/// Rename the cache in use in `root` to `name`, out of reach of every
+/// later read; where it went, or `None` when there was none.
+fn set_aside(root: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
+    let ended = root.join(name);
+    match fs::rename(root.join(CURRENT), &ended) {
+        Ok(()) => Ok(Some(ended)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Delete the caches set aside in `root` by an earlier run, as one that
+/// quit or crashed before deleting them. Those named with `ours` belong to
+/// this run, which deletes them itself.
+fn sweep_ended(root: &Path, ours: &str) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(ENDED)
+            && !name.starts_with(ours)
+            && let Err(err) = fs::remove_dir_all(entry.path())
+        {
+            log::warn!("deleting the cache of an ended session: {err}");
+        }
+    }
+}
+
 /// A file's contents, refreshing its modification time so pruning sees
 /// it as recently used. An empty file, as a crash may leave, is a miss.
 fn read_marking_used(path: &Path) -> Option<Vec<u8>> {
@@ -336,7 +406,7 @@ mod tests {
     fn writes_begun_before_a_clear_are_dropped() {
         let dir = scratch("clear");
         let before = generation();
-        next_generation();
+        clear();
 
         write_for(before, &dir.join("old"), b"png").unwrap();
         write_for(generation(), &dir.join("new"), b"png").unwrap();
@@ -344,6 +414,23 @@ mod tests {
         assert!(!dir.join("old").exists());
         assert!(dir.join("new").exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_ended_cache_is_out_of_reach_at_once_and_swept_later() {
+        let root = scratch("ended");
+        write(&root.join(CURRENT).join("users.json"), b"[]").unwrap();
+
+        let ended = set_aside(&root, "ended-1-1").unwrap().unwrap();
+        assert!(!root.join(CURRENT).exists(), "nothing reads it again");
+        assert!(set_aside(&root, "ended-1-2").unwrap().is_none());
+
+        // An earlier run's leftovers go; this run's are left to it.
+        write(&root.join("ended-2-1").join("users.json"), b"[]").unwrap();
+        sweep_ended(&root, "ended-2-");
+        assert!(!ended.exists());
+        assert!(root.join("ended-2-1").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
