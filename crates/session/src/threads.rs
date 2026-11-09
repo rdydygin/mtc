@@ -545,9 +545,9 @@ impl FollowedThreads {
         cx.notify();
     }
 
-    /// Forget the threads of channels the user is no longer in, such as one
-    /// they left. The server stops counting them too, including any on pages
-    /// not loaded yet, so its totals are read again.
+    /// The user is no longer in some channels, such as one they left: forget
+    /// their threads. The server stops counting them too, including any not
+    /// loaded here, so its totals are read again.
     pub fn keep_channels(&mut self, member: impl Fn(&ChannelId) -> bool, cx: &mut Context<Self>) {
         let gone: Vec<PostId> = self
             .threads
@@ -555,9 +555,6 @@ impl FollowedThreads {
             .filter(|thread| !member(thread.channel()))
             .map(|thread| thread.id().clone())
             .collect();
-        if gone.is_empty() {
-            return;
-        }
         for id in &gone {
             self.forget(id, cx);
         }

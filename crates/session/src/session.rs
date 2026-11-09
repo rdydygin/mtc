@@ -405,7 +405,7 @@ impl Session {
                         .into_iter()
                         .map(|m| (m.channel_id.clone(), m))
                         .collect();
-                    this.channels = channels
+                    let channels: HashMap<ChannelId, ChannelEntry> = channels
                         .into_iter()
                         .filter(|c| c.delete_at == 0)
                         .map(|channel| {
@@ -413,13 +413,17 @@ impl Session {
                             (channel.id.clone(), ChannelEntry { channel, member })
                         })
                         .collect();
+                    // A channel left elsewhere, or one the user was removed
+                    // from, takes its threads with it.
+                    let lost = this.channels.keys().any(|id| !channels.contains_key(id));
+                    this.channels = channels;
                     this.channels_loaded = true;
-                    // A channel left here or elsewhere, or one the user
-                    // was removed from, takes its threads with it.
-                    let channels = &this.channels;
-                    this.threads.update(cx, |t, cx| {
-                        t.keep_channels(|id| channels.contains_key(id), cx)
-                    });
+                    if lost {
+                        let channels = &this.channels;
+                        this.threads.update(cx, |t, cx| {
+                            t.keep_channels(|id| channels.contains_key(id), cx)
+                        });
+                    }
                     let partners: Vec<UserId> = this
                         .channels
                         .values()
@@ -1579,6 +1583,68 @@ mod slow_network_tests {
             let left: Vec<_> = threads.threads(ThreadFilter::All).map(|t| t.id()).collect();
             assert_eq!(left, [&PostId::from("in-town")]);
         });
+    }
+
+    /// Design's threads count in the totals until the user is out of it:
+    /// they leave, or `out` is set as if they were removed elsewhere.
+    fn design_threads_route(request: &Request, out: &AtomicBool) -> Reply {
+        let path = request.path().split('?').next().unwrap_or_default();
+        match (request.method(), path) {
+            ("GET", "/api/v4/users/me/teams/team/threads") => {
+                let unread = i64::from(!out.load(Ordering::SeqCst));
+                Reply::json(json!({
+                    "total_unread_threads": unread,
+                    "total_unread_mentions": unread,
+                }))
+            }
+            // Town Square alone.
+            ("GET", "/api/v4/users/me/teams/team/channels") if out.load(Ordering::SeqCst) => {
+                route(request)
+            }
+            ("DELETE", "/api/v4/channels/design/members/me") => {
+                out.store(true, Ordering::SeqCst);
+                leave_route(request, 200)
+            }
+            _ => leave_route(request, 200),
+        }
+    }
+
+    /// A session in Town Square and Design, whose totals count a thread in
+    /// Design that no list here has loaded.
+    fn in_design(cx: &mut TestAppContext) -> (SlowServer, Arc<AtomicBool>, Entity<Session>) {
+        let out = Arc::new(AtomicBool::new(false));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let out = out.clone();
+            move |request| design_threads_route(request, &out)
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, cx| {
+                s.channel(&"design".into()).is_some() && s.threads().read(cx).unread_mentions() == 1
+            })
+        });
+        (server, out, session)
+    }
+
+    #[gpui_kit::test]
+    fn leaving_a_channel_reads_the_thread_totals_again(cx: &mut TestAppContext) {
+        let (_server, _, session) = in_design(cx);
+        session.update(cx, |s, cx| s.leave_channel(&"design".into(), cx));
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, cx| s.threads().read(cx).unread_mentions() == 0)
+        });
+    }
+
+    #[gpui_kit::test]
+    fn removal_from_a_channel_elsewhere_reads_the_thread_totals_again(cx: &mut TestAppContext) {
+        let (_server, out, session) = in_design(cx);
+        out.store(true, Ordering::SeqCst);
+        // As a membership event does.
+        session.update(cx, |s, cx| s.load_channels(cx));
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, cx| s.threads().read(cx).unread_mentions() == 0)
+        });
+        session.read_with(cx, |s, _| assert!(s.channel(&"design".into()).is_none()));
     }
 
     #[gpui_kit::test]
