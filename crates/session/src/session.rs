@@ -928,6 +928,7 @@ impl Session {
         cx.notify();
         let client = self.client.clone();
         let me = self.me.id.clone();
+        let team = self.team.clone();
         let channel = channel.clone();
         cx.spawn(async move |this, cx| {
             let result = client.leave_channel(&channel, &me).await;
@@ -939,7 +940,11 @@ impl Session {
                     .update(cx, |t, cx| t.keep_channels(|id| id != &channel, cx)),
                 Err(err) => {
                     let label = this.channel_label(&entry, cx);
-                    this.channels.entry(channel).or_insert(entry);
+                    // Another team's channels have replaced its own since;
+                    // they'll include it again when it is next shown.
+                    if this.team == team {
+                        this.channels.entry(channel).or_insert(entry);
+                    }
                     cx.emit(SessionEvent::SendFailed {
                         message: format!("Couldn’t leave {label}. {err:#}").into(),
                     });
@@ -1319,7 +1324,7 @@ mod slow_network_tests {
         time::{Duration, Instant},
     };
 
-    use gpui_kit::{AppContext as _, Entity, TestAppContext};
+    use gpui_kit::{AppContext as _, Entity, SharedString, TestAppContext};
     use mattermost::{
         Client, PostId, TeamId, User,
         testing::{Network, Reply, Request, SlowServer},
@@ -1578,17 +1583,8 @@ mod slow_network_tests {
 
     #[gpui_kit::test]
     fn a_refused_leave_puts_the_channel_back(cx: &mut TestAppContext) {
-        let failures = Rc::new(RefCell::new(Vec::new()));
         let (_server, session) = leave_design(403, cx);
-        cx.update(|cx| {
-            let failures = failures.clone();
-            cx.subscribe(&session, move |_, event, _| {
-                if let SessionEvent::SendFailed { message } = event {
-                    failures.borrow_mut().push(message.clone());
-                }
-            })
-            .detach();
-        });
+        let failures = failures(&session, cx);
         wait_until(cx, |cx| {
             session.read_with(cx, |s, _| s.channel(&"design".into()).is_some())
         });
@@ -1598,6 +1594,54 @@ mod slow_network_tests {
             failures[0].starts_with("Couldn’t leave Design."),
             "{failures:?}"
         );
+    }
+
+    #[gpui_kit::test]
+    fn a_refused_leave_after_a_team_switch_stays_with_its_team(cx: &mut TestAppContext) {
+        // On a slow link, the long refusal arrives well after the other
+        // team's short channel lists.
+        let network = Network::new(Duration::ZERO).bandwidth(1_000_000);
+        let server = SlowServer::start(network, |request| {
+            match request.path().split('?').next().unwrap_or_default() {
+                "/api/v4/users/me/teams/other/channels"
+                | "/api/v4/users/me/teams/other/channels/members" => Reply::json(json!([])),
+                "/api/v4/channels/design/members/me" => Reply::json(json!({
+                    "message": "You can't leave this channel.",
+                    "detail": "x".repeat(1_000_000),
+                }))
+                .status(403),
+                _ => leave_route(request, 403),
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        let failures = failures(&session, cx);
+        session.update(cx, |s, cx| {
+            s.leave_channel(&"design".into(), cx);
+            s.select_team("other".into(), cx);
+        });
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        assert!(failures.borrow().is_empty(), "refused before the switch");
+        wait_until(cx, |_| !failures.borrow().is_empty());
+        session.read_with(cx, |s, _| assert!(s.channel(&"design".into()).is_none()));
+    }
+
+    /// The messages of the failures `session` reports, as they arrive.
+    fn failures(
+        session: &Entity<Session>,
+        cx: &mut TestAppContext,
+    ) -> Rc<RefCell<Vec<SharedString>>> {
+        let failures = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let failures = failures.clone();
+            cx.subscribe(session, move |_, event, _| {
+                if let SessionEvent::SendFailed { message } = event {
+                    failures.borrow_mut().push(message.clone());
+                }
+            })
+            .detach();
+        });
+        failures
     }
 
     /// The server of a company with custom emoji, where the full list can't

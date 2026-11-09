@@ -63,6 +63,9 @@ pub struct SearchView {
     selected: Option<usize>,
     scroll: ScrollHandle,
     _search: Option<Task<()>>,
+    /// The next page loading. Kept apart from `_search` so asking for more
+    /// of the old results never cancels a search for newer words.
+    _more: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -105,6 +108,7 @@ impl SearchView {
             selected: None,
             scroll: ScrollHandle::new(),
             _search: None,
+            _more: None,
             _subscriptions: subscriptions,
         }
     }
@@ -130,15 +134,14 @@ impl SearchView {
         if !query.is_empty() && query == self.query && !failed && delay.is_some() {
             // Typed back to what the results answer: drop the search for
             // what was typed in between, but not a page still loading.
-            if !self.loading_more {
-                self._search = None;
-            }
+            self._search = None;
             self.status = Status::Done;
             cx.notify();
             return;
         }
         if query.is_empty() {
             self._search = None;
+            self._more = None;
             self.query.clear();
             self.results.clear();
             self.matches.clear();
@@ -156,6 +159,7 @@ impl SearchView {
             }
             let Ok(task) = this.update(cx, |this, cx| {
                 this.status = Status::Searching;
+                this._more = None;
                 this.loading_more = false;
                 cx.notify();
                 this.session
@@ -181,7 +185,7 @@ impl SearchView {
         let task = self.session.update(cx, |s, cx| {
             s.search_channel(&self.channel, &query, page, cx)
         });
-        self._search = Some(cx.spawn(async move |this, cx| {
+        self._more = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| this.finish(query, page, result, cx));
         }));
@@ -194,6 +198,10 @@ impl SearchView {
         result: anyhow::Result<PostSearch>,
         cx: &mut Context<Self>,
     ) {
+        // A page of older words, answered after newer ones were searched.
+        if page > 0 && query != self.query {
+            return;
+        }
         self.loading_more = false;
         self.query = query;
         match result {
@@ -626,7 +634,9 @@ mod tests {
     };
 
     use gpui_kit::test::TestWindowExt as _;
-    use gpui_kit::{Bounds, TestAppContext, WindowBounds, WindowOptions, point, px, size};
+    use gpui_kit::{
+        AnyWindowHandle, Bounds, TestAppContext, WindowBounds, WindowOptions, point, px, size,
+    };
     use mattermost::{
         Client, TeamId, User,
         testing::{Network, Reply, Request, SlowServer},
@@ -661,23 +671,26 @@ mod tests {
         }
     }
 
-    /// Run GPUI's work and let real network I/O happen until `done`.
-    fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            cx.run_until_parked();
-            if done(cx) {
-                return;
-            }
-            assert!(Instant::now() < deadline, "timed out waiting");
-            cx.executor().advance_clock(Duration::from_millis(50));
-            std::thread::sleep(Duration::from_millis(5));
+    /// The same, with another page of results always waiting.
+    fn paged_route(request: &Request) -> Reply {
+        match request.path().split('?').next().unwrap_or_default() {
+            "/api/v4/teams/team/posts/search" => Reply::json(json!({
+                "order": ["new"],
+                "posts": {
+                    "new": { "id": "new", "channel_id": "town", "user_id": "ann",
+                             "message": "hello again", "create_at": 2 },
+                },
+                "has_next": true,
+            })),
+            _ => route(request),
         }
     }
 
-    #[gpui_kit::test]
-    fn typing_searches_and_the_keyboard_opens_a_result(cx: &mut TestAppContext) {
-        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+    /// A search of Town Square in its own window, on a signed-in session.
+    fn open_search(
+        server: &SlowServer,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<SearchView>) {
         cx.executor().allow_parking();
         cx.update(gpui_kit::init);
         let client = Client::new_unverified(&server.url(), "token").unwrap();
@@ -698,6 +711,32 @@ mod tests {
             })
             .unwrap()
         });
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.focus(window, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        (window, view)
+    }
+
+    /// Run GPUI's work and let real network I/O happen until `done`.
+    fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting");
+            cx.executor().advance_clock(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn typing_searches_and_the_keyboard_opens_a_result(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (window, view) = open_search(&server, cx);
         let opened = Rc::new(RefCell::new(Vec::new()));
         let sink = opened.clone();
         cx.update(|cx| {
@@ -723,11 +762,6 @@ mod tests {
                 .unwrap();
             cx.run_until_parked();
         };
-        cx.update_window(window, |_, window, cx| {
-            view.update(cx, |v, cx| v.focus(window, cx));
-            window.render_frame(cx);
-        })
-        .unwrap();
         type_keys(cx, |window, cx| window.input("hel", cx));
         type_keys(cx, |window, cx| window.input("lo", cx));
         wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 2));
@@ -761,6 +795,24 @@ mod tests {
         // Down stops at the last result, and Enter opens the chosen one.
         assert_eq!(*opened.borrow(), ["old"]);
         assert_eq!(searches(&server), 1);
+    }
+
+    #[gpui_kit::test]
+    fn showing_more_results_doesnt_cancel_a_newer_search(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), paged_route);
+        let (window, view) = open_search(&server, cx);
+        cx.update_window(window, |_, window, cx| window.input("hello", cx))
+            .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.next_page.is_some()));
+
+        // "Show more results" for the old words, pressed while the new
+        // ones wait out the debounce.
+        cx.update_window(window, |_, window, cx| window.input("!", cx))
+            .unwrap();
+        cx.run_until_parked();
+        view.update(cx, |v, cx| v.load_more(cx));
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.query == "hello!"));
+        view.read_with(cx, |v, _| assert!(matches!(v.status, Status::Done)));
     }
 
     fn words(terms: &[&str]) -> Vec<String> {
