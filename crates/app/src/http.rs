@@ -21,11 +21,17 @@ use crate::cache;
 
 pub struct ServerHttpClient {
     client: Client,
+    /// The sign-in this client serves, so its downloads aren't saved after
+    /// a sign-out clears the cache.
+    generation: u64,
 }
 
 impl ServerHttpClient {
     pub fn new(client: Client) -> Arc<Self> {
-        Arc::new(Self { client })
+        Arc::new(Self {
+            client,
+            generation: cache::generation(),
+        })
     }
 }
 
@@ -45,6 +51,7 @@ impl HttpClient for ServerHttpClient {
         let client = self.client.clone();
         let uri = request.uri().to_string();
         let keep = never_changes(&client, &uri);
+        let generation = self.generation;
         Box::pin(async move {
             if keep && let Some(body) = cache::image(&uri) {
                 return Ok(Response::builder()
@@ -53,7 +60,7 @@ impl HttpClient for ServerHttpClient {
             }
             let fetched = client.fetch(&uri).await?;
             if keep && fetched.status == 200 && !fetched.body.is_empty() {
-                cache::save_image(&uri, &fetched.body);
+                cache::save_image(generation, &uri, &fetched.body);
             }
             let mut response = Response::builder().status(fetched.status);
             if let Some(content_type) = fetched.content_type {

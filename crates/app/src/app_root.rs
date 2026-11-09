@@ -190,7 +190,7 @@ impl AppRoot {
         persist::update(|state| state.session = None);
         // The account's pictures, attachment previews, and contacts
         // shouldn't outlast it on this computer.
-        cx.background_spawn(async { cache::clear() }).detach();
+        cache::clear(cx);
         self.show_login(None, window, cx);
     }
 }

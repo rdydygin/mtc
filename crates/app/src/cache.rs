@@ -14,7 +14,7 @@ use std::{
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -31,6 +31,21 @@ const IMAGE_LIMIT: u64 = 256 * 1024 * 1024;
 /// How long the people and emoji wait after a change before they are
 /// saved, so the burst of lookups at startup costs one write.
 const SAVE_DELAY: Duration = Duration::from_secs(5);
+
+/// The sign-in that writes belong to. [`clear`] moves it on, so a write
+/// begun for an account signed out of, such as a download still in
+/// flight, is dropped rather than putting back what was deleted. Writes
+/// hold it for reading while they check and write.
+static GENERATION: RwLock<u64> = RwLock::new(0);
+
+/// The current sign-in, for [`save_image`].
+pub fn generation() -> u64 {
+    *GENERATION.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn next_generation() {
+    *GENERATION.write().unwrap_or_else(|e| e.into_inner()) += 1;
+}
 
 #[cfg(not(test))]
 fn dir() -> Option<PathBuf> {
@@ -59,9 +74,11 @@ pub fn image(url: &str) -> Option<Vec<u8>> {
     read_marking_used(&image_path(url)?)
 }
 
-pub fn save_image(url: &str, bytes: &[u8]) {
+/// Save `bytes` as the image for `url`, unless the cache was cleared
+/// since `generation`.
+pub fn save_image(generation: u64, url: &str, bytes: &[u8]) {
     if let Some(path) = image_path(url)
-        && let Err(err) = write(&path, bytes)
+        && let Err(err) = write_for(generation, &path, bytes)
     {
         log::warn!("caching an image: {err}");
     }
@@ -74,14 +91,20 @@ pub fn prune_images() {
     }
 }
 
-/// Forget everything saved, as on sign-out.
-pub fn clear() {
-    if let Some(dir) = dir()
-        && let Err(err) = fs::remove_dir_all(dir)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        log::warn!("clearing the cache: {err}");
-    }
+/// Forget everything saved, as on sign-out. Writes begun before this call
+/// are dropped, even ones that finish after it; the files are deleted in
+/// the background.
+pub fn clear(cx: &App) {
+    next_generation();
+    cx.background_spawn(async {
+        if let Some(dir) = dir()
+            && let Err(err) = fs::remove_dir_all(dir)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!("clearing the cache: {err}");
+        }
+    })
+    .detach();
 }
 
 /// Fill `directory` with the people saved last time on `server`, and save
@@ -163,6 +186,7 @@ fn restore<E: 'static, T: DeserializeOwned + Default + Send + 'static>(
 /// burst of changes costs one write.
 struct SaveLater {
     path: PathBuf,
+    generation: u64,
     pending: Option<Task<()>>,
 }
 
@@ -170,6 +194,7 @@ impl SaveLater {
     fn new(path: PathBuf) -> Self {
         Self {
             path,
+            generation: generation(),
             pending: None,
         }
     }
@@ -182,13 +207,14 @@ impl SaveLater {
         cx: &App,
     ) {
         let path = self.path.clone();
+        let generation = self.generation;
         let executor = cx.background_executor().clone();
         // Replacing the task cancels the save it was waiting to make.
         self.pending = Some(cx.background_spawn(async move {
             executor.timer(SAVE_DELAY).await;
             let result = contents()
                 .map_err(std::io::Error::other)
-                .and_then(|bytes| write(&path, &bytes));
+                .and_then(|bytes| write_for(generation, &path, &bytes));
             if let Err(err) = result {
                 log::warn!("saving {}: {err}", path.display());
             }
@@ -208,6 +234,15 @@ fn read_marking_used(path: &Path) -> Option<Vec<u8>> {
     file.read_to_end(&mut bytes).ok()?;
     let _ = file.set_modified(SystemTime::now());
     (!bytes.is_empty()).then_some(bytes)
+}
+
+/// [`write`], unless the cache was cleared since `generation`.
+fn write_for(generation: u64, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let current = GENERATION.read().unwrap_or_else(|e| e.into_inner());
+    if *current != generation {
+        return Ok(());
+    }
+    write(path, bytes)
 }
 
 /// Write `path` whole or not at all, readable only by the user.
@@ -294,6 +329,20 @@ mod tests {
             assert_eq!(mode(&path), 0o600);
             assert_eq!(mode(path.parent().unwrap()), 0o700);
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn writes_begun_before_a_clear_are_dropped() {
+        let dir = scratch("clear");
+        let before = generation();
+        next_generation();
+
+        write_for(before, &dir.join("old"), b"png").unwrap();
+        write_for(generation(), &dir.join("new"), b"png").unwrap();
+
+        assert!(!dir.join("old").exists());
+        assert!(dir.join("new").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
