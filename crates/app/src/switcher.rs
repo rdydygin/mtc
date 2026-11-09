@@ -141,8 +141,23 @@ pub fn open(
             },
             actions::ToggleFavorite,
         ));
+        if session_ref.channel(active).is_some_and(|e| e.can_leave()) {
+            commands.push(action_item(
+                "Leave channel",
+                IconName::LogOut,
+                actions::LeaveChannel,
+            ));
+        }
+    }
+    if active.is_some() {
+        commands.push(action_item(
+            "Search messages",
+            IconName::Search,
+            actions::SearchConversation,
+        ));
     }
     commands.extend([
+        action_item("Threads", IconName::MessagesSquare, actions::ShowThreads),
         action_item(
             "Close conversation",
             IconName::X,

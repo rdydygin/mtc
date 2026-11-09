@@ -48,6 +48,68 @@ pub fn conversation_rows(count: usize, offset: usize, cx: &App) -> impl IntoElem
     }))
 }
 
+/// Rows of the Threads list, matching `ThreadsView::render_row`'s lanes:
+/// the author and channel, two lines of preview, and the participants.
+pub fn thread_rows(cx: &App) -> impl IntoElement {
+    let radius = cx.theme().radius;
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .overflow_hidden()
+        .children((0..6).map(move |ix| {
+            let width = |offset: usize| LABEL_WIDTHS[(ix + offset) % LABEL_WIDTHS.len()];
+            v_flex()
+                .h(rems(crate::threads_view::ROW_HEIGHT))
+                .flex_none()
+                .justify_between()
+                .px_4()
+                .py_2p5()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .pl_4()
+                        .child(
+                            Skeleton::new()
+                                .h_3()
+                                .w(rems(6. + ix as f32 % 3.))
+                                .rounded(radius),
+                        )
+                        .child(
+                            Skeleton::new()
+                                .secondary()
+                                .h_3()
+                                .w(rems(4.))
+                                .rounded(radius),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .pl_4()
+                        .child(
+                            Skeleton::new()
+                                .secondary()
+                                .h_3()
+                                .w(relative(0.5 + width(0) / 2.))
+                                .rounded(radius),
+                        )
+                        .child(
+                            Skeleton::new()
+                                .secondary()
+                                .h_3()
+                                .w(relative(width(3) / 1.5))
+                                .rounded(radius),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_0p5()
+                        .pl_4()
+                        .children((0..1 + ix % 3).map(|_| Skeleton::new().size_5().rounded_full())),
+                )
+        }))
+}
+
 /// One placeholder bar for the team name in the sidebar header.
 pub fn team_name(cx: &App) -> impl IntoElement {
     Skeleton::new()

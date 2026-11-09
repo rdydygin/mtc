@@ -1,6 +1,6 @@
 //! A channel or thread: header, virtualized posts, typing line, composer.
 
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, rc::Rc, time::Duration};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -17,15 +17,17 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription,
-    WeakEntity, Window, div, prelude::FluentBuilder as _,
+    Task, WeakEntity, Window, div, prelude::FluentBuilder as _,
 };
 use mattermost::{ChannelId, ChannelType, FileInfo, Millis, Post, PostId};
 use session::{Delivery, LoadState, Session, Timeline, TimelineEvent, TimelineKind};
 
 use crate::{
     composer::{Composer, ComposerEvent, UploadTarget},
+    download,
     extensions::{self, CommandContext, CommandOutcome},
     http::avatar_url,
+    image_viewer,
     post_row::{PostAction, PostActionHandler, PostRow},
     time,
 };
@@ -35,6 +37,11 @@ const GROUP_WINDOW: Millis = 5 * 60 * 1000;
 /// Start loading older posts when the top of the viewport is this close to
 /// the oldest loaded post.
 const PREFETCH_ROWS: usize = 8;
+/// How many older pages to load looking for a post to reveal before
+/// showing it in its thread instead.
+const REVEAL_PAGES: usize = 20;
+/// How long a revealed post stays marked.
+const FLASH: Duration = Duration::from_millis(2500);
 
 pub enum TimelineViewEvent {
     OpenThread(PostId),
@@ -54,7 +61,22 @@ pub struct TimelineView {
     /// The first post the user hasn't seen.
     unread_ix: Option<usize>,
     editing: Option<PostId>,
+    /// A post to scroll to once it's loaded.
+    revealing: Option<Reveal>,
+    /// The post just revealed, marked for a moment so the eye finds it.
+    flashed: Option<PostId>,
+    _flash: Option<Task<()>>,
+    /// A thread opened over search results offers to go back to them.
+    back_to_results: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A post [`TimelineView::reveal`] is looking for.
+struct Reveal {
+    post: PostId,
+    created: Millis,
+    /// Older pages loaded so far while looking.
+    pages: usize,
 }
 
 impl EventEmitter<TimelineViewEvent> for TimelineView {}
@@ -80,7 +102,10 @@ impl TimelineView {
 
         let subscriptions = vec![
             cx.subscribe(&timeline, Self::on_timeline_event),
-            cx.observe(&timeline, |_, _, cx| cx.notify()),
+            cx.observe(&timeline, |this, _, cx| {
+                this.continue_reveal(cx);
+                cx.notify();
+            }),
             cx.observe(&directory, |_, _, cx| cx.notify()),
             cx.observe(&session, |_, _, cx| cx.notify()),
             cx.observe(&scroller, Self::on_scroll),
@@ -96,6 +121,10 @@ impl TimelineView {
             rich_text: HashMap::new(),
             unread_ix: None,
             editing: None,
+            revealing: None,
+            flashed: None,
+            _flash: None,
+            back_to_results: false,
             _subscriptions: subscriptions,
         };
         this.rebuild(cx);
@@ -127,6 +156,88 @@ impl TimelineView {
 
     pub fn focus_composer(&self, window: &mut Window, cx: &mut App) {
         self.composer.focus_handle(cx).focus(window, cx);
+    }
+
+    /// Offer "Back to search results" in place of closing the thread.
+    pub fn set_back_to_results(&mut self, back: bool, cx: &mut Context<Self>) {
+        if self.back_to_results != back {
+            self.back_to_results = back;
+            cx.notify();
+        }
+    }
+
+    /// Scroll to `post`, created at `created`, and mark it for a moment.
+    /// A channel loads older pages until it reaches the post; one too far
+    /// back opens in its thread instead.
+    pub fn reveal(&mut self, post: PostId, created: Millis, cx: &mut Context<Self>) {
+        self.revealing = Some(Reveal {
+            post,
+            created,
+            pages: 0,
+        });
+        self.continue_reveal(cx);
+    }
+
+    fn continue_reveal(&mut self, cx: &mut Context<Self>) {
+        // A channel no longer on screen gives up, rather than load on and
+        // then open the post's thread beside another conversation.
+        if self.kind.root().is_none()
+            && self.session.read(cx).active_channel() != Some(self.kind.channel())
+        {
+            self.revealing = None;
+        }
+        let Some(reveal) = self.revealing.as_mut() else {
+            return;
+        };
+        let timeline = self.timeline.read(cx);
+        if let Some(ix) = timeline.position(&reveal.post) {
+            let post = reveal.post.clone();
+            self.revealing = None;
+            self.scroller.update(cx, |s, cx| {
+                s.scroll_to_item(ix, cx);
+            });
+            self.flash(post, cx);
+            return;
+        }
+        match timeline.state() {
+            LoadState::Loaded => {}
+            LoadState::NotLoaded | LoadState::Loading => return,
+            LoadState::Failed(_) => {
+                self.revealing = None;
+                return;
+            }
+        }
+        if timeline.is_loading_older() {
+            return;
+        }
+        let passed = timeline
+            .entries()
+            .first()
+            .is_none_or(|e| e.post().create_at <= reveal.created);
+        if passed || !timeline.has_older() || reveal.pages >= REVEAL_PAGES {
+            // Not among the channel's posts as far as they go: show it in
+            // its thread, which loads it by itself.
+            let post = reveal.post.clone();
+            self.revealing = None;
+            if self.kind.root().is_none() {
+                cx.emit(TimelineViewEvent::OpenThread(post));
+            }
+            return;
+        }
+        reveal.pages += 1;
+        self.timeline.update(cx, |t, cx| t.load_older(cx));
+    }
+
+    fn flash(&mut self, post: PostId, cx: &mut Context<Self>) {
+        self.flashed = Some(post);
+        self._flash = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FLASH).await;
+            let _ = this.update(cx, |this, cx| {
+                this.flashed = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     // ----- Mirroring the timeline -------------------------------------------
@@ -167,6 +278,7 @@ impl TimelineView {
                     }
                 });
                 self.unread_ix = self.find_unread(cx);
+                self.continue_reveal(cx);
             }
             TimelineEvent::Updated(ix) => {
                 let ix = *ix;
@@ -373,7 +485,25 @@ impl TimelineView {
                 self.session
                     .update(cx, |s, cx| s.discard_post(&kind, &post.id, cx));
             }
-            PostAction::OpenFile(file) => self.open_file(file, window, cx),
+            PostAction::OpenFile(file) => {
+                let client = self.session.read(cx).client().clone();
+                if file.is_image() {
+                    // Step through the message's pictures, not just this one.
+                    let images: Vec<FileInfo> = post
+                        .metadata
+                        .files
+                        .iter()
+                        .filter(|f| f.is_image())
+                        .cloned()
+                        .collect();
+                    let index = images.iter().position(|f| f.id == file.id).unwrap_or(0);
+                    image_viewer::open(client, images, index, window, cx);
+                } else {
+                    download::save(client, file, window, cx, |path, _, cx| {
+                        cx.open_with_system(path)
+                    });
+                }
+            }
             PostAction::MessageAuthor => {
                 let task = self
                     .session
@@ -397,39 +527,6 @@ impl TimelineView {
                 .detach();
             }
         }
-    }
-
-    /// Download an attachment into Downloads and open it with its default
-    /// app. The name gets a numeric suffix rather than overwriting a file.
-    fn open_file(&mut self, file: FileInfo, window: &mut Window, cx: &mut Context<Self>) {
-        let client = self.session.read(cx).client().clone();
-        cx.spawn_in(window, async move |_, cx| {
-            let result = async {
-                let bytes = client.download_file(&file.id).await?;
-                let name = file.name.clone();
-                cx.background_spawn(async move {
-                    let dir = dirs::download_dir()
-                        .or_else(dirs::home_dir)
-                        .ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
-                    let path = unique_path(&dir, &name);
-                    std::fs::write(&path, bytes)?;
-                    anyhow::Ok(path)
-                })
-                .await
-            }
-            .await;
-            let _ = cx.update(|window, cx| match result {
-                Ok(path) => cx.open_with_system(&path),
-                Err(err) => window.push_notification(
-                    gpui_kit::component::notification::Notification::error(format!(
-                        "Couldn’t download {}. {err:#}",
-                        file.name
-                    )),
-                    cx,
-                ),
-            });
-        })
-        .detach();
     }
 
     // ----- Rendering --------------------------------------------------------
@@ -487,6 +584,7 @@ impl TimelineView {
             .unread_divider(unread_divider)
             .rich_text(self.rich_text.get(entry.id()).cloned())
             .thread_entry(self.kind.root().is_none())
+            .highlighted(self.flashed.as_ref() == Some(entry.id()))
             .client(session.client().clone())
             .custom_emoji(session.custom_emoji().clone())
             .into_any_element()
@@ -667,13 +765,18 @@ impl TimelineView {
                 )
             })
             .when(is_thread, |this| {
+                let (icon, label) = if self.back_to_results {
+                    (IconName::ArrowLeft, "Back to search results")
+                } else {
+                    (IconName::X, "Close thread")
+                };
                 this.child(
                     Button::new("close-thread")
                         .small()
                         .ghost()
-                        .icon(IconName::X)
-                        .accessibility_label("Close thread")
-                        .tooltip("Close thread")
+                        .icon(icon)
+                        .accessibility_label(label)
+                        .tooltip(label)
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(TimelineViewEvent::Close))),
                 )
             })
@@ -884,22 +987,189 @@ impl Render for TimelineView {
     }
 }
 
-/// `dir/name`, or `dir/name (2)` and so on if that file exists.
-fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-    let name = std::path::Path::new(name)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download".into());
-    let candidate = dir.join(&name);
-    if !candidate.exists() {
-        return candidate;
-    }
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
-        _ => (name.clone(), String::new()),
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::RefCell,
+        ops::Range,
+        time::{Duration, Instant},
     };
-    (2..)
-        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-        .find(|p| !p.exists())
-        .expect("an unused name exists")
+
+    use gpui_kit::{Bounds, TestAppContext, WindowBounds, WindowOptions, point, px, size};
+    use mattermost::{
+        Client, TeamId, User,
+        testing::{Network, Reply, Request, SlowServer},
+    };
+    use serde_json::json;
+
+    use super::*;
+
+    /// Posts `n{i}` of the channel `town`, created at `i + 1`.
+    fn posts(range: Range<usize>) -> serde_json::Value {
+        let order: Vec<String> = range.clone().rev().map(|i| format!("n{i}")).collect();
+        let posts: serde_json::Map<String, serde_json::Value> = range
+            .map(|i| {
+                let id = format!("n{i}");
+                let post = json!({ "id": id, "channel_id": "town", "user_id": "ann",
+                                   "message": format!("message {i}"), "create_at": i + 1 });
+                (id, post)
+            })
+            .collect();
+        json!({ "order": order, "posts": posts })
+    }
+
+    /// A channel of 120 posts: the newest page holds the last 60, the
+    /// page before it the first 60, and nothing comes before those.
+    fn route(request: &Request) -> Reply {
+        let path = request.path();
+        match path.split('?').next().unwrap_or_default() {
+            "/api/v4/users/me/teams" => Reply::json(json!([{ "id": "team", "name": "team" }])),
+            "/api/v4/users/me/teams/team/channels" => Reply::json(json!([
+                { "id": "town", "team_id": "team", "type": "O", "name": "town-square" },
+            ])),
+            "/api/v4/channels/town/posts" if path.contains("before=n60") => {
+                Reply::json(posts(0..60))
+            }
+            "/api/v4/channels/town/posts" if path.contains("before=") => Reply::json(json!({})),
+            "/api/v4/channels/town/posts" => Reply::json(posts(60..120)),
+            "/api/v4/users/me/teams/team/channels/members"
+            | "/api/v4/users/me/preferences/favorite_channel"
+            | "/api/v4/emoji"
+            | "/api/v4/users/ids"
+            | "/api/v4/users/status/ids" => Reply::json(json!([])),
+            _ => Reply::not_found(),
+        }
+    }
+
+    /// Run GPUI's work and let real network I/O happen until `done`.
+    fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting");
+            cx.executor().advance_clock(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The channel's view in a window once its newest page is shown, and
+    /// the threads it asks to open.
+    fn open_channel(
+        server: &SlowServer,
+        cx: &mut TestAppContext,
+    ) -> (Entity<TimelineView>, Rc<RefCell<Vec<PostId>>>) {
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let mut me = User::default();
+        me.id = "me".into();
+        let session = cx.new(|cx| Session::new(client, me, Some(TeamId::from("team")), cx));
+        // Shown, as the workspace does.
+        session.update(cx, |s, cx| {
+            s.open_channel(&"town".into(), cx);
+        });
+        let view = cx.update(|cx| {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.), px(0.)),
+                    size: size(px(800.), px(600.)),
+                })),
+                ..Default::default()
+            };
+            let kind = TimelineKind::Channel("town".into());
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| TimelineView::new(kind, session, None, window, cx))
+            })
+            .unwrap()
+            .1
+        });
+        let threads = Rc::new(RefCell::new(Vec::new()));
+        let opened = threads.clone();
+        cx.update(|cx| {
+            cx.subscribe(&view, move |_, event: &TimelineViewEvent, _| {
+                if let TimelineViewEvent::OpenThread(root) = event {
+                    opened.borrow_mut().push(root.clone());
+                }
+            })
+            .detach()
+        });
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, cx| v.timeline.read(cx).entries().len() == 60)
+        });
+        (view, threads)
+    }
+
+    fn older_pages(server: &SlowServer) -> usize {
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.path().contains("before="))
+            .count()
+    }
+
+    #[gpui_kit::test]
+    fn revealing_a_loaded_post_scrolls_to_it_and_marks_it(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (view, threads) = open_channel(&server, cx);
+        view.update(cx, |v, cx| v.reveal("n70".into(), 71, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |v, cx| {
+            assert_eq!(v.flashed, Some("n70".into()));
+            let ix = v.timeline.read(cx).position(&"n70".into()).unwrap();
+            assert_eq!(v.scroller.read(cx).logical_scroll_top().item_ix, ix);
+        });
+        assert_eq!(older_pages(&server), 0);
+        assert!(threads.borrow().is_empty());
+        // The mark fades on its own.
+        cx.executor().advance_clock(FLASH);
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert_eq!(v.flashed, None));
+    }
+
+    #[gpui_kit::test]
+    fn revealing_an_older_post_loads_back_to_it(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (view, threads) = open_channel(&server, cx);
+        view.update(cx, |v, cx| v.reveal("n5".into(), 6, cx));
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, _| v.flashed == Some("n5".into()))
+        });
+        view.read_with(cx, |v, cx| {
+            let ix = v.timeline.read(cx).position(&"n5".into()).unwrap();
+            assert_eq!(ix, 5);
+            assert_eq!(v.scroller.read(cx).logical_scroll_top().item_ix, ix);
+        });
+        assert!(threads.borrow().is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn a_post_the_channel_doesnt_reach_opens_in_its_thread(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (view, threads) = open_channel(&server, cx);
+        view.update(cx, |v, cx| v.reveal("gone".into(), 0, cx));
+        wait_until(cx, |_| !threads.borrow().is_empty());
+        assert_eq!(*threads.borrow(), [PostId::from("gone")]);
+        view.read_with(cx, |v, _| {
+            assert!(v.revealing.is_none());
+            assert_eq!(v.flashed, None);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_reveal_stops_when_another_conversation_opens(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (view, threads) = open_channel(&server, cx);
+        let session = view.read_with(cx, |v, _| v.session.clone());
+        view.update(cx, |v, cx| v.reveal("gone".into(), 0, cx));
+        // Another channel opens while the older page is on its way.
+        session.update(cx, |s, cx| {
+            s.open_channel(&"other".into(), cx);
+        });
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.revealing.is_none()));
+        assert!(threads.borrow().is_empty());
+        assert_eq!(older_pages(&server), 1);
+    }
 }

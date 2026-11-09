@@ -43,6 +43,27 @@ pub fn day_label(at: Millis) -> String {
     }
 }
 
+/// When something last happened, as a list of conversations shows it:
+/// `14:05` today, then `Yesterday`, the weekday within the past week,
+/// `March 3` this year, and `March 3, 2024` before that.
+pub fn recent(at: Millis) -> String {
+    let Some(date) = day(at) else {
+        return String::new();
+    };
+    let today = Local::now().date_naive();
+    if date == today {
+        clock(at)
+    } else if Some(date) == today.pred_opt() {
+        "Yesterday".into()
+    } else if date < today && (today - date).num_days() < 7 {
+        date.format("%A").to_string()
+    } else if date.year() == today.year() {
+        date.format("%B %-d").to_string()
+    } else {
+        date.format("%B %-d, %Y").to_string()
+    }
+}
+
 /// The current moment as RFC 3339 UTC, for comparing status expiries.
 pub fn now_rfc3339() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()

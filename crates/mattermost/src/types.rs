@@ -453,6 +453,81 @@ impl PostList {
     }
 }
 
+/// One page of posts found by a search.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct PostSearch {
+    /// The matching posts, newest first.
+    pub posts: Vec<Post>,
+    /// The words that matched in each post, as the server stemmed them.
+    pub matches: HashMap<PostId, Vec<String>>,
+    /// Whether another page may follow.
+    pub has_next: bool,
+}
+
+impl PostSearch {
+    pub(crate) fn from_page(
+        list: PostList,
+        matches: Option<HashMap<PostId, Vec<String>>>,
+        per_page: usize,
+    ) -> Self {
+        let fetched = list.order.len().max(list.posts.len());
+        let has_next = list.has_next || fetched >= per_page;
+        let mut posts = list.into_chronological();
+        posts.reverse();
+        Self {
+            posts,
+            matches: matches.unwrap_or_default(),
+            has_next,
+        }
+    }
+}
+
+/// Go encodes an empty list as `null`, which `#[serde(default)]` alone
+/// doesn't accept.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+/// A thread the user follows (collapsed reply threads), with their read
+/// state in it.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct UserThread {
+    /// The root post's identity.
+    pub id: PostId,
+    pub reply_count: i64,
+    pub last_reply_at: Millis,
+    pub last_viewed_at: Millis,
+    /// Everyone who has posted in the thread, earliest first. Only `id` is
+    /// filled in unless full profiles were asked for.
+    #[serde(deserialize_with = "null_as_default")]
+    pub participants: Vec<User>,
+    /// The root post.
+    #[serde(deserialize_with = "null_as_default")]
+    pub post: Post,
+    pub unread_replies: i64,
+    pub unread_mentions: i64,
+}
+
+/// One page of the threads the user follows in a team, and their unread
+/// totals across all of them.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct UserThreads {
+    pub total: i64,
+    pub total_unread_threads: i64,
+    pub total_unread_mentions: i64,
+    #[serde(deserialize_with = "null_as_default")]
+    pub threads: Vec<UserThread>,
+}
+
 /// An emoji uploaded to the server. Messages and reactions name it like a
 /// standard emoji (`:partyparrot:`); standard emoji are never listed.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -593,6 +668,24 @@ mod tests {
             .map(|p| p.id)
             .collect();
         assert_eq!(ids, vec![PostId::from("root"), PostId::from("reply")]);
+    }
+
+    #[test]
+    fn followed_threads_accept_null_lists() {
+        let page: UserThreads = serde_json::from_str(
+            r#"{"total":1,"total_unread_threads":1,"total_unread_mentions":2,"threads":[
+                {"id":"root","reply_count":3,"last_reply_at":30,"last_viewed_at":10,
+                 "participants":null,"unread_replies":2,"unread_mentions":2,
+                 "post":{"id":"root","channel_id":"c1","message":"hi"}}]}"#,
+        )
+        .unwrap();
+        let thread = &page.threads[0];
+        assert_eq!(thread.id.as_str(), "root");
+        assert_eq!(thread.post.channel_id.as_str(), "c1");
+        assert!(thread.participants.is_empty());
+        let totals: UserThreads =
+            serde_json::from_str(r#"{"total":0,"total_unread_threads":0,"threads":null}"#).unwrap();
+        assert!(totals.threads.is_empty());
     }
 }
 

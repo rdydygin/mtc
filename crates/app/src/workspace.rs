@@ -1,4 +1,5 @@
-//! The signed-in window: sidebar, the open channel, and an optional thread.
+//! The signed-in window: sidebar, the open channel or the Threads list, and
+//! beside it a thread or a search of the channel's messages.
 //!
 //! Recently opened channel views stay alive, so switching back is instant
 //! and keeps scroll position, parsed Markdown, and the unsent draft.
@@ -13,22 +14,26 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    Action, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
+    Action, AnyElement, AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
     Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+    Styled as _, Subscription, Task, Window, div, px,
 };
-use mattermost::{ChannelId, Client, PostId, TeamId, User};
+use mattermost::{ChannelId, Client, Post, PostId, TeamId, User};
 use session::{Session, SessionEvent, TimelineKind};
 
 use crate::{
     actions::{
-        CloseConversation, Dismiss, FocusComposer, NextChannel, NextUnreadChannel, PreviousChannel,
-        PreviousUnreadChannel, QuickSwitch, RESET_ZOOM_KEY, ShowSettings, ShowShortcuts,
-        ToggleFavorite, WORKSPACE_CONTEXT, ZOOM_IN_KEY, ZOOM_OUT_KEY, shortcut_label,
+        CloseConversation, Dismiss, FocusComposer, LeaveChannel, NextChannel, NextUnreadChannel,
+        PreviousChannel, PreviousUnreadChannel, QuickSwitch, RESET_ZOOM_KEY, SearchConversation,
+        ShowSettings, ShowShortcuts, ShowThreads, ToggleFavorite, WORKSPACE_CONTEXT, ZOOM_IN_KEY,
+        ZOOM_OUT_KEY, shortcut_label,
     },
+    dither::DitherView,
     extensions, persist,
+    search::{SearchEvent, SearchView},
     sidebar::{SidebarEvent, SidebarView, sections},
     skeleton, switcher,
+    threads_view::{ThreadsView, ThreadsViewEvent},
     timeline_view::{TimelineView, TimelineViewEvent},
     update,
 };
@@ -43,7 +48,10 @@ const SIDEBAR_WIDTH: f32 = 21.;
 const SIDEBAR_RANGE: Range<f32> = 18.5..33.;
 const THREAD_WIDTH: f32 = 28.5;
 const THREAD_RANGE: Range<f32> = 21.5..51.;
-/// The narrowest the open channel gets beside a thread.
+/// The Threads list, beside the open thread.
+const THREAD_LIST_WIDTH: f32 = 26.;
+const THREAD_LIST_RANGE: Range<f32> = 20.5..40.;
+/// The narrowest the open channel gets beside a thread or search.
 const CHANNEL_MIN_WIDTH: f32 = 20.;
 /// How far the sidebar gives way when the window can't fit it at its own
 /// minimum beside the channel: large zoom in a small window.
@@ -51,6 +59,37 @@ const SIDEBAR_SQUEEZED_WIDTH: f32 = 12.;
 
 pub enum WorkspaceEvent {
     SignedOut,
+}
+
+/// How the panes beside the sidebar are arranged. A change lays them out
+/// afresh, since a pane at the same position may now be another kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    /// The channel, with its thread beside it at a fixed width.
+    Channel,
+    /// The Threads list at a fixed width, and the open thread beside it.
+    ThreadsSplit,
+    /// The Threads list or, in its place, the open thread: the window is
+    /// too narrow for both.
+    ThreadsSingle,
+}
+
+/// The pane preference a drag on a pane's edge changes.
+#[derive(Clone, Copy)]
+enum Drag {
+    Sidebar,
+    Thread,
+    ThreadList,
+}
+
+/// One pane of the resizable group, as this frame lays it out.
+struct Pane {
+    content: AnyElement,
+    /// A fixed pane keeps this width as the window resizes; the others
+    /// share what is left.
+    width: Option<Pixels>,
+    range: Range<Pixels>,
+    drag: Option<Drag>,
 }
 
 pub struct Workspace {
@@ -61,20 +100,35 @@ pub struct Workspace {
     views: Vec<(ChannelId, Entity<TimelineView>, Subscription)>,
     active: Option<ChannelId>,
     thread: Option<(Entity<TimelineView>, Subscription)>,
+    /// The open channel's search, kept while hidden so its results are
+    /// still there when it comes back.
+    search: Option<(Entity<SearchView>, Subscription)>,
+    /// Whether the search shows. A thread opened over it covers it until
+    /// the thread closes.
+    search_open: bool,
+    /// The Threads list, made the first time it is shown.
+    threads: Option<(Entity<ThreadsView>, Subscription)>,
+    /// The Threads pane is shown in the channel's place.
+    showing_threads: bool,
+    /// Beside the Threads list before a thread is open.
+    no_thread: Entity<DitherView>,
     drafts: HashMap<TimelineKind, String>,
     recent: Vec<ChannelId>,
     focus_handle: FocusHandle,
-    /// Pane widths, and the rem size and sidebar cap they were laid out at.
+    /// Pane widths, and the rem size, sidebar cap, and arrangement they
+    /// were laid out at.
     panes: Entity<ResizableState>,
-    panes_basis: (Pixels, bool),
+    panes_basis: (Pixels, bool, Layout),
     /// The thread width the user dragged to, kept for the session.
     thread_width_rem: Option<f32>,
+    /// The Threads list width the user dragged to, kept for the session.
+    thread_list_width_rem: Option<f32>,
     /// Pane widths, as laid out, when the mouse last went down on the panes:
     /// a drag is told apart by which pane it changed.
     drag_origin: Vec<Pixels>,
-    /// The window is too narrow for both, so the thread is shown in the
-    /// channel's place.
-    thread_replaces_channel: bool,
+    /// The window is too narrow for both, so the thread or search is shown
+    /// in the place of the channel or the Threads list.
+    side_replaces_content: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -102,6 +156,7 @@ impl Workspace {
         let subscriptions = vec![
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
                 SidebarEvent::OpenChannel(id) => this.open_channel(id, window, cx),
+                SidebarEvent::OpenThreads => this.show_threads(&ShowThreads, window, cx),
             }),
             cx.subscribe_in(&session, window, |this, session, event, window, cx| {
                 if let SessionEvent::SignedOut = event {
@@ -118,8 +173,11 @@ impl Workspace {
             // virtual list, or the channel replaced by its thread in a narrow
             // window. Typing should still land in the visible conversation.
             cx.on_focus_lost(window, |this, window, cx| {
-                match (&this.thread, this.thread_replaces_channel) {
-                    (Some((thread, _)), true) => thread.focus_handle(cx).focus(window, cx),
+                match (&this.thread, &this.search, this.side_replaces_content) {
+                    (Some((thread, _)), _, true) => thread.focus_handle(cx).focus(window, cx),
+                    (None, Some((search, _)), true) if this.search_open => {
+                        search.update(cx, |search, cx| search.focus(window, cx))
+                    }
                     _ => this.focus_active(window, cx),
                 }
             }),
@@ -133,14 +191,20 @@ impl Workspace {
             views: Vec::new(),
             active: None,
             thread: None,
+            search: None,
+            search_open: false,
+            threads: None,
+            showing_threads: false,
+            no_thread: cx.new(|_| DitherView::new().thread_hint()),
             drafts: HashMap::new(),
             recent: Vec::new(),
             focus_handle,
             panes: cx.new(|_| ResizableState::default()),
-            panes_basis: (Pixels::ZERO, false),
+            panes_basis: (Pixels::ZERO, false, Layout::Channel),
             thread_width_rem: None,
+            thread_list_width_rem: None,
             drag_origin: Vec::new(),
-            thread_replaces_channel: false,
+            side_replaces_content: false,
             _subscriptions: subscriptions,
         }
     }
@@ -171,13 +235,24 @@ impl Workspace {
         if !session_ref.is_loaded() {
             return;
         }
-        let still_exists = self
+        if self.showing_threads {
+            // Another team's thread leaves with its channel.
+            let gone = self.thread.as_ref().is_some_and(|(thread, _)| {
+                session_ref
+                    .channel(thread.read(cx).kind().channel())
+                    .is_none()
+            });
+            if gone {
+                self.close_thread(window, cx);
+            }
+        } else if self
             .active
             .as_ref()
-            .is_some_and(|id| session_ref.channel(id).is_some());
-        if still_exists {
+            .is_some_and(|id| session_ref.channel(id).is_some())
+        {
             return;
         }
+        let session_ref = session.read(cx);
         let initial = persist::read_with(|state| state.last_channel.clone())
             .map(ChannelId::from)
             .filter(|id| session_ref.channel(id).is_some());
@@ -197,6 +272,10 @@ impl Workspace {
                 });
             }
         }
+        // The Threads pane stays up; there is no channel to recover.
+        if self.showing_threads {
+            return;
+        }
         if let Some(id) = initial {
             self.open_channel(&id, window, cx);
         } else if self.active.is_some() {
@@ -205,6 +284,7 @@ impl Workspace {
     }
 
     pub fn open_channel(&mut self, id: &ChannelId, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_threads(cx);
         if self.active.as_ref() == Some(id) {
             self.focus_active(window, cx);
             return;
@@ -240,7 +320,15 @@ impl Workspace {
         self.recent.truncate(RECENT_LIMIT);
         persist::update(|state| state.last_channel = Some(id.to_string()));
 
-        // A thread belongs to its channel.
+        // A thread belongs to its channel, and so does a search.
+        if self
+            .search
+            .as_ref()
+            .is_some_and(|(search, _)| search.read(cx).channel() != id)
+        {
+            self.search = None;
+            self.search_open = false;
+        }
         if let Some((thread, _)) = &self.thread
             && thread.read(cx).kind().channel() != id
         {
@@ -259,13 +347,22 @@ impl Workspace {
         }
     }
 
+    fn leave_channel(&mut self, _: &LeaveChannel, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(active) = &self.active {
+            crate::sidebar::confirm_leave(&self.session, active, window, cx);
+        }
+    }
+
     fn close_conversation(
         &mut self,
         _: &CloseConversation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.search = None;
+        self.search_open = false;
         self.close_thread(window, cx);
+        self.leave_threads(cx);
         self.active = None;
         persist::update(|state| state.last_channel = None);
         self.session.update(cx, |s, cx| s.close_channel(cx));
@@ -290,6 +387,64 @@ impl Workspace {
         }
     }
 
+    /// Show the threads the user follows in the channel's place. A thread
+    /// already open stays open beside the list.
+    fn show_threads(&mut self, _: &ShowThreads, window: &mut Window, cx: &mut Context<Self>) {
+        let view = match &self.threads {
+            Some((view, _)) => view.clone(),
+            None => {
+                let session = self.session.clone();
+                let view = cx.new(|cx| ThreadsView::new(session, cx));
+                let subscription = cx.subscribe_in(&view, window, Self::on_threads_view_event);
+                self.threads = Some((view.clone(), subscription));
+                view
+            }
+        };
+        if !self.showing_threads {
+            self.showing_threads = true;
+            view.update(cx, |view, cx| view.shown(cx));
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.set_threads_selected(true, cx));
+            // The channel is no longer in view, so its new posts are unread.
+            if self.active.take().is_some() {
+                self.session.update(cx, |s, cx| s.close_channel(cx));
+            }
+            // The channel's search goes with it, keeping its results for ⌘F.
+            self.search_open = false;
+            if let Some((thread, _)) = &self.thread {
+                thread.update(cx, |thread, cx| thread.set_back_to_results(false, cx));
+            }
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn leave_threads(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.showing_threads) {
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.set_threads_selected(false, cx));
+            cx.notify();
+        }
+    }
+
+    fn on_threads_view_event(
+        &mut self,
+        _: &Entity<ThreadsView>,
+        event: &ThreadsViewEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ThreadsViewEvent::OpenThread { channel, root } => {
+                self.open_thread(channel.clone(), root.clone(), window, cx)
+            }
+            ThreadsViewEvent::OpenInChannel { channel, root } => {
+                self.open_channel(channel, window, cx);
+                self.open_thread(channel.clone(), root.clone(), window, cx);
+            }
+        }
+    }
+
     fn open_thread(
         &mut self,
         channel: ChannelId,
@@ -307,20 +462,101 @@ impl Workspace {
             self.save_draft(&thread, cx);
         }
         let draft = self.drafts.remove(&kind);
+        self.session
+            .update(cx, |s, cx| s.set_open_thread(kind.root().cloned(), cx));
         let session = self.session.clone();
         let view = cx.new(|cx| TimelineView::new(kind, session, draft, window, cx));
         let subscription = cx.subscribe_in(&view, window, Self::on_timeline_view_event);
+        let back_to_results = self.search_open;
+        view.update(cx, |view, cx| view.set_back_to_results(back_to_results, cx));
         view.focus_handle(cx).focus(window, cx);
         self.thread = Some((view, subscription));
         cx.notify();
     }
 
+    /// Close the thread, uncovering the search it was opened over, if any.
     fn close_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((thread, _)) = self.thread.take() {
             self.save_draft(&thread, cx);
-            self.focus_active(window, cx);
+            self.session.update(cx, |s, cx| s.set_open_thread(None, cx));
+            match &self.search {
+                Some((search, _)) if self.search_open => {
+                    search.update(cx, |search, cx| search.focus(window, cx))
+                }
+                _ => self.focus_active(window, cx),
+            }
             cx.notify();
         }
+    }
+
+    /// Show the search of the open channel, keeping its last results.
+    fn search_conversation(
+        &mut self,
+        _: &SearchConversation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.active.clone() else {
+            return;
+        };
+        let search = match &self.search {
+            Some((search, _)) if search.read(cx).channel() == &active => search.clone(),
+            _ => {
+                let session = self.session.clone();
+                let search = cx.new(|cx| SearchView::new(session, active, window, cx));
+                let subscription = cx.subscribe_in(&search, window, Self::on_search_event);
+                self.search = Some((search.clone(), subscription));
+                search
+            }
+        };
+        // The search takes the thread's place.
+        self.search_open = true;
+        self.close_thread(window, cx);
+        search.update(cx, |search, cx| search.focus(window, cx));
+        cx.notify();
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = false;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn on_search_event(
+        &mut self,
+        _: &Entity<SearchView>,
+        event: &SearchEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SearchEvent::Open(post) => self.show_result(post, window, cx),
+            SearchEvent::Close => self.close_search(window, cx),
+        }
+    }
+
+    /// Show a search result where it was written: a reply in its thread,
+    /// over the results, and any other post in the channel beside them.
+    fn show_result(&mut self, post: &Post, window: &mut Window, cx: &mut Context<Self>) {
+        let channel = post.channel_id.clone();
+        if self.active.as_ref() != Some(&channel) {
+            self.open_channel(&channel, window, cx);
+        }
+        let target = if post.is_reply() {
+            self.open_thread(channel, post.root_id.clone(), window, cx);
+            self.thread.as_ref().map(|(thread, _)| thread.clone())
+        } else {
+            // A narrow window can't show the results beside the channel.
+            if self.side_replaces_content {
+                self.close_search(window, cx);
+            }
+            self.active_view().cloned()
+        };
+        if let Some(view) = target {
+            let (id, created) = (post.id.clone(), post.create_at);
+            view.update(cx, |view, cx| view.reveal(id, created, cx));
+        }
+        cx.notify();
     }
 
     fn save_draft(&mut self, view: &Entity<TimelineView>, cx: &mut Context<Self>) {
@@ -339,9 +575,20 @@ impl Workspace {
             .map(|(_, v, _)| v)
     }
 
+    /// Focus the conversation in view: the open channel, or in the Threads
+    /// pane, the open thread or else the list.
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.active_view() {
-            view.focus_handle(cx).focus(window, cx);
+        let focus = if self.showing_threads {
+            match (&self.thread, &self.threads) {
+                (Some((thread, _)), _) => Some(thread.focus_handle(cx)),
+                (None, Some((list, _))) => Some(list.focus_handle(cx)),
+                (None, None) => None,
+            }
+        } else {
+            self.active_view().map(|view| view.focus_handle(cx))
+        };
+        if let Some(focus) = focus {
+            focus.focus(window, cx);
         }
     }
 
@@ -390,6 +637,10 @@ impl Workspace {
             self.close_thread(window, cx);
             return;
         }
+        if self.search_open {
+            self.close_search(window, cx);
+            return;
+        }
         if let Some(active) = self.active.clone() {
             self.session.update(cx, |s, cx| {
                 s.mark_viewed(&active, cx);
@@ -401,8 +652,13 @@ impl Workspace {
 
     fn show_shortcuts(&mut self, _: &ShowShortcuts, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, |dialog, window, cx| {
-            let rows: [(&str, Box<dyn Action>); 9] = [
+            let rows: [(&str, Box<dyn Action>); 11] = [
                 ("Jump to a channel or person", Box::new(QuickSwitch)),
+                (
+                    "Search messages in the conversation",
+                    Box::new(SearchConversation),
+                ),
+                ("Threads", Box::new(ShowThreads)),
                 ("Next channel", Box::new(NextChannel)),
                 ("Previous channel", Box::new(PreviousChannel)),
                 ("Next unread channel", Box::new(NextUnreadChannel)),
@@ -447,12 +703,15 @@ impl Workspace {
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let session = self.session.read(cx);
-        let title = self
-            .active
-            .as_ref()
-            .and_then(|id| session.channel(id))
-            .map(|e| session.channel_label(e, cx))
-            .unwrap_or_else(|| "Conversations".into());
+        let title = if self.showing_threads {
+            "Threads".into()
+        } else {
+            self.active
+                .as_ref()
+                .and_then(|id| session.channel(id))
+                .map(|e| session.channel_label(e, cx))
+                .unwrap_or_else(|| "Conversations".into())
+        };
         TitleBar::new()
             .child(
                 h_flex()
@@ -526,61 +785,147 @@ impl Render for Workspace {
         // sidebar's own minimum, it holds that width and can't be dragged.
         let sidebar_fit = (viewport - channel_min).max(rem * SIDEBAR_SQUEEZED_WIDTH);
         let sidebar_capped = sidebar_fit < preferred_sidebar;
-        // Pane widths are pixels laid out from these preferences. After a
-        // zoom change, or when the window starts or stops capping the
-        // sidebar, lay them out afresh so they return to the preferences.
-        if (rem, sidebar_capped) != self.panes_basis {
-            self.panes_basis = (rem, sidebar_capped);
-            self.panes = cx.new(|_| ResizableState::default());
-        }
-        let theme = cx.theme();
-        let (background, border, radius) = (theme.background, theme.border, theme.radius_lg);
-        // Every content surface is an inset card on one tinted backdrop, with
-        // the same gutter around and between them as the sidebar's.
-        let backdrop = theme.title_bar;
-        let panel = move |child: AnyElement| {
-            div().size_full().min_w_0().py_2().pr_2().child(
-                div()
-                    .size_full()
-                    .min_w_0()
-                    .rounded(radius)
-                    .border_1()
-                    .border_color(border)
-                    .bg(background)
-                    .overflow_hidden()
-                    .child(child),
+        let (background, border, radius, backdrop) = {
+            let theme = cx.theme();
+            // Every content surface is an inset card on one tinted backdrop,
+            // with the same gutter around and between them as the sidebar's.
+            (
+                theme.background,
+                theme.border,
+                theme.radius_lg,
+                theme.title_bar,
             )
+        };
+        let panel = move |child: AnyElement| {
+            div()
+                .size_full()
+                .min_w_0()
+                .py_2()
+                .pr_2()
+                .child(
+                    div()
+                        .size_full()
+                        .min_w_0()
+                        .rounded(radius)
+                        .border_1()
+                        .border_color(border)
+                        .bg(background)
+                        .overflow_hidden()
+                        .child(child),
+                )
+                .into_any_element()
         };
         let sidebar_range = (rem * SIDEBAR_RANGE.start).min(sidebar_fit)
             ..(rem * SIDEBAR_RANGE.end).min(sidebar_fit);
         let sidebar_width = preferred_sidebar.min(sidebar_fit);
-        let thread_range = rem * THREAD_RANGE.start..rem * THREAD_RANGE.end;
-
-        // A thread opens beside the channel at its default width, narrowed
-        // to what the window can spare, and replaces the channel when the
-        // window can no longer fit it beside a usable channel.
-        let room = viewport - sidebar_width - channel_min;
-        let preferred = (rem * self.thread_width_rem.unwrap_or(THREAD_WIDTH))
-            .clamp(thread_range.start, thread_range.end);
-        let thread_width = room.clamp(thread_range.start, preferred);
-        // A thread dragged wide gives way when the window narrows, down to
-        // its minimum, rather than pushing the channel under its own.
-        let thread_fit = thread_range.start..thread_range.end.min(room).max(thread_range.start);
         let thread = self.thread.as_ref().map(|(t, _)| t.clone());
-        // Only the window and the sidebar decide this, never the thread's
-        // current width: a test on that width changes the width it tests,
-        // so the layout would flip back and forth at the switch point.
-        self.thread_replaces_channel = thread.is_some() && room < thread_range.start;
-        let (content, side_thread) = match thread {
-            Some(thread) if self.thread_replaces_channel => (Some(thread), None),
-            thread => (self.active_view().cloned(), thread),
+        // What the window leaves beside the sidebar and a usable channel or
+        // thread.
+        let room = viewport - sidebar_width - channel_min;
+        let thread_list = self
+            .threads
+            .as_ref()
+            .filter(|_| self.showing_threads)
+            .map(|(list, _)| list.clone());
+        let content_pane = |content: AnyElement| Pane {
+            content: panel(content),
+            width: None,
+            range: channel_min..Pixels::MAX,
+            drag: None,
         };
+
+        // Only the window and the sidebar decide whether a thread replaces
+        // what it opens beside, never the thread's current width: a test on
+        // that width changes the width it tests, so the layout would flip
+        // back and forth at the switch point.
+        let (layout, panes) = if let Some(list) = thread_list {
+            // The list keeps its width and the thread takes the rest, unless
+            // the window can't fit the list at its minimum beside a usable
+            // thread. Then one shows at a time.
+            let list_range = rem * THREAD_LIST_RANGE.start..rem * THREAD_LIST_RANGE.end;
+            self.side_replaces_content = thread.is_some() && room < list_range.start;
+            if room < list_range.start {
+                let content = match thread {
+                    Some(thread) => thread.into_any_element(),
+                    None => list.into_any_element(),
+                };
+                (Layout::ThreadsSingle, vec![content_pane(content)])
+            } else {
+                let preferred = (rem * self.thread_list_width_rem.unwrap_or(THREAD_LIST_WIDTH))
+                    .clamp(list_range.start, list_range.end);
+                let detail = match thread {
+                    Some(thread) => thread.into_any_element(),
+                    None => self.no_thread.clone().into_any_element(),
+                };
+                let list = Pane {
+                    content: panel(list.into_any_element()),
+                    width: Some(preferred.min(room)),
+                    range: list_range.start..list_range.end.min(room),
+                    drag: Some(Drag::ThreadList),
+                };
+                (Layout::ThreadsSplit, vec![list, content_pane(detail)])
+            }
+        } else {
+            // A thread or search opens beside the channel at its default
+            // width, narrowed to what the window can spare, and replaces the
+            // channel when the window can no longer fit it beside a usable
+            // channel.
+            let thread_range = rem * THREAD_RANGE.start..rem * THREAD_RANGE.end;
+            let preferred = (rem * self.thread_width_rem.unwrap_or(THREAD_WIDTH))
+                .clamp(thread_range.start, thread_range.end);
+            let thread_width = room.clamp(thread_range.start, preferred);
+            // A thread dragged wide gives way when the window narrows, down to
+            // its minimum, rather than pushing the channel under its own.
+            let thread_fit = thread_range.start..thread_range.end.min(room).max(thread_range.start);
+            let side: Option<AnyView> = match (thread, &self.search) {
+                (Some(thread), _) => Some(thread.into()),
+                (None, Some((search, _))) if self.search_open => Some(search.clone().into()),
+                _ => None,
+            };
+            self.side_replaces_content = side.is_some() && room < thread_range.start;
+            let (content, side) = match side {
+                Some(side) if self.side_replaces_content => (Some(side), None),
+                side => (self.active_view().map(|view| view.clone().into()), side),
+            };
+            let content = match content {
+                Some(view) => view.into_any_element(),
+                // A conversation is about to reopen: show its shape, not the
+                // empty state.
+                None if !self.session.read(cx).is_loaded()
+                    && persist::read_with(|s| s.last_channel.is_some()) =>
+                {
+                    skeleton::conversation(cx).into_any_element()
+                }
+                None => self.empty.clone().into_any_element(),
+            };
+            let mut panes = vec![content_pane(content)];
+            panes.extend(side.map(|side| Pane {
+                content: panel(side.into_any_element()),
+                width: Some(thread_width),
+                range: thread_fit,
+                drag: Some(Drag::Thread),
+            }));
+            (Layout::Channel, panes)
+        };
+
+        // Pane widths are pixels laid out from these preferences. After a
+        // zoom change, when the window starts or stops capping the sidebar,
+        // or when the panes are rearranged, lay them out afresh so they
+        // return to the preferences.
+        if (rem, sidebar_capped, layout) != self.panes_basis {
+            self.panes_basis = (rem, sidebar_capped, layout);
+            self.panes = cx.new(|_| ResizableState::default());
+        }
+        let sidebar = Pane {
+            content: self.sidebar.clone().into_any_element(),
+            width: Some(sidebar_width),
+            range: sidebar_range,
+            drag: Some(Drag::Sidebar),
+        };
+        let panes: Vec<Pane> = std::iter::once(sidebar).chain(panes).collect();
+        let ranges: Vec<Range<Pixels>> = panes.iter().map(|pane| pane.range.clone()).collect();
+        let drags: Vec<Option<Drag>> = panes.iter().map(|pane| pane.drag).collect();
         let workspace = cx.entity().downgrade();
-        let ranges = [
-            sidebar_range.clone(),
-            channel_min..Pixels::MAX,
-            thread_fit.clone(),
-        ];
         let laid_out = move |sizes: &[Pixels]| -> Vec<Pixels> {
             // The group keeps the width a pane was dragged to even where the
             // pane's range no longer allows it, and lays it out clamped.
@@ -591,6 +936,43 @@ impl Render for Workspace {
                 .collect()
         };
         let drag_start = laid_out.clone();
+        let group = h_resizable("workspace-panes")
+            .with_handle_appearance(pane_divider())
+            .with_state(&self.panes)
+            .on_resize(move |state, _, cx| {
+                let sizes = laid_out(state.read(cx).sizes());
+                let _ = workspace.update(cx, |this, _| {
+                    let origin = std::mem::take(&mut this.drag_origin);
+                    // A fixed pane changes only for a drag on its own divider.
+                    // Widths are kept in rems so a zoom change doesn't undo
+                    // them.
+                    for (ix, drag) in drags.iter().enumerate() {
+                        let (Some(drag), Some(&now), Some(&was)) =
+                            (drag, sizes.get(ix), origin.get(ix))
+                        else {
+                            continue;
+                        };
+                        if (now - was).abs() <= px(0.5) {
+                            continue;
+                        }
+                        match drag {
+                            Drag::Sidebar => {
+                                persist::update(|s| s.sidebar_width_rem = Some(now / rem))
+                            }
+                            Drag::Thread => this.thread_width_rem = Some(now / rem),
+                            Drag::ThreadList => this.thread_list_width_rem = Some(now / rem),
+                        }
+                    }
+                });
+            });
+        let group = panes.into_iter().fold(group, |group, pane| {
+            let panel = resizable_panel().size_range(pane.range);
+            let panel = match pane.width {
+                Some(width) => panel.size(width).fixed(),
+                None => panel,
+            };
+            group.child(panel.child(pane.content))
+        });
 
         v_flex()
             .id("workspace")
@@ -599,6 +981,7 @@ impl Render for Workspace {
             .size_full()
             .bg(backdrop)
             .on_action(cx.listener(Self::quick_switch))
+            .on_action(cx.listener(Self::show_threads))
             .on_action(cx.listener(|this, _: &NextChannel, window, cx| {
                 this.step_channel(1, false, window, cx)
             }))
@@ -614,6 +997,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::close_conversation))
             .on_action(cx.listener(Self::toggle_favorite))
+            .on_action(cx.listener(Self::search_conversation))
+            .on_action(cx.listener(Self::leave_channel))
             .on_action(
                 cx.listener(|this, _: &FocusComposer, window, cx| this.focus_active(window, cx)),
             )
@@ -628,66 +1013,191 @@ impl Render for Workspace {
                     .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
                         this.drag_origin = drag_start(this.panes.read(cx).sizes());
                     }))
-                    .child(
-                        h_resizable("workspace-panes")
-                            .with_handle_appearance(pane_divider())
-                            .with_state(&self.panes)
-                            .on_resize(move |state, _, cx| {
-                                let sizes = laid_out(state.read(cx).sizes());
-                                let _ = workspace.update(cx, |this, _| {
-                                    let origin = std::mem::take(&mut this.drag_origin);
-                                    let moved = |ix: usize| match (sizes.get(ix), origin.get(ix)) {
-                                        (Some(&now), Some(&was)) if (now - was).abs() > px(0.5) => {
-                                            Some(now)
-                                        }
-                                        _ => None,
-                                    };
-                                    // A fixed pane changes only for a drag on its
-                                    // own divider: the sidebar's, or the thread's.
-                                    // Widths are kept in rems so a zoom change
-                                    // doesn't undo them.
-                                    if let Some(sidebar) = moved(0) {
-                                        persist::update(|s| {
-                                            s.sidebar_width_rem = Some(sidebar / rem)
-                                        });
-                                    }
-                                    if let Some(thread) = moved(2) {
-                                        this.thread_width_rem = Some(thread / rem);
-                                    }
-                                });
-                            })
-                            .child(
-                                resizable_panel()
-                                    .size(sidebar_width)
-                                    .size_range(sidebar_range)
-                                    .fixed()
-                                    .child(self.sidebar.clone()),
-                            )
-                            .child(
-                                resizable_panel()
-                                    .size_range(channel_min..Pixels::MAX)
-                                    .child(panel(match content {
-                                        Some(view) => view.into_any_element(),
-                                        // A conversation is about to reopen:
-                                        // show its shape, not the empty state.
-                                        None if !self.session.read(cx).is_loaded()
-                                            && persist::read_with(|s| s.last_channel.is_some()) =>
-                                        {
-                                            skeleton::conversation(cx).into_any_element()
-                                        }
-                                        None => self.empty.clone().into_any_element(),
-                                    })),
-                            )
-                            .when_some(side_thread, |this, thread| {
-                                this.child(
-                                    resizable_panel()
-                                        .size(thread_width)
-                                        .size_range(thread_fit)
-                                        .fixed()
-                                        .child(panel(thread.into_any_element())),
-                                )
-                            }),
-                    ),
+                    .child(group),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AnyWindowHandle, Bounds, TestAppContext, WindowBounds, WindowOptions, size};
+    use mattermost::testing::{Network, Reply, Request, SlowServer};
+    use serde_json::json;
+
+    use super::*;
+
+    /// A team with one channel and one followed thread in it, with two
+    /// unread replies, one of them a mention.
+    fn route(request: &Request) -> Reply {
+        let path = request.path().split('?').next().unwrap_or_default();
+        let thread = json!({
+            "id": "root", "reply_count": 2, "last_reply_at": 30,
+            "unread_replies": 2, "unread_mentions": 1,
+            "participants": [{ "id": "ann" }],
+            "post": { "id": "root", "channel_id": "town", "user_id": "ann",
+                      "message": "Release **notes** are up", "create_at": 10 },
+        });
+        match path {
+            "/api/v4/users/me/teams" => {
+                Reply::json(json!([{ "id": "team", "name": "team", "display_name": "Team" }]))
+            }
+            "/api/v4/users/me/teams/team/channels" => Reply::json(json!([
+                { "id": "town", "team_id": "team", "type": "O", "name": "town-square",
+                  "display_name": "Town Square" },
+            ])),
+            "/api/v4/users/me/teams/team/channels/members" => {
+                Reply::json(json!([{ "channel_id": "town", "user_id": "me" }]))
+            }
+            "/api/v4/users/me/teams/team/threads" if request.path().contains("totalsOnly") => {
+                Reply::json(json!({ "total_unread_threads": 1, "total_unread_mentions": 1 }))
+            }
+            "/api/v4/users/me/teams/team/threads" => Reply::json(json!({
+                "total": 1, "total_unread_threads": 1, "total_unread_mentions": 1,
+                "threads": [thread],
+            })),
+            "/api/v4/posts/root/thread" => Reply::json(json!({
+                "order": ["root", "reply"],
+                "posts": {
+                    "root": { "id": "root", "channel_id": "town", "user_id": "ann",
+                              "message": "Release notes are up", "create_at": 10 },
+                    "reply": { "id": "reply", "channel_id": "town", "user_id": "ann",
+                               "root_id": "root", "message": "@me have a look", "create_at": 30 },
+                },
+            })),
+            "/api/v4/users/ids" => Reply::json(json!([{ "id": "ann", "username": "ann" }])),
+            "/api/v4/users/status/ids" => {
+                Reply::json(json!([{ "user_id": "ann", "status": "online" }]))
+            }
+            "/api/v4/users/me/preferences/favorite_channel" | "/api/v4/emoji" => {
+                Reply::json(json!([]))
+            }
+            _ if path.starts_with("/api/v4/users/me/teams/team/threads/root/read/") => {
+                Reply::json(json!({}))
+            }
+            _ => Reply::not_found(),
+        }
+    }
+
+    fn open_workspace(
+        server: &SlowServer,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<Workspace>) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            update::init(cx);
+            crate::actions::init(cx);
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let mut me = User::default();
+        me.id = "me".into();
+        let workspace = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (handle, _) = cx.update(|cx| {
+            let workspace = workspace.clone();
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1200.), px(800.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                move |window, cx| {
+                    let view = cx.new(|cx| {
+                        Workspace::new(client, me, Some(TeamId::from("team")), window, cx)
+                    });
+                    *workspace.borrow_mut() = Some(view.clone());
+                    view
+                },
+            )
+            .expect("open test window")
+        });
+        let workspace = workspace.borrow_mut().take().unwrap();
+        (handle, workspace)
+    }
+
+    /// Run GPUI's work and let real network I/O happen until `done`.
+    fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting");
+            cx.executor().advance_clock(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn the_threads_pane_lists_followed_threads_and_opens_one_beside_the_list(
+        cx: &mut TestAppContext,
+    ) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (handle, workspace) = open_workspace(&server, cx);
+        let session = workspace.read_with(cx, |w, _| w.session.clone());
+        let threads = session.read_with(cx, |s, _| s.threads().clone());
+        // The sidebar counts unread threads before the pane is ever shown.
+        wait_until(cx, |cx| {
+            threads.read_with(cx, |t, _| t.unread_mentions() == 1)
+        });
+
+        cx.update_window(handle, |_, window, cx| {
+            window.dispatch_action(Box::new(ShowThreads), cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find("thread-root").is_some()
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.click("thread-root", cx);
+        })
+        .unwrap();
+
+        // The thread opens beside the list and is marked read.
+        wait_until(cx, |_| {
+            server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "PUT" && r.path().contains("/threads/root/read/"))
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, cx| {
+            assert!(w.showing_threads);
+            let (thread, _) = w.thread.as_ref().expect("a thread is open");
+            assert_eq!(thread.read(cx).kind().root(), Some(&PostId::from("root")));
+        });
+        session.read_with(cx, |s, _| {
+            assert_eq!(s.open_thread(), Some(&PostId::from("root")))
+        });
+        threads.read_with(cx, |t, _| {
+            assert_eq!((t.unread_threads(), t.unread_mentions()), (0, 0));
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let row = window.find("thread-root").bounds();
+            let thread = window.find("close-thread").bounds();
+            assert!(thread.left() > row.right(), "{row:?} {thread:?}");
+        })
+        .unwrap();
+
+        // A channel takes the pane's place; the thread belongs to it, so it stays.
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_channel(&"town".into(), window, cx));
+        })
+        .unwrap();
+        workspace.read_with(cx, |w, _| {
+            assert!(!w.showing_threads);
+            assert!(w.thread.is_some());
+        });
     }
 }

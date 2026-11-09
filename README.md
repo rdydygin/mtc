@@ -70,6 +70,8 @@ On Linux and Windows, use Ctrl where the table says ⌘, Alt for ⌥, and Shift 
 | Shortcut | Action |
 | --- | --- |
 | ⌘K / ⌘T | Jump to a channel, person, or app command |
+| ⌘F | Search the conversation's messages |
+| ⌘⇧T | Threads you follow |
 | ⌥↑ / ⌥↓ | Previous / next channel |
 | ⌥⇧↑ / ⌥⇧↓ | Previous / next unread channel |
 | Enter / ⇧Enter | Send / new line |
@@ -83,17 +85,39 @@ On Linux and Windows, use Ctrl where the table says ⌘, Alt for ⌥, and Shift 
 | ⌘, | Settings: appearance, text size, updates, version |
 
 Attach files with the paperclip, by dropping them on a conversation, or by pasting an
-image; they upload right away and send with the message. Click an attachment to download
-it to Downloads and open it.
+image; they upload right away and send with the message. Click a picture to see it large
+in mtc: ← and → step through the message's other pictures, Esc closes it, and Download
+saves it to Downloads and shows it there. Click any other attachment to download it to
+Downloads and open it.
+
+Search a conversation's messages with ⌘F. Results appear beside the conversation as you
+type, newest first, with the matching words marked; ↑ and ↓ move through them and Enter
+opens one. A message scrolls into view in the conversation and is marked for a moment
+(older messages load as needed); a reply opens in its thread, with a button back to the
+results. Mattermost's search syntax works, such as `"exact phrase"`, `from:username`,
+and `-word`. The last word you type also matches longer words that start with it.
 
 Right-click a message to reply, react, copy, edit, or delete it. Click a message to open
 its replies in a thread panel beside the channel (collapsed reply threads); the reply
 count sits at the end of the message's reactions line. Click someone's name or avatar to
 see their profile and start a direct message.
 
+**Threads**, at the top of the sidebar (⌘⇧T), lists the threads you follow (ones you
+started, replied to, or were mentioned in) across the team's channels and your direct
+messages, newest reply first, like Mattermost's own Threads view. Unread threads carry a
+dot and mentions a count, which the sidebar entry adds up. **All** and **Unread** switch
+between every thread and the ones with replies you haven't read. Pick one and it opens beside
+the list, marked read; in a narrow window it takes the list's place until you close it.
+Right-click a thread to open it in its channel, mark it read, or unfollow it. Reading a
+thread anywhere, including beside its channel or on another device, clears it here too.
+
 Star a conversation from the star in its header, by right-clicking it in the sidebar, or
 with "Add to favorites" in ⌘K. Favorites sit in their own section at the top of the
 sidebar and sync with your other Mattermost apps.
+
+Leave a channel by right-clicking it in the sidebar, or with "Leave channel" in ⌘K.
+mtc asks first, because it has no way to find and rejoin channels. Town Square and
+direct messages can't be left.
 
 The server's custom emoji show up inline in messages, in reactions, and in custom statuses,
 next to the standard ones. The emoji on screen are looked up by name as they appear, so
@@ -108,7 +132,8 @@ crates/
 ├── session/      The signed-in state as GPUI entities. No rendering.
 │   ├── Session     teams, channels, read state, event routing, sending
 │   ├── Directory   users and presence, batched lookups
-│   └── Timeline    ordered posts of one channel or thread
+│   ├── Timeline    ordered posts of one channel or thread
+│   └── FollowedThreads  the Threads pane's lists and unread totals
 └── app/          The window: sign-in, sidebar, timelines, composer, ⌘K
 ```
 
@@ -182,7 +207,7 @@ notifications) is itself registered as the `Core` extension.
   `%APPDATA%\mtc` on Windows). On macOS and Linux the file is owner-only; on Windows
   it relies on your profile folder's permissions. Moving it to the system keychain is a
   natural next step.
-- Not implemented yet: message search, @mention autocomplete, multiple
+- Not implemented yet: search across all channels, @mention autocomplete, multiple
   servers.
 
 ## Development

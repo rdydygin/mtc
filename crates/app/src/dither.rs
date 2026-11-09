@@ -23,11 +23,18 @@ struct Ripple {
     born: Instant,
 }
 
+/// What an idle pane invites the user to pick.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hint {
+    Conversation,
+    Thread,
+}
+
 pub struct DitherView {
     started: Instant,
     ripples: [Option<Ripple>; 8],
     next: usize,
-    conversation_hint: bool,
+    hint: Option<Hint>,
 }
 
 impl DitherView {
@@ -36,12 +43,18 @@ impl DitherView {
             started: Instant::now(),
             ripples: [None; 8],
             next: 0,
-            conversation_hint: false,
+            hint: None,
         }
     }
 
     pub fn conversation_hint(mut self) -> Self {
-        self.conversation_hint = true;
+        self.hint = Some(Hint::Conversation);
+        self
+    }
+
+    /// Beside the Threads list, before a thread is open.
+    pub fn thread_hint(mut self) -> Self {
+        self.hint = Some(Hint::Thread);
         self
     }
 }
@@ -175,7 +188,7 @@ impl Render for DitherView {
                 )
                 .size_full(),
             )
-            .when(self.conversation_hint, |this| {
+            .when_some(self.hint, |this, hint| {
                 this.child(
                     div()
                         .absolute()
@@ -190,30 +203,48 @@ impl Render for DitherView {
                                 .p_6()
                                 .rounded(cx.theme().radius_lg)
                                 .bg(background.opacity(0.94))
-                                .child(div().text_sm().font_medium().child("Select a conversation"))
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child("Pick a channel, or")
-                                        .child(
-                                            Button::new("idle-jump")
-                                                .ghost()
-                                                .label(format!(
-                                                    "Jump to…  {}",
-                                                    crate::actions::shortcut_label(
-                                                        crate::actions::QUICK_SWITCH_KEY
-                                                    )
-                                                ))
-                                                .on_click(|_, window, cx| {
-                                                    window.dispatch_action(
-                                                        Box::new(crate::actions::QuickSwitch),
-                                                        cx,
-                                                    )
-                                                }),
-                                        ),
-                                ),
+                                .when(hint == Hint::Thread, |this| {
+                                    this.child(
+                                        div().text_sm().font_medium().child("Select a thread"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child("Open one from the list to read and reply."),
+                                    )
+                                })
+                                .when(hint == Hint::Conversation, |this| {
+                                    this.child(
+                                        div()
+                                            .text_sm()
+                                            .font_medium()
+                                            .child("Select a conversation"),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child("Pick a channel, or")
+                                            .child(
+                                                Button::new("idle-jump")
+                                                    .ghost()
+                                                    .label(format!(
+                                                        "Jump to…  {}",
+                                                        crate::actions::shortcut_label(
+                                                            crate::actions::QUICK_SWITCH_KEY
+                                                        )
+                                                    ))
+                                                    .on_click(|_, window, cx| {
+                                                        window.dispatch_action(
+                                                            Box::new(crate::actions::QuickSwitch),
+                                                            cx,
+                                                        )
+                                                    }),
+                                            ),
+                                    )
+                                }),
                         ),
                 )
             })

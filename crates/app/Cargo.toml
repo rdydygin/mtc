@@ -35,3 +35,4 @@ windows-registry = "0.6"
 
 [dev-dependencies]
 gpui-kit = { workspace = true, default-features = true, features = ["test-support"] }
+mattermost = { workspace = true, features = ["test-support"] }

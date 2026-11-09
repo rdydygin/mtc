@@ -18,9 +18,15 @@ actions!(
         Quit,
         /// Jump to any channel or person by name.
         QuickSwitch,
+        /// Search the messages of the open conversation.
+        SearchConversation,
+        /// Show the threads you follow.
+        ShowThreads,
         CloseConversation,
         /// Add the open conversation to favorites, or remove it.
         ToggleFavorite,
+        /// Leave the open channel, after asking.
+        LeaveChannel,
         NextChannel,
         PreviousChannel,
         NextUnreadChannel,
@@ -87,6 +93,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(primary!("q"), Quit, None),
         KeyBinding::new(QUICK_SWITCH_KEY, QuickSwitch, None),
         KeyBinding::new(primary!("t"), QuickSwitch, None),
+        KeyBinding::new(primary!("f"), SearchConversation, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new(primary!("shift-t"), ShowThreads, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("alt-down", NextChannel, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("alt-up", PreviousChannel, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("alt-shift-down", NextUnreadChannel, Some(WORKSPACE_CONTEXT)),
@@ -109,6 +117,7 @@ pub fn init(cx: &mut App) {
             PreviousUnreadChannel,
             Some("Workspace > Input"),
         ),
+        KeyBinding::new(primary!("f"), SearchConversation, Some("Workspace > Input")),
         KeyBinding::new(primary!("w"), CloseConversation, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new(primary!("l"), FocusComposer, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new(ZOOM_IN_KEY, ZoomIn, None),
@@ -165,6 +174,8 @@ pub fn set_menus(cx: &mut App) {
         ]),
         Menu::new("Go").items([
             MenuItem::action("Jump To…", QuickSwitch),
+            MenuItem::action("Search Messages…", SearchConversation),
+            MenuItem::action("Threads", ShowThreads),
             MenuItem::action("Close Conversation", CloseConversation),
             MenuItem::separator(),
             MenuItem::action("Next Channel", NextChannel),

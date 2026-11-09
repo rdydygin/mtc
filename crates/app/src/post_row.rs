@@ -29,7 +29,7 @@ use gpui_kit::{
     Anchor, AnyElement, App, ClickEvent, ElementId, Entity, FocusHandle, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, RenderOnce, SharedString,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img,
-    prelude::FluentBuilder as _, px,
+    prelude::FluentBuilder as _, px, relative,
 };
 use mattermost::{Client, FileInfo, Status, User, UserId};
 use session::{CustomEmojis, Delivery, Entry};
@@ -81,6 +81,7 @@ pub struct PostRow {
     continuation: bool,
     day_label: Option<SharedString>,
     unread_divider: bool,
+    highlighted: bool,
     rich_text: Option<Entity<TextViewState>>,
     thread_entry: bool,
     client: Option<Client>,
@@ -99,6 +100,7 @@ impl PostRow {
             continuation: false,
             day_label: None,
             unread_divider: false,
+            highlighted: false,
             rich_text: None,
             thread_entry: false,
             client: None,
@@ -134,6 +136,12 @@ impl PostRow {
     /// Draw the "New" divider above the post.
     pub fn unread_divider(mut self, unread: bool) -> Self {
         self.unread_divider = unread;
+        self
+    }
+
+    /// Mark the post the user just jumped to, such as a search result.
+    pub fn highlighted(mut self, highlighted: bool) -> Self {
+        self.highlighted = highlighted;
         self
     }
 
@@ -774,17 +782,23 @@ impl RenderOnce for PostRow {
             if let Some(url) = self.avatar_url.clone() {
                 avatar = avatar.src(url.to_string());
             }
+            // Dropped to the name's cap height, so the avatar spans from the
+            // name to the first line's baseline rather than riding above both.
             div()
                 .w_9()
                 .flex_none()
+                .mt_1()
                 .child(self.author_trigger("author-avatar", avatar.into_any_element(), true))
                 .into_any_element()
         };
 
         let header = (!self.continuation).then(|| {
+            // Centered, not baseline-aligned: GPUI reports no text baselines
+            // to layout, so baseline alignment falls back to each box's bottom
+            // and the name, time and reply count all sit at different heights.
             h_flex()
                 .gap_2()
-                .items_baseline()
+                .items_center()
                 .child(
                     self.author_trigger(
                         "author-name",
@@ -862,11 +876,17 @@ impl RenderOnce for PostRow {
             .items_start()
             .gap_3()
             .px_4()
-            .when(self.continuation, |this| this.py_0p5())
-            .when(!self.continuation, |this| this.pt_3().pb_1())
+            // Every group starts below a divider, which spaces it from the
+            // previous one, so rows of both kinds pad alike.
+            .py_0p5()
             .hover(|style| style.bg(theme.accent.opacity(0.5)))
             // Mark the post the focused actions trigger acts on.
             .when(actions_revealed, |this| this.bg(theme.accent.opacity(0.5)))
+            // Emphasis, like the "New messages" divider: `primary` is the
+            // theme's emphasis role.
+            .when(self.highlighted, |this| {
+                this.bg(theme.primary.opacity(0.12))
+            })
             // Clicking anywhere else on a post opens its thread. Selecting
             // text and pressing the row's own controls do not.
             .when(self.thread_entry && sent && !is_system, |this| {
@@ -944,29 +964,26 @@ impl RenderOnce for PostRow {
         // A new author's group starts below a faint rule, unless a day or
         // unread divider already marks the break.
         let group_rule = !self.continuation && self.day_label.is_none() && !self.unread_divider;
+        // A labeled divider's label box already pads the line, so it gets
+        // no margin of its own. With the label's line height cut to its font
+        // size, its text keeps about the rule's gap to the posts around it.
+        let labeled_divider =
+            |separator: Separator| div().px_4().child(separator.line_height(relative(1.)));
         v_flex()
             .w_full()
             .when(group_rule, |this| {
-                this.child(div().mx_4().mt_1().h_px().bg(theme.border.opacity(0.7)))
+                this.child(div().mx_4().my_1().h_px().bg(theme.border.opacity(0.7)))
             })
             .when_some(self.day_label, |this, label| {
-                this.child(
-                    div()
-                        .px_4()
-                        .pt_3()
-                        .pb_1()
-                        .child(Separator::horizontal().label(label)),
-                )
+                this.child(labeled_divider(Separator::horizontal().label(label)))
             })
             .when(self.unread_divider, |this| {
-                this.child(
-                    div().px_4().py_1().child(
-                        Separator::horizontal()
-                            .label("New messages")
-                            // Emphasis, not an error: `primary` is the theme's emphasis role.
-                            .color(theme.primary),
-                    ),
-                )
+                this.child(labeled_divider(
+                    Separator::horizontal()
+                        .label("New messages")
+                        // Emphasis, not an error: `primary` is the theme's emphasis role.
+                        .color(theme.primary),
+                ))
             })
             .child(row)
     }

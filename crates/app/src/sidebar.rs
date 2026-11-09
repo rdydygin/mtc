@@ -1,11 +1,11 @@
-//! Channel navigation: team switcher, favorites, channels, direct messages,
-//! and the signed-in account.
+//! Channel navigation: team switcher, the Threads pane, favorites, channels,
+//! direct messages, and the signed-in account.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, Selectable as _, Sizable as _, StyledExt as _,
+    ActiveTheme as _, Icon, Selectable as _, Sizable as _, StyledExt as _, WindowExt as _,
     avatar::Avatar,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonVariant, ButtonVariants as _},
     h_flex,
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     popover::Popover,
@@ -36,6 +36,7 @@ const DIRECT_MESSAGE_LIMIT: usize = 20;
 
 pub enum SidebarEvent {
     OpenChannel(ChannelId),
+    OpenThreads,
 }
 
 /// The channels in sidebar order, as three sections. A favorite appears
@@ -93,6 +94,8 @@ pub fn sections(session: &Session, cx: &App) -> ChannelSections {
 
 pub struct SidebarView {
     session: Entity<Session>,
+    /// The Threads pane is shown, rather than a channel.
+    threads_selected: bool,
     favorites_collapsed: bool,
     channels_collapsed: bool,
     direct_collapsed: bool,
@@ -105,17 +108,27 @@ impl EventEmitter<SidebarEvent> for SidebarView {}
 impl SidebarView {
     pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
         let directory = session.read(cx).directory().clone();
+        let threads = session.read(cx).threads().clone();
         let subscriptions = vec![
             cx.observe(&session, |_, _, cx| cx.notify()),
             cx.observe(&directory, |_, _, cx| cx.notify()),
+            cx.observe(&threads, |_, _, cx| cx.notify()),
         ];
         Self {
             session,
+            threads_selected: false,
             favorites_collapsed: false,
             channels_collapsed: false,
             direct_collapsed: false,
             account_open: false,
             _subscriptions: subscriptions,
+        }
+    }
+
+    pub fn set_threads_selected(&mut self, selected: bool, cx: &mut Context<Self>) {
+        if self.threads_selected != selected {
+            self.threads_selected = selected;
+            cx.notify();
         }
     }
 
@@ -265,18 +278,110 @@ impl SidebarView {
                 .context_menu({
                     let session = self.session.clone();
                     move |menu, _, cx| {
-                        let favorite = session.read(cx).is_favorite(&channel);
+                        let session_ref = session.read(cx);
+                        let favorite = session_ref.is_favorite(&channel);
+                        let can_leave = session_ref
+                            .channel(&channel)
+                            .is_some_and(ChannelEntry::can_leave);
                         let session = session.clone();
                         let channel = channel.clone();
+                        let leave = (session.clone(), channel.clone());
                         menu.item(PopupMenuItem::new(favorite_label(favorite)).on_click(
                             move |_, _, cx| {
                                 session.update(cx, |s, cx| s.set_favorite(&channel, !favorite, cx));
                             },
                         ))
+                        .when(can_leave, move |menu| {
+                            let (session, channel) = leave;
+                            menu.separator()
+                                .item(PopupMenuItem::new("Leave channel").on_click(
+                                    move |_, window, cx| {
+                                        confirm_leave(&session, &channel, window, cx)
+                                    },
+                                ))
+                        })
                     }
                 })
                 .into_any_element(),
         )
+    }
+
+    /// The Threads pane's entry, above the conversations, in the shape of a
+    /// channel row.
+    fn threads_item(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let threads = self.session.read(cx).threads().read(cx);
+        let (unread, mentions) = (threads.unread_threads() > 0, threads.unread_mentions());
+        let active = self.threads_selected;
+        let theme = cx.theme();
+        Button::new("threads")
+            .ghost()
+            .w_full()
+            .h_9()
+            .px_2()
+            .selected(active)
+            .accessibility_label(match (mentions, unread) {
+                (0, false) => "Threads".to_string(),
+                (0, true) => "Threads, unread".to_string(),
+                (1, _) => "Threads, 1 mention".to_string(),
+                (mentions, _) => format!("Threads, {mentions} mentions"),
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size_6()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(theme.radius)
+                            .bg(if active {
+                                theme.primary.opacity(0.12)
+                            } else {
+                                theme.muted
+                            })
+                            .child(Icon::new(IconName::MessagesSquare).small().text_color(
+                                if active {
+                                    theme.primary
+                                } else {
+                                    theme.muted_foreground
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(if active || unread {
+                                theme.foreground
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .when(unread, |this| this.font_semibold())
+                            .child("Threads"),
+                    )
+                    .child(
+                        div()
+                            .w_6()
+                            .flex_none()
+                            .text_right()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(if mentions > 0 {
+                                mentions.min(99).to_string()
+                            } else if unread {
+                                "•".into()
+                            } else {
+                                String::new()
+                            }),
+                    ),
+            )
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenThreads)))
     }
 
     /// The heading of a collapsible section of the conversation list.
@@ -810,7 +915,6 @@ impl Render for SidebarView {
             .iter()
             .filter_map(|id| self.channel_item(id, cx))
             .collect();
-        let has_favorites = !favorites.is_empty();
         // Until the channel list arrives, each section shows rows in the
         // shape of the conversations about to fill it.
         let loading = !self.session.read(cx).is_loaded();
@@ -840,6 +944,7 @@ impl Render for SidebarView {
                             .overflow_y_scroll()
                             .px_2()
                             .gap_0p5()
+                            .child(self.threads_item(cx))
                             .when(!favorites.is_empty(), |this| {
                                 this.child(
                                     Self::section_header(
@@ -849,6 +954,7 @@ impl Render for SidebarView {
                                         self.favorites_collapsed,
                                         cx,
                                     )
+                                    .mt_4()
                                     .on_click(cx.listener(
                                         |this, _, _, cx| {
                                             this.favorites_collapsed = !this.favorites_collapsed;
@@ -866,7 +972,7 @@ impl Render for SidebarView {
                                     self.channels_collapsed,
                                     cx,
                                 )
-                                .when(has_favorites, |this| this.mt_4())
+                                .mt_4()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.channels_collapsed = !this.channels_collapsed;
@@ -914,4 +1020,40 @@ pub fn favorite_label(favorite: bool) -> &'static str {
     } else {
         "Add to favorites"
     }
+}
+
+/// Ask before leaving `channel`, then leave it. mtc can't browse for
+/// channels to join, so coming back takes another app or an invitation.
+pub fn confirm_leave(
+    session: &Entity<Session>,
+    channel: &ChannelId,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let session_ref = session.read(cx);
+    let Some(entry) = session_ref.channel(channel).filter(|e| e.can_leave()) else {
+        return;
+    };
+    let title = format!("Leave {}?", session_ref.channel_label(entry, cx));
+    let description = if entry.kind() == ChannelType::Private {
+        "It’s private, so someone in it will have to add you back."
+    } else {
+        "It’s public, so you can join it again later."
+    };
+    let session = session.clone();
+    let channel = channel.clone();
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let session = session.clone();
+        let channel = channel.clone();
+        alert
+            .title(title.clone())
+            .description(description)
+            .confirm()
+            .ok_text("Leave")
+            .ok_variant(ButtonVariant::Danger)
+            .on_ok(move |_, _, cx| {
+                session.update(cx, |s, cx| s.leave_channel(&channel, cx));
+                true
+            })
+    });
 }
