@@ -5,7 +5,7 @@
 //! trips later.
 //!
 //! Kept in the platform cache directory, readable only by the user, and
-//! deleted on sign-out. Reads and writes block, so callers run them off the
+//! deleted when the session ends, by sign-out or by the server. Reads and writes block, so callers run them off the
 //! UI thread; [`remember_users`] and [`remember_emoji`] do that themselves.
 
 use std::{
@@ -91,9 +91,9 @@ pub fn prune_images() {
     }
 }
 
-/// Forget everything saved, as on sign-out. Writes begun before this call
-/// are dropped, even ones that finish after it; the files are deleted in
-/// the background.
+/// Forget everything saved, as when a session ends. Writes begun before
+/// this call are dropped, even ones that finish after it; the files are
+/// deleted in the background.
 pub fn clear(cx: &App) {
     next_generation();
     cx.background_spawn(async {

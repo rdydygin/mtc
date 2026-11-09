@@ -3,8 +3,9 @@
 
 use gpui_kit::component::{ActiveTheme as _, TitleBar, v_flex};
 use gpui_kit::{
-    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _,
+    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div,
+    prelude::FluentBuilder as _,
 };
 use mattermost::{ApiError, Client, TeamId, User};
 
@@ -96,7 +97,7 @@ impl AppRoot {
                 Err(err) => {
                     let message = if err.downcast_ref::<ApiError>() == Some(&ApiError::Unauthorized)
                     {
-                        persist::update(|state| state.session = None);
+                        end_session(cx);
                         "Your session has expired. Sign in again.".to_string()
                     } else {
                         format!("{err:#}")
@@ -161,7 +162,7 @@ impl AppRoot {
             window,
             |this, _, event, window, cx| match event {
                 WorkspaceEvent::SignedOut => {
-                    persist::update(|state| state.session = None);
+                    end_session(cx);
                     this.show_login(
                         Some("Your session has expired. Sign in again.".into()),
                         window,
@@ -187,12 +188,18 @@ impl AppRoot {
             let _ = client.logout().await;
         })
         .detach();
-        persist::update(|state| state.session = None);
-        // The account's pictures, attachment previews, and contacts
-        // shouldn't outlast it on this computer.
-        cache::clear(cx);
+        end_session(cx);
         self.show_login(None, window, cx);
     }
+}
+
+/// Forget the saved session and what was cached for it, whether the user
+/// signed out or the server ended the session. The account's pictures,
+/// attachment previews, and contacts shouldn't outlast it on this
+/// computer, nor greet whoever signs in next.
+fn end_session(cx: &App) {
+    persist::update(|state| state.session = None);
+    cache::clear(cx);
 }
 
 impl Render for AppRoot {
