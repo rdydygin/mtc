@@ -179,6 +179,13 @@ impl TimelineView {
     }
 
     fn continue_reveal(&mut self, cx: &mut Context<Self>) {
+        // A channel no longer on screen gives up, rather than load on and
+        // then open the post's thread beside another conversation.
+        if self.kind.root().is_none()
+            && self.session.read(cx).active_channel() != Some(self.kind.channel())
+        {
+            self.revealing = None;
+        }
         let Some(reveal) = self.revealing.as_mut() else {
             return;
         };
@@ -1060,6 +1067,10 @@ mod tests {
         let mut me = User::default();
         me.id = "me".into();
         let session = cx.new(|cx| Session::new(client, me, Some(TeamId::from("team")), cx));
+        // Shown, as the workspace does.
+        session.update(cx, |s, cx| {
+            s.open_channel(&"town".into(), cx);
+        });
         let view = cx.update(|cx| {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -1145,5 +1156,20 @@ mod tests {
             assert!(v.revealing.is_none());
             assert_eq!(v.flashed, None);
         });
+    }
+
+    #[gpui_kit::test]
+    fn a_reveal_stops_when_another_conversation_opens(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (view, threads) = open_channel(&server, cx);
+        let session = view.read_with(cx, |v, _| v.session.clone());
+        view.update(cx, |v, cx| v.reveal("gone".into(), 0, cx));
+        // Another channel opens while the older page is on its way.
+        session.update(cx, |s, cx| {
+            s.open_channel(&"other".into(), cx);
+        });
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.revealing.is_none()));
+        assert!(threads.borrow().is_empty());
+        assert_eq!(older_pages(&server), 1);
     }
 }

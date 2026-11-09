@@ -87,8 +87,10 @@ impl SearchView {
             cx.subscribe_in(&input, window, |this, _, event, _, cx| match event {
                 InputEvent::Change => this.search(Some(DEBOUNCE), cx),
                 InputEvent::PressEnter { .. } => match this.selected {
-                    Some(ix) => this.open(ix, cx),
-                    None => this.search(None, cx),
+                    // A choice among results for other words searches the
+                    // words typed now.
+                    Some(ix) if this.answers_input(cx) => this.open(ix, cx),
+                    _ => this.search(None, cx),
                 },
                 _ => {}
             }),
@@ -116,6 +118,11 @@ impl SearchView {
     /// The conversation searched.
     pub fn channel(&self) -> &ChannelId {
         &self.channel
+    }
+
+    /// Whether the results answer what's typed now.
+    fn answers_input(&self, cx: &App) -> bool {
+        self.input.read(cx).value().trim() == self.query
     }
 
     /// Put the cursor in the search field with its text selected, so typing
@@ -719,6 +726,21 @@ mod tests {
         (window, view)
     }
 
+    /// The posts `view` asks to open, as it asks.
+    fn opened(view: &Entity<SearchView>, cx: &mut TestAppContext) -> Rc<RefCell<Vec<String>>> {
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let sink = opened.clone();
+        cx.update(|cx| {
+            cx.subscribe(view, move |_, event: &SearchEvent, _| {
+                if let SearchEvent::Open(post) = event {
+                    sink.borrow_mut().push(post.id.to_string());
+                }
+            })
+            .detach()
+        });
+        opened
+    }
+
     /// Run GPUI's work and let real network I/O happen until `done`.
     fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -737,16 +759,7 @@ mod tests {
     fn typing_searches_and_the_keyboard_opens_a_result(cx: &mut TestAppContext) {
         let server = SlowServer::start(Network::new(Duration::ZERO), route);
         let (window, view) = open_search(&server, cx);
-        let opened = Rc::new(RefCell::new(Vec::new()));
-        let sink = opened.clone();
-        cx.update(|cx| {
-            cx.subscribe(&view, move |_, event: &SearchEvent, _| {
-                if let SearchEvent::Open(post) = event {
-                    sink.borrow_mut().push(post.id.to_string());
-                }
-            })
-            .detach()
-        });
+        let opened = opened(&view, cx);
         let searches = |server: &SlowServer| {
             server
                 .requests()
@@ -795,6 +808,24 @@ mod tests {
         // Down stops at the last result, and Enter opens the chosen one.
         assert_eq!(*opened.borrow(), ["old"]);
         assert_eq!(searches(&server), 1);
+    }
+
+    #[gpui_kit::test]
+    fn enter_searches_new_words_rather_than_opening_the_old_choice(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (window, view) = open_search(&server, cx);
+        let opened = opened(&view, cx);
+        cx.update_window(window, |_, window, cx| window.input("hello", cx))
+            .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 2));
+        cx.update_window(window, |_, window, cx| {
+            window.press("down", cx);
+            window.input("!", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.query == "hello!"));
+        assert!(opened.borrow().is_empty());
     }
 
     #[gpui_kit::test]
