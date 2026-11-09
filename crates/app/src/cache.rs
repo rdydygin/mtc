@@ -28,7 +28,9 @@ use serde::de::DeserializeOwned;
 use session::{Directory, EmojiStore};
 use sha2::{Digest as _, Sha256};
 
-/// The most image data kept; the least recently used goes first.
+/// The most image data kept; the least recently used goes first. Checked
+/// on every save, so a channel full of large attachments can't fill the
+/// disk during a long session.
 const IMAGE_LIMIT: u64 = 256 * 1024 * 1024;
 /// How long the people and emoji wait after a change before they are
 /// saved, so the burst of lookups at startup costs one write.
@@ -47,6 +49,10 @@ static DELETIONS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 /// renamed to `ended-…` beside it until it is deleted.
 const CURRENT: &str = "current";
 const ENDED: &str = "ended-";
+
+/// About how much image data is saved: measured when pruning, counted up
+/// by each save in between.
+static IMAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// The current sign-in, for [`save_image`].
 pub fn generation() -> u64 {
@@ -75,31 +81,59 @@ fn key(text: &str) -> String {
         .collect()
 }
 
-fn image_path(url: &str) -> Option<PathBuf> {
-    Some(dir()?.join("images").join(key(url)))
+fn images() -> Option<PathBuf> {
+    Some(dir()?.join("images"))
 }
 
 /// The image saved for `url`, if any.
 pub fn image(url: &str) -> Option<Vec<u8>> {
-    read_marking_used(&image_path(url)?)
+    read_marking_used(&images()?.join(key(url)))
 }
 
 /// Save `bytes` as the image for `url`, unless the cache was cleared
 /// since `generation`.
 pub fn save_image(generation: u64, url: &str, bytes: &[u8]) {
-    if let Some(path) = image_path(url)
-        && let Err(err) = write_for(generation, &path, bytes)
-    {
-        log::warn!("caching an image: {err}");
+    if let Some(images) = images() {
+        save_image_in(&images, IMAGE_LIMIT, generation, url, bytes);
     }
 }
 
-/// Keep the saved images within [`IMAGE_LIMIT`], and finish deleting
-/// caches of sessions that ended in an earlier run.
+/// [`save_image`] into `images`, keeping them within `limit` bytes.
+fn save_image_in(images: &Path, limit: u64, generation: u64, url: &str, bytes: &[u8]) {
+    let len = bytes.len() as u64;
+    // A few huge images would push out everything else.
+    if len > limit / 32 {
+        return;
+    }
+    match write_for(generation, &images.join(key(url)), bytes) {
+        Ok(true) => {
+            if IMAGE_BYTES.fetch_add(len, Ordering::Relaxed) + len > limit {
+                prune_images(images, limit);
+            }
+        }
+        Ok(false) => {}
+        Err(err) => log::warn!("caching an image: {err}"),
+    }
+}
+
+/// Bring `images` within `limit`, well within, so the next prune is many
+/// saves away.
+fn prune_images(images: &Path, limit: u64) {
+    static PRUNING: Mutex<()> = Mutex::new(());
+    // Another thread is already at it.
+    let Ok(_pruning) = PRUNING.try_lock() else {
+        return;
+    };
+    let left = prune(images, limit, limit / 4 * 3);
+    IMAGE_BYTES.store(left, Ordering::Relaxed);
+}
+
+/// Measure the saved images and keep them within [`IMAGE_LIMIT`], and
+/// finish deleting caches of sessions that ended in an earlier run.
 pub fn tidy() {
     if let Some(root) = root() {
         sweep_ended(&root, &format!("{ENDED}{}-", std::process::id()));
-        prune(&root.join(CURRENT).join("images"), IMAGE_LIMIT);
+        prune_images(&root.join(CURRENT).join("images"), IMAGE_LIMIT);
     }
 }
 
@@ -306,13 +340,14 @@ fn read_marking_used(path: &Path) -> Option<Vec<u8>> {
     (!bytes.is_empty()).then_some(bytes)
 }
 
-/// [`write`], unless the cache was cleared since `generation`.
-fn write_for(generation: u64, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// [`write`], unless the cache was cleared since `generation`. Returns
+/// whether it wrote.
+fn write_for(generation: u64, path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
     let current = GENERATION.read().unwrap_or_else(|e| e.into_inner());
     if *current != generation {
-        return Ok(());
+        return Ok(false);
     }
-    write(path, bytes)
+    write(path, bytes).map(|()| true)
 }
 
 /// Write `path` whole or not at all, readable only by the user.
@@ -347,11 +382,11 @@ fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
-/// Delete the least recently used files in `dir` until the rest take at
-/// most `limit` bytes.
-fn prune(dir: &Path, limit: u64) {
+/// If the files in `dir` take more than `over` bytes, delete the least
+/// recently used until the rest take at most `to`. Returns the bytes left.
+fn prune(dir: &Path, over: u64, to: u64) -> u64 {
     let Ok(entries) = fs::read_dir(dir) else {
-        return;
+        return 0;
     };
     let mut files: Vec<(SystemTime, u64, PathBuf)> = entries
         .flatten()
@@ -361,15 +396,19 @@ fn prune(dir: &Path, limit: u64) {
         })
         .collect();
     let mut total: u64 = files.iter().map(|(_, len, _)| len).sum();
+    if total <= over {
+        return total;
+    }
     files.sort_by_key(|(modified, _, _)| *modified);
     for (_, len, path) in files {
-        if total <= limit {
+        if total <= to {
             break;
         }
         if fs::remove_file(&path).is_ok() {
             total -= len;
         }
     }
+    total
 }
 
 #[cfg(test)]
@@ -408,8 +447,8 @@ mod tests {
         let before = generation();
         clear();
 
-        write_for(before, &dir.join("old"), b"png").unwrap();
-        write_for(generation(), &dir.join("new"), b"png").unwrap();
+        assert!(!write_for(before, &dir.join("old"), b"png").unwrap());
+        assert!(write_for(generation(), &dir.join("new"), b"png").unwrap());
 
         assert!(!dir.join("old").exists());
         assert!(dir.join("new").exists());
@@ -449,13 +488,38 @@ mod tests {
         // Reading "old" makes it the most recently used.
         read_marking_used(&dir.join("old")).unwrap();
 
-        prune(&dir, 20);
+        assert_eq!(prune(&dir, 25, 20), 20);
 
         assert!(dir.join("old").exists());
         assert!(!dir.join("used").exists());
         assert!(dir.join("new").exists());
-        prune(&dir, 20);
-        assert!(dir.join("new").exists(), "within the limit, nothing goes");
+        assert_eq!(prune(&dir, 25, 10), 20, "within the limit, nothing goes");
+        assert!(dir.join("new").exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saved_images_stay_within_the_limit() {
+        let images = scratch("limit");
+        // Another test's clear may drop a save before the folder exists.
+        fs::create_dir_all(&images).unwrap();
+        let limit = 32 * 100;
+        let size = |dir: &Path| -> u64 {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().metadata().unwrap().len())
+                .sum()
+        };
+        for n in 0..200 {
+            let url = format!("https://chat.example.com/api/v4/files/f{n}");
+            save_image_in(&images, limit, generation(), &url, &[0; 100]);
+            assert!(size(&images) <= limit, "after {n} saves");
+        }
+        save_image_in(&images, limit, generation(), "https://x/huge", &[0; 101]);
+        assert!(
+            !images.join(key("https://x/huge")).exists(),
+            "too big to keep"
+        );
+        fs::remove_dir_all(images).unwrap();
     }
 }
