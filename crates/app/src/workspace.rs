@@ -28,6 +28,7 @@ use crate::{
         ShowSettings, ShowShortcuts, ShowThreads, ToggleFavorite, WORKSPACE_CONTEXT, ZOOM_IN_KEY,
         ZOOM_OUT_KEY, shortcut_label,
     },
+    cache,
     dither::DitherView,
     extensions, persist,
     search::{SearchEvent, SearchView},
@@ -153,7 +154,19 @@ impl Workspace {
             });
         }
         let sidebar = cx.new(|cx| SidebarView::new(session.clone(), cx));
-        let subscriptions = vec![
+        let (directory, emoji, server) = {
+            let session = session.read(cx);
+            (
+                session.directory().clone(),
+                session.emoji_store().clone(),
+                session.client().server().to_string(),
+            )
+        };
+        let remembered = [
+            cache::remember_users(&directory, &server, cx),
+            cache::remember_emoji(&emoji, &server, cx),
+        ];
+        let mut subscriptions = vec![
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
                 SidebarEvent::OpenChannel(id) => this.open_channel(id, window, cx),
                 SidebarEvent::OpenThreads => this.show_threads(&ShowThreads, window, cx),
@@ -182,6 +195,7 @@ impl Workspace {
                 }
             }),
         ];
+        subscriptions.extend(remembered.into_iter().flatten());
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         Self {

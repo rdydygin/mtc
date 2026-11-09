@@ -7,6 +7,7 @@ mod actions;
 mod app_root;
 mod appearance;
 mod assets;
+mod cache;
 mod composer;
 #[cfg(not(target_os = "macos"))]
 mod deep_link;
@@ -77,9 +78,11 @@ fn main() {
         actions::init(cx);
         extensions::init(cx);
         sso::register_callback_schemes(cx);
-        // State is saved in the background; finish before the process ends.
+        // State is saved, and ended sessions' caches deleted, in the
+        // background; finish before the process ends.
         cx.on_app_quit(|_| {
             persist::flush();
+            cache::flush();
             async {}
         })
         .detach();

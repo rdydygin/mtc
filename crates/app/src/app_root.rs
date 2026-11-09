@@ -10,7 +10,7 @@ use mattermost::{ApiError, Client, TeamId, User};
 
 use crate::{
     actions::{ShowSettings, SignOut},
-    appearance,
+    appearance, cache,
     http::ServerHttpClient,
     login::{LoginEvent, LoginView},
     persist::{self, SavedSession},
@@ -96,7 +96,7 @@ impl AppRoot {
                 Err(err) => {
                     let message = if err.downcast_ref::<ApiError>() == Some(&ApiError::Unauthorized)
                     {
-                        persist::update(|state| state.session = None);
+                        end_session();
                         "Your session has expired. Sign in again.".to_string()
                     } else {
                         format!("{err:#}")
@@ -138,6 +138,7 @@ impl AppRoot {
     ) {
         // Lets avatars and thumbnails load through GPUI's image cache.
         cx.set_http_client(ServerHttpClient::new(client.clone()));
+        cx.background_spawn(async { cache::tidy() }).detach();
         let server = client.server().to_string();
         persist::update(|state| {
             let team_id = state
@@ -159,7 +160,7 @@ impl AppRoot {
             window,
             |this, _, event, window, cx| match event {
                 WorkspaceEvent::SignedOut => {
-                    persist::update(|state| state.session = None);
+                    end_session();
                     this.show_login(
                         Some("Your session has expired. Sign in again.".into()),
                         window,
@@ -185,9 +186,18 @@ impl AppRoot {
             let _ = client.logout().await;
         })
         .detach();
-        persist::update(|state| state.session = None);
+        end_session();
         self.show_login(None, window, cx);
     }
+}
+
+/// Forget the saved session and what was cached for it, whether the user
+/// signed out or the server ended the session. The account's pictures,
+/// attachment previews, and contacts shouldn't outlast it on this
+/// computer, nor greet whoever signs in next.
+fn end_session() {
+    persist::update(|state| state.session = None);
+    cache::clear();
 }
 
 impl Render for AppRoot {
