@@ -1,11 +1,14 @@
 name: Release
 
-# Publish a release in either of two ways:
-#   - Actions → Release → Run workflow: tags the chosen branch as v<version> (the
-#     workspace version in Cargo.toml) and publishes it.
-#   - Push a tag matching the workspace version: git tag v0.1.0 && git push origin v0.1.0
+# Every push to main publishes a release. The version is the next patch after
+# the newest v* tag, or the workspace version in Cargo.toml when that is higher,
+# so bump Cargo.toml to start a new minor or major series. Also:
+#   - Actions → Release → Run workflow: releases the chosen branch the same way.
+#   - Push a tag (git tag v0.3.0 && git push origin v0.3.0): releases that commit
+#     as that exact version.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -28,30 +31,71 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
-      # A cache saved by a run on a pushed tag is visible only to that tag, so
-      # nothing could restore it. Save from runs started on main; tag runs
-      # restore that.
+      # A cache saved by a run on a pushed tag or another branch is visible only
+      # to that ref, so nothing else could restore it. Save from runs on main.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Resolve release tag
+      - name: Pick the release version
         id: tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="mtc"))')
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            BASE=$(cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="mtc"))')
+            # The checkout is shallow and has no tags, so ask the remote.
+            VERSION=$(git ls-remote --tags --refs origin 'v*' | python3 -c '
+          import re, sys
+          def parse(v):
+              m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", v)
+              return tuple(map(int, m.groups())) if m else None
+          base = parse(sys.argv[1])
+          tags = [parse(line.strip().split("refs/tags/v", 1)[1]) for line in sys.stdin if "refs/tags/v" in line]
+          tags = [t for t in tags if t]
+          latest = max(tags, default=None)
+          major, minor, patch = base if latest is None or latest < base else (latest[0], latest[1], latest[2] + 1)
+          print(f"{major}.{minor}.{patch}")
+          ' "$BASE")
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::${VERSION} is not a release version (MAJOR.MINOR.PATCH)"
+            exit 1
+          fi
           TAG="v${VERSION}"
-          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" != "${TAG}" ]]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo version ${TAG}"
-            exit 1
-          fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::Release ${TAG} already exists. Bump version in Cargo.toml first."
+            echo "::error::Release ${TAG} already exists."
             exit 1
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # Stamp the version into this checkout only (nothing is committed), so the
+      # binary's CARGO_PKG_VERSION and the bundle's Info.plist carry it.
+      - name: Set the version
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          MEMBERS=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(" ".join(p["name"] for p in json.load(sys.stdin)["packages"]))')
+          python3 - $MEMBERS <<'PY'
+          import os, re, sys
+          version, members = os.environ["VERSION"], sys.argv[1:]
+          toml = open("Cargo.toml").read()
+          toml, n = re.subn(r'(\[workspace\.package\][^\[]*?\nversion = )"[^"]*"', rf'\1"{version}"', toml)
+          assert n == 1, "no version in [workspace.package]"
+          open("Cargo.toml", "w").write(toml)
+          lock = open("Cargo.lock").read()
+          for name in members:
+              lock, n = re.subn(rf'(\nname = "{re.escape(name)}"\nversion = )"[^"]*"', rf'\1"{version}"', lock)
+              assert n == 1, f"{name} not in Cargo.lock"
+          open("Cargo.lock", "w").write(lock)
+          PY
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+          git diff
 
       - name: Test
         run: cargo test --workspace --locked

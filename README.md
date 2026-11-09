@@ -195,11 +195,14 @@ MTC_SSO_SERVER=… MTC_SSO_CALLBACK='…/login/desktop?…' cargo test -p matter
 ```
 
 CI (`.github/workflows/ci.yml`) runs rustfmt, clippy with warnings denied, and the tests on
-every pull request and push to `main`. To publish a release, bump `version` in `Cargo.toml`,
-then either run the Release workflow from the Actions tab (it tags the branch as
-`v<version>`) or push a matching tag (`git tag v0.1.0 && git push origin v0.1.0`):
-`.github/workflows/release.yml` builds a universal (Apple Silicon and Intel) `mtc.app` with
-`script/bundle-macos --universal` and attaches it to a GitHub release.
+every pull request and push to `main`. Every push to `main` also publishes a release:
+`.github/workflows/release.yml` picks the next patch after the newest `v*` tag (or the
+`version` in `Cargo.toml`, when that is higher), stamps it into the build, builds a universal
+(Apple Silicon and Intel) `mtc.app` with `script/bundle-macos --universal`, and attaches it to
+a GitHub release tagged `v<version>`. Nothing is committed back, so to start a new minor or
+major series, bump `version` in `Cargo.toml`. Running the Release workflow from the Actions
+tab releases any branch the same way, and pushing a tag (`git tag v0.3.0 && git push origin
+v0.3.0`) releases that commit as exactly that version.
 
 The release also carries `latest.json`, the update feed: the version, the release page,
 and each download's URL and SHA-256. Installed copies read it from
