@@ -335,8 +335,13 @@ impl Render for SsoPanel {
                     h_flex()
                         .gap_2()
                         .justify_between()
+                        // Wrap the reason instead of pushing the button out
+                        // of the panel: a flex item won't shrink below its
+                        // text's width otherwise.
                         .child(
                             div()
+                                .flex_1()
+                                .min_w_0()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(format!(
@@ -345,6 +350,7 @@ impl Render for SsoPanel {
                         )
                         .child(
                             Button::new("retry-sso-lookup")
+                                .flex_shrink_0()
                                 .ghost()
                                 .small()
                                 .label("Try again")
@@ -414,5 +420,68 @@ pub fn register_callback_schemes(cx: &mut App) {
             }
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{
+        AppContext as _, Bounds, TestAppContext, WindowBounds, WindowOptions, point, px, size,
+    };
+
+    use super::*;
+
+    /// The panel in a column as narrow as the sign-in card's.
+    struct Narrow(Entity<SsoPanel>);
+
+    const WIDTH: f32 = 360.;
+
+    impl Render for Narrow {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            v_flex().w(px(WIDTH)).child(self.0.clone())
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_long_lookup_error_wraps_inside_the_panel(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let window = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: point(px(0.), px(0.)),
+                        size: size(px(1000.), px(400.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let panel = cx.new(|cx| {
+                        let mut panel = SsoPanel::new(window, cx);
+                        panel.lookup = Lookup::Failed(
+                            "Couldn’t reach the server. Check the address and your connection."
+                                .into(),
+                        );
+                        panel
+                    });
+                    cx.new(|_| Narrow(panel))
+                },
+            )
+            .unwrap()
+            .0
+        });
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let retry = window.find("retry-sso-lookup").bounds();
+            assert!(retry.size.width > px(0.));
+            assert!(
+                retry.right() <= px(WIDTH),
+                "Try again ends at {:?}, past the {WIDTH}px panel",
+                retry.right()
+            );
+        })
+        .unwrap();
     }
 }
