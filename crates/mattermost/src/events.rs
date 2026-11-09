@@ -17,7 +17,10 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _, ht
 
 use crate::{
     Client, runtime,
-    types::{ChannelId, Emoji, Post, PostId, Preference, Reaction, Status, TeamId, User, UserId},
+    types::{
+        ChannelId, Emoji, Millis, Post, PostId, Preference, Reaction, Status, TeamId, User, UserId,
+        UserThread,
+    },
 };
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -72,6 +75,30 @@ pub enum Event {
     /// The current user rearranged their sidebar categories, which include
     /// favorites. Newer web clients change favorites this way.
     SidebarCategoriesChanged,
+    /// A thread the user follows changed, usually with a new reply.
+    ThreadUpdated {
+        thread: UserThread,
+        /// Empty for threads in direct and group messages.
+        team_id: TeamId,
+    },
+    /// The user read followed threads, possibly on another device.
+    ThreadRead {
+        /// The thread read, or `None` when every thread in `channel_id`
+        /// was (or, with no channel either, every thread in `team_id`).
+        thread_id: Option<PostId>,
+        channel_id: Option<ChannelId>,
+        team_id: TeamId,
+        /// When the threads were read.
+        timestamp: Millis,
+        unread_replies: i64,
+        unread_mentions: i64,
+    },
+    /// The user started or stopped following a thread.
+    ThreadFollowChanged {
+        thread_id: PostId,
+        team_id: TeamId,
+        following: bool,
+    },
     /// Any other event, passed through unparsed so extensions can react to
     /// events this crate does not model.
     Other {
@@ -272,6 +299,30 @@ pub(crate) fn parse_event(text: &str) -> Option<Event> {
         "preference_changed" => Event::PreferencesChanged(vec![embedded(data, "preference")?]),
         "preferences_deleted" => Event::PreferencesDeleted(embedded(data, "preferences")?),
         "sidebar_category_updated" => Event::SidebarCategoriesChanged,
+        "thread_updated" => Event::ThreadUpdated {
+            thread: embedded(data, "thread")?,
+            team_id: str_field(broadcast, "team_id").into(),
+        },
+        "thread_read_changed" => {
+            let thread_id = str_field(data, "thread_id");
+            // Every thread in a channel is read at once when the channel is.
+            let channel_id = str_field(broadcast, "channel_id");
+            let number = |key: &str| data.get(key).and_then(Value::as_i64).unwrap_or_default();
+            Event::ThreadRead {
+                thread_id: (!thread_id.is_empty()).then(|| thread_id.into()),
+                channel_id: (thread_id.is_empty() && !channel_id.is_empty())
+                    .then(|| channel_id.into()),
+                team_id: str_field(broadcast, "team_id").into(),
+                timestamp: number("timestamp"),
+                unread_replies: number("unread_replies"),
+                unread_mentions: number("unread_mentions"),
+            }
+        }
+        "thread_follow_changed" => Event::ThreadFollowChanged {
+            thread_id: str_field(data, "thread_id").into(),
+            team_id: str_field(broadcast, "team_id").into(),
+            following: data.get("state").and_then(Value::as_bool).unwrap_or(false),
+        },
         name => Event::Other {
             name: name.to_string(),
             data: raw.data.clone(),
@@ -326,6 +377,50 @@ mod tests {
         assert!(
             matches!(parse_event(text), Some(Event::EmojiAdded(emoji)) if emoji.name == "parrot")
         );
+    }
+
+    #[test]
+    fn parses_thread_events() {
+        let text = r#"{"event":"thread_updated","data":{"thread":"{\"id\":\"root\",\"reply_count\":2,\"last_reply_at\":20,\"unread_replies\":1,\"unread_mentions\":0,\"participants\":[{\"id\":\"u1\"}],\"post\":{\"id\":\"root\",\"channel_id\":\"c1\"}}","previous_unread_replies":0},"broadcast":{"team_id":"t1","user_id":"me"}}"#;
+        match parse_event(text) {
+            Some(Event::ThreadUpdated { thread, team_id }) => {
+                assert_eq!(thread.id.as_str(), "root");
+                assert_eq!(thread.unread_replies, 1);
+                assert_eq!(thread.participants[0].id.as_str(), "u1");
+                assert_eq!(team_id.as_str(), "t1");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let one = r#"{"event":"thread_read_changed","data":{"thread_id":"root","timestamp":50,"unread_replies":0,"unread_mentions":0,"channel_id":"c1"},"broadcast":{"team_id":"t1"}}"#;
+        assert!(matches!(
+            parse_event(one),
+            Some(Event::ThreadRead { thread_id: Some(id), channel_id: None, timestamp: 50, .. })
+                if id.as_str() == "root"
+        ));
+        let channel = r#"{"event":"thread_read_changed","data":{"timestamp":60},"broadcast":{"channel_id":"c1","team_id":""}}"#;
+        assert!(matches!(
+            parse_event(channel),
+            Some(Event::ThreadRead { thread_id: None, channel_id: Some(c), .. }) if c.as_str() == "c1"
+        ));
+        let team = r#"{"event":"thread_read_changed","data":{"timestamp":70},"broadcast":{"team_id":"t1"}}"#;
+        assert!(matches!(
+            parse_event(team),
+            Some(Event::ThreadRead {
+                thread_id: None,
+                channel_id: None,
+                ..
+            })
+        ));
+
+        let unfollowed = r#"{"event":"thread_follow_changed","data":{"thread_id":"root","state":false,"reply_count":2},"broadcast":{"team_id":"t1"}}"#;
+        assert!(matches!(
+            parse_event(unfollowed),
+            Some(Event::ThreadFollowChanged {
+                following: false,
+                ..
+            })
+        ));
     }
 
     #[test]

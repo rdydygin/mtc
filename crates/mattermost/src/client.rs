@@ -9,8 +9,9 @@ use url::Url;
 use crate::{
     runtime,
     types::{
-        Channel, ChannelId, ChannelMember, CustomStatus, Emoji, EmojiId, FileInfo, Post, PostId,
-        PostList, Preference, Status, Team, TeamId, User, UserId, UserStatus,
+        Channel, ChannelId, ChannelMember, CustomStatus, Emoji, EmojiId, FileInfo, Millis, Post,
+        PostId, PostList, PostSearch, Preference, Status, Team, TeamId, User, UserId, UserStatus,
+        UserThread, UserThreads,
     },
 };
 
@@ -302,6 +303,99 @@ impl Client {
         self.get(format!("posts/{root}/thread")).await
     }
 
+    /// Up to `per_page` of the threads `user` follows in `team`, most
+    /// recently replied to first, with the unread totals across all of
+    /// them. Direct and group messages count toward every team. `before`
+    /// continues after the last thread of the previous page.
+    pub async fn followed_threads(
+        &self,
+        user: &UserId,
+        team: &TeamId,
+        before: Option<&PostId>,
+        unread_only: bool,
+        per_page: usize,
+    ) -> Result<UserThreads> {
+        let mut path =
+            format!("users/{user}/teams/{team}/threads?per_page={per_page}&unread={unread_only}");
+        if let Some(before) = before {
+            path.push_str(&format!("&before={before}"));
+        }
+        self.get(path).await
+    }
+
+    /// The unread totals of [`Self::followed_threads`] without the threads.
+    pub async fn followed_thread_totals(
+        &self,
+        user: &UserId,
+        team: &TeamId,
+    ) -> Result<UserThreads> {
+        self.get(format!(
+            "users/{user}/teams/{team}/threads?totalsOnly=true&threadsOnly=false"
+        ))
+        .await
+    }
+
+    /// One followed thread with the user's read state in it.
+    pub async fn followed_thread(
+        &self,
+        user: &UserId,
+        team: &TeamId,
+        thread: &PostId,
+    ) -> Result<UserThread> {
+        self.get(format!("users/{user}/teams/{team}/threads/{thread}"))
+            .await
+    }
+
+    /// Mark a followed thread read up to `at`.
+    pub async fn mark_thread_read(
+        &self,
+        user: &UserId,
+        team: &TeamId,
+        thread: &PostId,
+        at: Millis,
+    ) -> Result<()> {
+        self.request::<serde_json::Value, ()>(
+            Method::PUT,
+            format!("users/{user}/teams/{team}/threads/{thread}/read/{at}"),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Mark every thread `user` follows in `team` read.
+    pub async fn mark_all_threads_read(&self, user: &UserId, team: &TeamId) -> Result<()> {
+        self.request::<serde_json::Value, ()>(
+            Method::PUT,
+            format!("users/{user}/teams/{team}/threads/read"),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Start or stop following a thread.
+    pub async fn set_thread_following(
+        &self,
+        user: &UserId,
+        team: &TeamId,
+        thread: &PostId,
+        following: bool,
+    ) -> Result<()> {
+        let method = if following {
+            Method::PUT
+        } else {
+            Method::DELETE
+        };
+        self.request::<serde_json::Value, ()>(
+            method,
+            format!("users/{user}/teams/{team}/threads/{thread}/following"),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub async fn create_post(
         &self,
         channel: &ChannelId,
@@ -333,6 +427,18 @@ impl Client {
         self.request::<serde_json::Value, ()>(Method::DELETE, format!("posts/{post}"), None)
             .await
             .map(|_| ())
+    }
+
+    /// Take `me` out of `channel`. The server refuses the team's default
+    /// channel and direct messages.
+    pub async fn leave_channel(&self, channel: &ChannelId, me: &UserId) -> Result<()> {
+        self.request::<serde_json::Value, ()>(
+            Method::DELETE,
+            format!("channels/{channel}/members/{me}"),
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Mark `channel` as read.
@@ -618,6 +724,40 @@ impl Client {
         .map(|_| ())
     }
 
+    /// Search the posts the user can see in `team`, including direct and
+    /// group messages. `terms` uses Mattermost's search syntax: words,
+    /// `"phrases"`, `prefix*`, and modifiers such as `from:` and `in:`.
+    /// `page` counts from 0.
+    pub async fn search_posts(
+        &self,
+        team: &TeamId,
+        terms: &str,
+        page: usize,
+        per_page: usize,
+    ) -> Result<PostSearch> {
+        #[derive(Default, serde::Deserialize)]
+        #[serde(default)]
+        struct Found {
+            #[serde(flatten)]
+            list: PostList,
+            /// Sent as `null` when the search engine doesn't report them.
+            matches: Option<HashMap<PostId, Vec<String>>>,
+        }
+        let found: Found = self
+            .post(
+                format!("teams/{team}/posts/search"),
+                json!({
+                    "terms": terms,
+                    "is_or_search": false,
+                    "include_deleted_channels": false,
+                    "page": page,
+                    "per_page": per_page,
+                }),
+            )
+            .await?;
+        Ok(PostSearch::from_page(found.list, found.matches, per_page))
+    }
+
     /// Search users by name for autocomplete and starting conversations.
     pub async fn search_users(&self, term: &str, limit: usize) -> Result<Vec<User>> {
         self.post(
@@ -817,6 +957,45 @@ mod tests {
         let client = Client::with_timeouts(&server.url(), "token", timeouts).unwrap();
         let err = block_on(client.me()).unwrap_err();
         assert_eq!(err.to_string(), "The server took too long to respond.");
+    }
+
+    #[test]
+    fn search_results_come_newest_first_with_their_matches() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            assert_eq!(request.method(), "POST");
+            assert_eq!(request.path(), "/api/v4/teams/team/posts/search");
+            Reply::json(json!({
+                "order": ["new", "old"],
+                "posts": {
+                    "old": {"id": "old", "create_at": 10, "message": "deploy failed"},
+                    "new": {"id": "new", "create_at": 20, "message": "deployed"},
+                },
+                "matches": {"new": ["deployed"]},
+                "has_next": false,
+            }))
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let found = block_on(client.search_posts(&TeamId::from("team"), "deploy*", 0, 20)).unwrap();
+        let ids: Vec<&str> = found.posts.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["new", "old"]);
+        assert_eq!(found.matches[&PostId::from("new")], ["deployed"]);
+        assert!(!found.has_next);
+    }
+
+    #[test]
+    fn search_tolerates_missing_matches_and_pages_on_a_full_page() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |_| {
+            Reply::json(json!({
+                "order": ["a"],
+                "posts": {"a": {"id": "a", "create_at": 1}},
+                "matches": null,
+            }))
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let found = block_on(client.search_posts(&TeamId::from("team"), "a", 0, 1)).unwrap();
+        assert_eq!(found.posts.len(), 1);
+        assert!(found.matches.is_empty());
+        assert!(found.has_next);
     }
 
     #[test]

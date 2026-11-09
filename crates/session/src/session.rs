@@ -17,7 +17,8 @@ use mattermost::{
 };
 
 use crate::{
-    CustomEmojis, Delivery, Directory, EmojiStore, Timeline, TimelineKind,
+    CustomEmojis, Delivery, Directory, EmojiStore, FollowedThreads, ThreadsEvent, Timeline,
+    TimelineKind,
     retry::{is_transient, retry},
     timeline::{LoadState, now_millis},
 };
@@ -75,7 +76,17 @@ impl ChannelEntry {
     pub fn last_activity(&self) -> Millis {
         self.channel.last_post_at
     }
+
+    /// Whether the user can leave: a public or private channel other than
+    /// the team's default one, which everyone stays in.
+    pub fn can_leave(&self) -> bool {
+        matches!(self.kind(), ChannelType::Open | ChannelType::Private)
+            && self.channel.name != DEFAULT_CHANNEL
+    }
 }
+
+/// The channel every team member belongs to and can't leave.
+const DEFAULT_CHANNEL: &str = "town-square";
 
 /// The real-time connection as the user should understand it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +135,10 @@ pub struct Session {
     /// The latest snapshot of [`Self::emoji`], shared with timelines.
     custom_emoji: CustomEmojis,
     active_channel: Option<ChannelId>,
+    /// The thread on screen, kept read while the window is active.
+    open_thread: Option<PostId>,
+    /// The threads the user follows in the current team.
+    threads: Entity<FollowedThreads>,
     window_active: bool,
     /// Every live timeline, for routing real-time events.
     timelines: HashMap<TimelineKind, WeakEntity<Timeline>>,
@@ -140,6 +155,7 @@ pub struct Session {
     _channels_task: Option<Task<()>>,
     _typing_expiry: Option<Task<()>>,
     _emoji_subscription: Subscription,
+    _threads_subscription: Subscription,
 }
 
 impl EventEmitter<SessionEvent> for Session {}
@@ -165,6 +181,13 @@ impl Session {
             this.set_custom_emoji(custom, cx);
         });
         let directory = cx.new(|_| Directory::new(client.clone(), me, emoji.clone()));
+        let threads =
+            cx.new(|_| FollowedThreads::new(client.clone(), me_arc.id.clone(), directory.clone()));
+        let _threads_subscription = cx.subscribe(&threads, |_, _, event, cx| match event {
+            ThreadsEvent::Failed { message } => cx.emit(SessionEvent::SendFailed {
+                message: message.clone(),
+            }),
+        });
         let (stream, mut events) = EventStream::connect(client.clone());
         let _event_task = cx.spawn(async move |this, cx| {
             while let Some(event) = events.next().await {
@@ -191,6 +214,8 @@ impl Session {
             emoji,
             custom_emoji: CustomEmojis::default(),
             active_channel: None,
+            open_thread: None,
+            threads,
             window_active: true,
             timelines: HashMap::new(),
             timeline_cache: Vec::new(),
@@ -204,6 +229,7 @@ impl Session {
             _channels_task: None,
             _typing_expiry: None,
             _emoji_subscription,
+            _threads_subscription,
         };
         this.load_teams(cx);
         this.load_favorites(cx);
@@ -259,6 +285,16 @@ impl Session {
 
     pub fn active_channel(&self) -> Option<&ChannelId> {
         self.active_channel.as_ref()
+    }
+
+    /// The threads the user follows in the current team.
+    pub fn threads(&self) -> &Entity<FollowedThreads> {
+        &self.threads
+    }
+
+    /// The root of the thread on screen.
+    pub fn open_thread(&self) -> Option<&PostId> {
+        self.open_thread.as_ref()
     }
 
     pub fn is_favorite(&self, channel: &ChannelId) -> bool {
@@ -349,6 +385,8 @@ impl Session {
     }
 
     fn load_channels(&mut self, cx: &mut Context<Self>) {
+        let team = self.team.clone();
+        self.threads.update(cx, |t, cx| t.set_team(team, cx));
         let Some(team) = self.team.clone() else {
             self.channels_loaded = true;
             cx.notify();
@@ -376,6 +414,12 @@ impl Session {
                         })
                         .collect();
                     this.channels_loaded = true;
+                    // A channel left here or elsewhere, or one the user
+                    // was removed from, takes its threads with it.
+                    let channels = &this.channels;
+                    this.threads.update(cx, |t, cx| {
+                        t.keep_channels(|id| channels.contains_key(id), cx)
+                    });
                     let partners: Vec<UserId> = this
                         .channels
                         .values()
@@ -601,6 +645,37 @@ impl Session {
                 self.mark_viewed(&channel, cx);
             }
         }
+        if active && let Some(root) = self.open_thread.clone() {
+            let unread = self
+                .threads
+                .read(cx)
+                .thread(&root)
+                .is_some_and(|t| t.is_unread());
+            if unread {
+                self.threads.update(cx, |t, cx| t.mark_read(&root, cx));
+            }
+        }
+    }
+
+    /// Show the thread under `root`, or with `None`, no thread, and mark it
+    /// read.
+    pub fn set_open_thread(&mut self, root: Option<PostId>, cx: &mut Context<Self>) {
+        if self.open_thread == root {
+            return;
+        }
+        self.open_thread = root.clone();
+        if let Some(root) = root
+            && self.window_active
+        {
+            self.threads.update(cx, |t, cx| t.mark_read(&root, cx));
+        }
+        cx.notify();
+    }
+
+    /// Whether a server event about followed threads is about this team's.
+    /// Threads in direct and group messages belong to no team.
+    fn is_current_team(&self, team: &TeamId) -> bool {
+        team.is_empty() || self.team.as_ref() == Some(team)
     }
 
     // ----- Commands --------------------------------------------------------
@@ -844,6 +919,37 @@ impl Session {
         .detach();
     }
 
+    /// Leave `channel`. It leaves the sidebar at once and comes back if the
+    /// server refuses.
+    pub fn leave_channel(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        let Some(entry) = self.channels.remove(channel) else {
+            return;
+        };
+        cx.notify();
+        let client = self.client.clone();
+        let me = self.me.id.clone();
+        let channel = channel.clone();
+        cx.spawn(async move |this, cx| {
+            let result = client.leave_channel(&channel, &me).await;
+            let _ = this.update(cx, |this, cx| match result {
+                // Its threads go once the server agrees, so a refused leave
+                // has none to bring back.
+                Ok(()) => this
+                    .threads
+                    .update(cx, |t, cx| t.keep_channels(|id| id != &channel, cx)),
+                Err(err) => {
+                    let label = this.channel_label(&entry, cx);
+                    this.channels.entry(channel).or_insert(entry);
+                    cx.emit(SessionEvent::SendFailed {
+                        message: format!("Couldn’t leave {label}. {err:#}").into(),
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Run a server-side slash command in the active channel.
     pub fn execute_command(
         &self,
@@ -933,6 +1039,7 @@ impl Session {
                         self.load_channels(cx);
                     }
                     self.load_favorites(cx);
+                    self.threads.update(cx, |t, cx| t.refresh(cx));
                     for timeline in self.live_timelines() {
                         timeline.update(cx, |t, cx| t.catch_up(cx));
                     }
@@ -1024,6 +1131,35 @@ impl Session {
             }
             // The server mirrors the Favorites category into preferences.
             Event::SidebarCategoriesChanged => self.load_favorites(cx),
+            Event::ThreadUpdated { thread, team_id } if self.is_current_team(&team_id) => {
+                let root = thread.id.clone();
+                self.threads.update(cx, |t, cx| t.apply_update(thread, cx));
+                // A reply to the thread on screen is read as it arrives.
+                if self.window_active && self.open_thread.as_ref() == Some(&root) {
+                    self.threads.update(cx, |t, cx| t.mark_read(&root, cx));
+                }
+            }
+            Event::ThreadRead {
+                thread_id,
+                channel_id,
+                team_id,
+                unread_replies,
+                unread_mentions,
+                ..
+            } if self.is_current_team(&team_id) => {
+                self.threads.update(cx, |t, cx| match thread_id {
+                    Some(root) => t.note_read(&root, unread_replies, unread_mentions, cx),
+                    None => t.note_all_read(channel_id.as_ref(), cx),
+                });
+            }
+            Event::ThreadFollowChanged {
+                thread_id,
+                team_id,
+                following,
+            } if self.is_current_team(&team_id) => {
+                self.threads
+                    .update(cx, |t, cx| t.note_following(&thread_id, following, cx));
+            }
             Event::Other { name, data, .. } => {
                 cx.emit(SessionEvent::Raw {
                     name: name.into(),
@@ -1107,6 +1243,10 @@ impl Session {
     }
 
     fn route_edited(&mut self, post: Post, cx: &mut Context<Self>) {
+        if !post.is_reply() {
+            self.threads
+                .update(cx, |t, cx| t.note_root_edited(&post, cx));
+        }
         let channel = TimelineKind::Channel(post.channel_id.clone());
         let thread = TimelineKind::Thread {
             channel: post.channel_id.clone(),
@@ -1129,6 +1269,9 @@ impl Session {
     }
 
     fn route_deleted(&mut self, post: &Post, cx: &mut Context<Self>) {
+        if !post.is_reply() {
+            self.threads.update(cx, |t, cx| t.forget(&post.id, cx));
+        }
         for timeline in self.live_timelines() {
             timeline.update(cx, |t, cx| t.remove(&post.id, cx));
         }
@@ -1167,6 +1310,8 @@ impl Session {
 #[cfg(test)]
 mod slow_network_tests {
     use std::{
+        cell::RefCell,
+        rc::Rc,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1176,13 +1321,13 @@ mod slow_network_tests {
 
     use gpui_kit::{AppContext as _, Entity, TestAppContext};
     use mattermost::{
-        Client, TeamId, User,
+        Client, PostId, TeamId, User,
         testing::{Network, Reply, Request, SlowServer},
     };
     use serde_json::json;
 
-    use super::Session;
-    use crate::{EmojiStore, LoadState, TimelineKind};
+    use super::{Session, SessionEvent};
+    use crate::{EmojiStore, LoadState, ThreadFilter, TimelineKind};
 
     /// One round trip on a poor mobile or satellite link.
     const ROUND_TRIP: Duration = Duration::from_millis(400);
@@ -1358,6 +1503,101 @@ mod slow_network_tests {
         });
         assert!(failures.load(Ordering::SeqCst) >= 3);
         session.read_with(cx, |s, _| assert!(s.channel(&"town".into()).is_some()));
+    }
+
+    /// A team with a private channel besides Town Square. The server
+    /// answers a request to leave it with `status`.
+    fn leave_route(request: &Request, status: u16) -> Reply {
+        let path = request.path().split('?').next().unwrap_or_default();
+        match (request.method(), path) {
+            ("GET", "/api/v4/users/me/teams/team/channels") => Reply::json(json!([
+                { "id": "town", "team_id": "team", "type": "O", "name": "town-square",
+                  "display_name": "Town Square" },
+                { "id": "design", "team_id": "team", "type": "P", "name": "design",
+                  "display_name": "Design" },
+            ])),
+            // A followed thread in each channel.
+            ("GET", "/api/v4/users/me/teams/team/threads") => Reply::json(json!({
+                "total": 2,
+                "threads": [
+                    { "id": "in-design", "last_reply_at": 20,
+                      "post": { "id": "in-design", "channel_id": "design", "user_id": "ann" } },
+                    { "id": "in-town", "last_reply_at": 10,
+                      "post": { "id": "in-town", "channel_id": "town", "user_id": "ann" } },
+                ],
+            })),
+            ("DELETE", "/api/v4/channels/design/members/me") => {
+                Reply::json(json!({ "status": "OK" })).status(status)
+            }
+            _ => route(request),
+        }
+    }
+
+    fn leave_design(status: u16, cx: &mut TestAppContext) -> (SlowServer, Entity<Session>) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), move |request| {
+            leave_route(request, status)
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        session.read_with(cx, |s, _| {
+            assert!(s.channel(&"design".into()).unwrap().can_leave());
+            assert!(!s.channel(&"town".into()).unwrap().can_leave());
+        });
+        let threads = session.read_with(cx, |s, _| s.threads().clone());
+        threads.update(cx, |t, cx| t.load(ThreadFilter::All, cx));
+        wait_until(cx, |cx| {
+            threads.read_with(cx, |t, _| t.threads(ThreadFilter::All).count() == 2)
+        });
+        session.update(cx, |s, cx| s.leave_channel(&"design".into(), cx));
+        // Gone from the sidebar before the server answers.
+        session.read_with(cx, |s, _| assert!(s.channel(&"design".into()).is_none()));
+        (server, session)
+    }
+
+    #[gpui_kit::test]
+    fn leaving_a_channel_takes_it_out_of_the_sidebar(cx: &mut TestAppContext) {
+        let (server, session) = leave_design(200, cx);
+        // Its thread leaves the Threads pane once the server agrees.
+        let threads = session.read_with(cx, |s, _| s.threads().clone());
+        wait_until(cx, |cx| {
+            threads.read_with(cx, |t, _| t.thread(&"in-design".into()).is_none())
+        });
+        assert!(
+            server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "DELETE" && r.path() == "/api/v4/channels/design/members/me")
+        );
+        session.read_with(cx, |s, cx| {
+            assert!(s.channel(&"design".into()).is_none());
+            let threads = s.threads().read(cx);
+            let left: Vec<_> = threads.threads(ThreadFilter::All).map(|t| t.id()).collect();
+            assert_eq!(left, [&PostId::from("in-town")]);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_refused_leave_puts_the_channel_back(cx: &mut TestAppContext) {
+        let failures = Rc::new(RefCell::new(Vec::new()));
+        let (_server, session) = leave_design(403, cx);
+        cx.update(|cx| {
+            let failures = failures.clone();
+            cx.subscribe(&session, move |_, event, _| {
+                if let SessionEvent::SendFailed { message } = event {
+                    failures.borrow_mut().push(message.clone());
+                }
+            })
+            .detach();
+        });
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.channel(&"design".into()).is_some())
+        });
+        let failures = failures.borrow();
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].starts_with("Couldn’t leave Design."),
+            "{failures:?}"
+        );
     }
 
     /// The server of a company with custom emoji, where the full list can't

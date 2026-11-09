@@ -10,6 +10,7 @@ gpui_kit::assets::icon_assets!(
     [
         ArrowDown,
         AtSign,
+        CheckCheck,
         ChevronDown,
         ChevronRight,
         ChevronsUpDown,
@@ -26,6 +27,7 @@ gpui_kit::assets::icon_assets!(
         Lock,
         LogOut,
         MessageSquare,
+        MessagesSquare,
         Moon,
         CodeXml,
         Copy,
