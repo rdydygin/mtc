@@ -495,6 +495,10 @@ impl FollowedThreads {
     /// The user started or stopped following a thread, possibly elsewhere.
     pub fn note_following(&mut self, id: &PostId, following: bool, cx: &mut Context<Self>) {
         if !following {
+            // One not loaded may still count in the totals.
+            if self.thread(id).is_none() {
+                self.load_totals(TOTALS_DELAY, cx);
+            }
             self.forget(id, cx);
             return;
         }

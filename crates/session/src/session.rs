@@ -1319,7 +1319,7 @@ mod slow_network_tests {
         rc::Rc,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -1624,6 +1624,37 @@ mod slow_network_tests {
         assert!(failures.borrow().is_empty(), "refused before the switch");
         wait_until(cx, |_| !failures.borrow().is_empty());
         session.read_with(cx, |s, _| assert!(s.channel(&"design".into()).is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn unfollowing_a_thread_not_loaded_reads_the_totals_again(cx: &mut TestAppContext) {
+        let unfollowed = Arc::new(AtomicBool::new(false));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let unfollowed = unfollowed.clone();
+            move |request| match request.path().split('?').next().unwrap_or_default() {
+                "/api/v4/users/me/teams/team/threads" => {
+                    let unread = i64::from(!unfollowed.load(Ordering::SeqCst));
+                    Reply::json(json!({
+                        "total_unread_threads": unread,
+                        "total_unread_mentions": unread,
+                    }))
+                }
+                _ => route(request),
+            }
+        });
+        let session = start(&server, cx);
+        let threads = session.read_with(cx, |s, _| s.threads().clone());
+        wait_until(cx, |cx| {
+            threads.read_with(cx, |t, _| t.unread_mentions() == 1)
+        });
+        // Unfollowed on another device, with no list loaded here.
+        unfollowed.store(true, Ordering::SeqCst);
+        threads.update(cx, |t, cx| t.note_following(&"elsewhere".into(), false, cx));
+        wait_until(cx, |cx| {
+            threads.read_with(cx, |t, _| {
+                (t.unread_threads(), t.unread_mentions()) == (0, 0)
+            })
+        });
     }
 
     /// The messages of the failures `session` reports, as they arrive.
