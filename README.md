@@ -159,9 +159,10 @@ Dependencies point downward. The app depends on `gpui-kit` alone for UI.
 - **Skeletons while loading.** The window, sidebar, and conversation show their shape
   while their content is on the way, with the same lanes as the real rows, so
   nothing moves when it arrives.
-- **Virtualized timelines.** Posts render through `MessageScroller`. `Timeline` emits
-  splice events (`Spliced { old, new_count }`, `Updated(ix)`), so a new post or an edit
-  measures one row, not the whole list.
+- **Virtualized timelines.** Posts render through a GPUI list anchored to the composer
+  (`app/src/post_scroller.rs`). `Timeline` emits splice events
+  (`Spliced { old, new_count }`, `Updated(ix)`), so a new post or an edit measures one
+  row, not the whole list.
 - **Work happens once, at ingest.** Emoji shortcodes, @mentions, autolinks, and the plain
   vs rich decision run when a post arrives, never during render. Custom emoji are looked
   up by name as posts, reactions, and statuses name them, batched like users, while the
