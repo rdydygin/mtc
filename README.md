@@ -99,8 +99,8 @@ and `-word`. The last word you type also matches longer words that start with it
 
 Right-click a message to reply, react, copy, edit, or delete it. Click a message to open
 its replies in a thread panel beside the channel (collapsed reply threads); the reply
-count sits at the end of the message's reactions line. Click someone's name or avatar to
-see their profile and start a direct message.
+count sits at the end of the message's reactions line. Click someone's name or avatar, or
+an @mention of them in a message, to see their profile and start a direct message.
 
 **Threads**, at the top of the sidebar (⌘⇧T), lists the threads you follow (ones you
 started, replied to, or were mentioned in) across the team's channels and your direct
@@ -162,8 +162,8 @@ Dependencies point downward. The app depends on `gpui-kit` alone for UI.
 - **Virtualized timelines.** Posts render through `MessageScroller`. `Timeline` emits
   splice events (`Spliced { old, new_count }`, `Updated(ix)`), so a new post or an edit
   measures one row, not the whole list.
-- **Work happens once, at ingest.** Emoji shortcodes, autolinks, and the plain vs rich
-  decision run when a post arrives, never during render. Custom emoji are looked
+- **Work happens once, at ingest.** Emoji shortcodes, @mentions, autolinks, and the plain
+  vs rich decision run when a post arrives, never during render. Custom emoji are looked
   up by name as posts, reactions, and statuses name them, batched like users, while the
   full list loads in the background; when they arrive, open timelines re-prepare only
   the posts that name one. Most chat messages are plain

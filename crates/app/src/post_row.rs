@@ -10,7 +10,7 @@ use std::{rc::Rc, sync::Arc};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, GlobalState, Icon, Selectable as _, Sizable as _, StyledExt as _,
+    ActiveTheme as _, GlobalState, Icon, Selectable, Sizable as _, StyledExt as _,
     attachment::{
         Attachment, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle,
     },
@@ -21,20 +21,21 @@ use gpui_kit::component::{
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     popover::{Popover, PopoverState},
     separator::Separator,
+    spinner::Spinner,
     text::{TextView, TextViewState},
     tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::{
     Anchor, AnyElement, App, ClickEvent, ElementId, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, RenderOnce, SharedString,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img,
-    prelude::FluentBuilder as _, px, relative,
+    IntoElement, MouseButton, ParentElement as _, Pixels, Point, RenderOnce, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, Window,
+    canvas, div, img, prelude::FluentBuilder as _, px, relative,
 };
 use mattermost::{Client, FileInfo, Status, User, UserId};
-use session::{CustomEmojis, Delivery, Entry};
+use session::{CustomEmojis, Delivery, Directory, Entry, UsernameLookup};
 
-use crate::{composer::format_size, extensions, time};
+use crate::{composer::format_size, extensions, http::avatar_url, time};
 
 /// The largest an inline image is drawn, in logical pixels. Images keep
 /// their aspect ratio; this bounds raster content, not interface layout.
@@ -65,8 +66,9 @@ pub enum PostAction {
     Discard,
     /// Download an attached file and open it.
     OpenFile(FileInfo),
-    /// Open the direct message with the post's author.
-    MessageAuthor,
+    /// Open the direct message with someone: the author, or a person the
+    /// post mentions.
+    MessageUser(UserId),
 }
 
 pub type PostActionHandler = Rc<dyn Fn(PostAction, &mut Window, &mut App)>;
@@ -85,6 +87,7 @@ pub struct PostRow {
     rich_text: Option<Entity<TextViewState>>,
     thread_entry: bool,
     client: Option<Client>,
+    directory: Option<Entity<Directory>>,
     custom_emoji: CustomEmojis,
     on_action: PostActionHandler,
 }
@@ -104,6 +107,7 @@ impl PostRow {
             rich_text: None,
             thread_entry: false,
             client: None,
+            directory: None,
             custom_emoji: CustomEmojis::default(),
             on_action,
         }
@@ -157,6 +161,13 @@ impl PostRow {
         self
     }
 
+    /// Where the people the message mentions are looked up, so clicking a
+    /// mention shows them.
+    pub fn directory(mut self, directory: Entity<Directory>) -> Self {
+        self.directory = Some(directory);
+        self
+    }
+
     /// The server's custom emoji, for reactions and the author's status.
     pub fn custom_emoji(mut self, custom_emoji: CustomEmojis) -> Self {
         self.custom_emoji = custom_emoji;
@@ -180,7 +191,7 @@ impl PostRow {
         }
     }
 
-    fn render_body(&self, cx: &App) -> AnyElement {
+    fn render_body(&self, mention: Option<&Entity<MentionCard>>, cx: &App) -> AnyElement {
         if let Some(body) = extensions::render_post_body(&self.entry, cx) {
             return body;
         }
@@ -188,6 +199,13 @@ impl PostRow {
         match &self.rich_text {
             Some(state) if message.is_rich() => TextView::new(state)
                 .w_full()
+                .on_link_click({
+                    let mention = mention.cloned();
+                    let directory = self.directory.clone();
+                    move |url, event, _, cx| {
+                        open_link(url, event, mention.as_ref(), directory.as_ref(), cx)
+                    }
+                })
                 // Language and copy sit in the block's top-right corner,
                 // over the code rather than on a line of their own.
                 .code_block_actions(|block, _, cx| {
@@ -285,6 +303,52 @@ impl PostRow {
                             .into_any_element()
                     }
                 }))
+                .into_any_element(),
+        )
+    }
+
+    /// The profile of the mention last clicked in the message, while it's
+    /// open. The popover hangs from an empty anchor placed where the click
+    /// landed: a mention is a run of text, not an element of its own.
+    fn render_mention(&self, mention: &Entity<MentionCard>, cx: &App) -> Option<AnyElement> {
+        let (username, at) = mention.read(cx).open.clone()?;
+        let directory = self.directory.clone()?;
+        let client = self.client.clone();
+        let me = self.me.clone();
+        let custom_emoji = self.custom_emoji.clone();
+        let on_action = self.on_action.clone();
+        let close = mention.clone();
+        Some(
+            Popover::new("mention-profile")
+                .anchor(Anchor::TopLeft)
+                .open(true)
+                .trigger_style(StyleRefinement::default().absolute().left(at.x).top(at.y))
+                .trigger(MentionAnchor)
+                .on_open_change(move |open, _, cx| {
+                    if !open {
+                        close.update(cx, |card, cx| {
+                            card.open = None;
+                            cx.notify();
+                        });
+                    }
+                })
+                .content(move |_, _, cx| {
+                    let popover = cx.entity();
+                    let directory = directory.read(cx);
+                    let Some(user) = directory.user_by_username(&username).cloned() else {
+                        return render_lookup(&username, directory.username_lookup(&username), cx);
+                    };
+                    let profile = Profile {
+                        is_me: user.id == me,
+                        avatar_url: client.as_ref().map(|client| {
+                            avatar_url(client, user.id.as_str(), user.last_picture_update).into()
+                        }),
+                        status: directory.status(&user.id),
+                        custom_emoji: custom_emoji.clone(),
+                        user,
+                    };
+                    render_profile(&profile, popover, &on_action, cx)
+                })
                 .into_any_element(),
         )
     }
@@ -739,6 +803,14 @@ impl RenderOnce for PostRow {
             |_, _| false,
         );
         let actions_revealed = *actions_open.read(cx) || actions_focus.is_focused(window);
+        // Only Markdown text carries mention links.
+        let mention = self.rich_text.is_some().then(|| {
+            window.use_keyed_state(
+                SharedString::from(format!("post-mention-{}", post.id)),
+                cx,
+                |_, _| MentionCard::default(),
+            )
+        });
         // Whether the current press began on a control inside the row, which
         // handles it. Controls claim their presses by suppressing text
         // selection; `prevent_default` alone can't tell, because the message
@@ -924,9 +996,10 @@ impl RenderOnce for PostRow {
                     .when(has_text || edited, |this| {
                         this.child(
                             div()
+                                .relative()
                                 .text_sm()
                                 .when(!sent, |this| this.opacity(0.6))
-                                .child(self.render_body(cx))
+                                .child(self.render_body(mention.as_ref(), cx))
                                 .when(edited, |this| {
                                     this.child(
                                         div()
@@ -934,6 +1007,24 @@ impl RenderOnce for PostRow {
                                             .text_color(theme.muted_foreground)
                                             .child("(edited)"),
                                     )
+                                })
+                                .when_some(mention.as_ref(), |this, mention| {
+                                    // Notes where the text sits, to place a
+                                    // click on a mention within it.
+                                    let origin = mention.clone();
+                                    this.child(
+                                        canvas(
+                                            move |bounds, _, cx| {
+                                                origin.update(cx, |card, _| {
+                                                    card.origin = bounds.origin
+                                                })
+                                            },
+                                            |_, _, _, _| {},
+                                        )
+                                        .absolute()
+                                        .size_full(),
+                                    )
+                                    .children(self.render_mention(mention, cx))
                                 }),
                         )
                     })
@@ -1021,6 +1112,7 @@ fn render_profile(
             .child(text)
     };
     let on_action = on_action.clone();
+    let user_id = user.id.clone();
     v_flex()
         .w_72()
         .gap_3()
@@ -1101,10 +1193,87 @@ fn render_profile(
                     .label("Message")
                     .on_click(move |_, window, cx| {
                         popover.update(cx, |popover, cx| popover.dismiss(window, cx));
-                        on_action(PostAction::MessageAuthor, window, cx);
+                        on_action(PostAction::MessageUser(user_id.clone()), window, cx);
                     }),
             )
         })
+        .into_any_element()
+}
+
+/// A clicked mention's profile, retained per post.
+#[derive(Default)]
+struct MentionCard {
+    /// Where the message text was last painted, in window coordinates.
+    origin: Point<Pixels>,
+    /// The username whose profile is open, and where its mention was
+    /// clicked, relative to `origin`.
+    open: Option<(SharedString, Point<Pixels>)>,
+}
+
+/// The empty point a mention's profile opens from.
+#[derive(IntoElement)]
+struct MentionAnchor;
+
+impl RenderOnce for MentionAnchor {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div()
+    }
+}
+
+impl Selectable for MentionAnchor {
+    fn selected(self, _: bool) -> Self {
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        false
+    }
+}
+
+/// Show the profile of a mentioned person, or open any other link the way
+/// the text view would.
+fn open_link(
+    url: &SharedString,
+    event: &ClickEvent,
+    mention: Option<&Entity<MentionCard>>,
+    directory: Option<&Entity<Directory>>,
+    cx: &mut App,
+) {
+    if event.is_secondary() {
+        return;
+    }
+    let Some(username) = session::mention_username(url) else {
+        cx.open_url(url);
+        return;
+    };
+    let (Some(mention), Some(directory)) = (mention, directory) else {
+        return;
+    };
+    directory.update(cx, |directory, cx| directory.ensure_username(username, cx));
+    let username = SharedString::from(username.to_string());
+    let position = event.position();
+    mention.update(cx, |card, cx| {
+        card.open = Some((username, position - card.origin));
+        cx.notify();
+    });
+}
+
+/// A mention's profile card before, or instead of, the person.
+fn render_lookup(username: &str, lookup: Option<UsernameLookup>, cx: &App) -> AnyElement {
+    let text = match lookup {
+        Some(UsernameLookup::Missing) => format!("No user named @{username}."),
+        Some(UsernameLookup::Failed) => format!("Couldn’t look up @{username}."),
+        Some(UsernameLookup::Pending) | None => format!("Looking up @{username}…"),
+    };
+    h_flex()
+        .gap_2()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .when(
+            matches!(lookup, Some(UsernameLookup::Pending) | None),
+            |this| this.child(Spinner::new().small()),
+        )
+        .child(text)
         .into_any_element()
 }
 
@@ -1205,6 +1374,7 @@ mod tests {
     struct OneRow {
         entry: Entry,
         rich_text: Entity<TextViewState>,
+        directory: Entity<Directory>,
         actions: Rc<RefCell<Vec<PostAction>>>,
     }
 
@@ -1218,6 +1388,7 @@ mod tests {
                     Rc::new(move |action, _, _| actions.borrow_mut().push(action)),
                 )
                 .rich_text(Some(self.rich_text.clone()))
+                .directory(self.directory.clone())
                 .thread_entry(true),
             )
         }
@@ -1226,17 +1397,31 @@ mod tests {
     fn open_row(
         cx: &mut TestAppContext,
     ) -> (gpui_kit::AnyWindowHandle, Rc<RefCell<Vec<PostAction>>>) {
+        open_row_with(cx, "ku, **1x1**?")
+    }
+
+    /// Like [`open_row`], with the root saying `message`. The directory
+    /// knows Ann, `@ann`.
+    fn open_row_with(
+        cx: &mut TestAppContext,
+        message: &str,
+    ) -> (gpui_kit::AnyWindowHandle, Rc<RefCell<Vec<PostAction>>>) {
         cx.update(gpui_kit::init);
         let client = Client::new_unverified("http://localhost:1", "token").unwrap();
         let mut me = User::default();
         me.id = "me".into();
+        let mut ann = User::default();
+        ann.id = "ann".into();
+        ann.username = "ann".into();
+        ann.first_name = "Ann".into();
         let emoji = cx.new(|_| EmojiStore::new(client.clone()));
         let directory = cx.new(|_| Directory::new(client.clone(), me, emoji.clone()));
+        directory.update(cx, |d, cx| d.insert([ann], cx));
         let timeline = cx.new(|_| {
             Timeline::new(
                 TimelineKind::Channel("c".into()),
                 client,
-                directory,
+                directory.clone(),
                 emoji,
                 CustomEmojis::default(),
             )
@@ -1246,7 +1431,7 @@ mod tests {
         post.channel_id = "c".into();
         post.user_id = "them".into();
         post.create_at = 1;
-        post.message = "ku, **1x1**?".into();
+        post.message = message.into();
         post.reply_count = 1;
         let mut reaction = Reaction::default();
         reaction.user_id = "them".into();
@@ -1275,6 +1460,7 @@ mod tests {
                     cx.new(|_| OneRow {
                         entry,
                         rich_text,
+                        directory,
                         actions,
                     })
                 },
@@ -1356,6 +1542,42 @@ mod tests {
         })
         .unwrap();
         assert_eq!(opened_thread(&actions), 1);
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_mention_shows_the_person_instead_of_the_thread(cx: &mut TestAppContext) {
+        let (window, actions) = open_row_with(cx, "@ann, ku");
+        let clicked = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let header = window.find("thread").bounds();
+                let reactions = window.find("reaction-+1").bounds();
+                let at = point(
+                    reactions.left() + px(4.),
+                    (header.bottom() + reactions.top()) / 2.,
+                );
+                click_point(window, at, cx);
+                at
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // The profile is placed once its anchor has been measured.
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            // It opens under the pointer, not at the message's corner.
+            let message = window.find("profile-message").bounds();
+            assert!(message.top() > clicked.y);
+            assert!((message.left() - clicked.x).abs() < px(24.));
+            window.click("profile-message", cx);
+        })
+        .unwrap();
+        assert_eq!(opened_thread(&actions), 0);
+        assert!(matches!(
+            actions.borrow().as_slice(),
+            [PostAction::MessageUser(user)] if user.as_str() == "ann"
+        ));
     }
 
     #[gpui_kit::test]
