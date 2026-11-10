@@ -2,7 +2,8 @@
 //!
 //! Runs once when a post enters a timeline, never during render: emoji
 //! shortcodes become Unicode (or, for the server's custom emoji, an inline
-//! image), `@username`s become links to the person, bare URLs become
+//! image), emphasis written with a space inside its markers is tightened,
+//! `@username`s become links to the person, bare URLs become
 //! CommonMark autolinks, and the message is classified as plain or rich. Plain messages (the majority in
 //! chat) render as ordinary text, which is far cheaper than a Markdown
 //! document with its own parser state.
@@ -22,7 +23,8 @@ pub struct PreparedMessage {
 
 impl PreparedMessage {
     pub fn new(message: &str, custom: &CustomEmojis) -> Self {
-        Self::from_text(autolink(&link_mentions(&emojify(message, custom))))
+        let text = tighten_emphasis(&emojify(message, custom));
+        Self::from_text(autolink(&link_mentions(&text)))
     }
 
     /// A system message, such as "@ann joined the channel." These are drawn
@@ -327,6 +329,159 @@ fn mention_at(rest: &str) -> Option<&str> {
     .then_some(name)
 }
 
+/// Move whitespace from just inside an emphasis marker to just outside it,
+/// so `**bold **` and `* italic*` read as emphasis. CommonMark, which the
+/// text view follows, takes such asterisks literally, yet they are what
+/// bolding a selection that ends in a space leaves behind.
+///
+/// Only asterisks the parser left as text count, and only a pair that is
+/// emphasis once tightened: anything else stays as written.
+fn tighten_emphasis(text: &str) -> String {
+    if !text.contains('*') {
+        return text.to_string();
+    }
+    let Ok(tree) = markdown::to_mdast(text, &parse_options()) else {
+        return text.to_string();
+    };
+    let mut existing = Vec::new();
+    emphasis_spans(&tree, &mut existing);
+    let mut pairs = Vec::new();
+    loose_pairs(&tree, text, &mut pairs);
+    // In source order, and never a pair inside another.
+    pairs.sort_by_key(|(open, _)| open.start);
+    let mut end = 0;
+    pairs.retain(|(open, close)| {
+        let outside = open.start >= end;
+        if outside {
+            end = close.end;
+        }
+        outside
+    });
+    while !pairs.is_empty() {
+        let (tightened, spans) = tighten(text, &pairs);
+        let mut emphasized = Vec::new();
+        if let Ok(tree) = markdown::to_mdast(&tightened, &parse_options()) {
+            emphasis_spans(&tree, &mut emphasized);
+        }
+        let proposed = pairs.len();
+        let mut spans = spans.iter();
+        pairs.retain(|_| spans.next().is_some_and(|span| emphasized.contains(span)));
+        if pairs.len() == proposed {
+            // Whitespace moved out of one marker can land inside another,
+            // costing emphasis the message had.
+            let kept = emphasized.len() >= existing.len() + proposed;
+            return if kept { tightened } else { text.to_string() };
+        }
+    }
+    text.to_string()
+}
+
+/// An opening and a closing emphasis marker: where each lies in the text.
+type MarkerPair = (Range<usize>, Range<usize>);
+
+/// Collect the marker pairs under `node` that whitespace keeps from being
+/// emphasis: two runs of `*` of one length, left as text by the parser under
+/// one parent and on one line, with whitespace inside exactly one of them.
+/// Whitespace inside both is more likely arithmetic, as in `2 * 3 * 4`.
+fn loose_pairs(node: &mdast::Node, text: &str, pairs: &mut Vec<MarkerPair>) {
+    let mut markers = Vec::new();
+    for child in node.children().into_iter().flatten() {
+        match child {
+            mdast::Node::Text(child) => {
+                if let Some(position) = &child.position {
+                    let source = position.start.offset..position.end.offset;
+                    literal_asterisks(text, source, &mut markers);
+                }
+            }
+            _ => loose_pairs(child, text, pairs),
+        }
+    }
+    let mut markers = markers.as_slice();
+    while let [open, rest @ ..] = markers {
+        markers = rest;
+        let close = rest
+            .iter()
+            .take_while(|close| !text[open.end..close.start].contains('\n'))
+            .position(|close| close.len() == open.len());
+        let Some(close) = close else {
+            continue;
+        };
+        let inside = &text[open.end..rest[close].start];
+        if inside.starts_with(char::is_whitespace) != inside.ends_with(char::is_whitespace) {
+            pairs.push((open.clone(), rest[close].clone()));
+            markers = &rest[close + 1..];
+        }
+    }
+}
+
+/// Collect the runs of `*` in `source`, the source of a text node.
+fn literal_asterisks(text: &str, source: Range<usize>, markers: &mut Vec<Range<usize>>) {
+    let bytes = text.as_bytes();
+    let mut ix = source.start;
+    while ix < source.end {
+        match bytes[ix] {
+            // An escaped asterisk is text, not a marker.
+            b'\\' => ix += 2,
+            b'*' => {
+                let start = ix;
+                while ix < source.end && bytes[ix] == b'*' {
+                    ix += 1;
+                }
+                // The rest of a longer run, part of which is emphasis
+                // already, is no marker of its own.
+                if !text[..start].ends_with('*') && !text[ix..].starts_with('*') {
+                    markers.push(start..ix);
+                }
+            }
+            _ => ix += 1,
+        }
+    }
+}
+
+/// `text` with the whitespace inside each of `pairs` moved outside it, and
+/// where each pair then lies, markers included.
+fn tighten(text: &str, pairs: &[MarkerPair]) -> (String, Vec<Range<usize>>) {
+    let mut out = String::with_capacity(text.len());
+    let mut spans = Vec::with_capacity(pairs.len());
+    let mut copied = 0;
+    for (open, close) in pairs {
+        let inside = &text[open.end..close.start];
+        out.push_str(&text[copied..open.start]);
+        if out.ends_with(|c: char| !sheds_space(c)) {
+            out.push_str(&inside[..inside.len() - inside.trim_start().len()]);
+        }
+        let start = out.len();
+        out.push_str(&text[open.clone()]);
+        out.push_str(inside.trim());
+        out.push_str(&text[close.clone()]);
+        spans.push(start..out.len());
+        if text[close.end..].starts_with(|c: char| !sheds_space(c)) {
+            out.push_str(&inside[inside.trim_end().len()..]);
+        }
+        copied = close.end;
+    }
+    out.push_str(&text[copied..]);
+    (out, spans)
+}
+
+/// Whether whitespace moved next to `c` is dropped instead: `c` is
+/// whitespace already, or a marker that the whitespace would loosen in turn.
+fn sheds_space(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '*' | '_' | '~')
+}
+
+/// Collect where `node`'s emphasis lies in the source, markers included.
+fn emphasis_spans(node: &mdast::Node, spans: &mut Vec<Range<usize>>) {
+    if let mdast::Node::Emphasis(_) | mdast::Node::Strong(_) = node
+        && let Some(position) = node.position()
+    {
+        spans.push(position.start.offset..position.end.offset);
+    }
+    for child in node.children().into_iter().flatten() {
+        emphasis_spans(child, spans);
+    }
+}
+
 /// Wrap bare `http(s)://` URLs in `<…>` so Markdown renders them as links.
 fn autolink(text: &str) -> String {
     if !text.contains("://") {
@@ -487,6 +642,63 @@ mod tests {
         assert_eq!(
             custom_emoji_names(r":party\_parrot: :white\_check\_mark: :a\b:"),
             ["party_parrot"]
+        );
+    }
+
+    #[test]
+    fn emphasis_may_hold_whitespace_inside_its_markers() {
+        assert_eq!(tighten_emphasis("**bold **"), "**bold**");
+        assert_eq!(tighten_emphasis("**Note: **the rest"), "**Note:** the rest");
+        assert_eq!(tighten_emphasis("so** bold** it is"), "so **bold** it is");
+        assert_eq!(tighten_emphasis("a ** bold** b"), "a **bold** b");
+        // A space moved next to the closing underscore would undo the italics.
+        assert_eq!(tighten_emphasis("_a **b **_"), "_a **b**_");
+        assert_eq!(
+            tighten_emphasis("*italic * and ***both ***"),
+            "*italic* and ***both***"
+        );
+        assert_eq!(
+            tighten_emphasis(
+                "**a `b` [c](https://x.y) *d* ![e](f) **\n> - **quoted ** x\n\n| **cell ** |\n| - |"
+            ),
+            "**a `b` [c](https://x.y) *d* ![e](f)**\n> - **quoted** x\n\n| **cell** |\n| - |"
+        );
+    }
+
+    #[test]
+    fn emphasis_is_tightened_only_where_it_then_reads_as_emphasis() {
+        for text in [
+            "2 * 3 * 4 and x ** 2 + y ** 2",
+            "**fine** and *fine* and ***fine***",
+            "`**code **` and\n```\n**code **\n```",
+            r"\*\*escaped \*\*",
+            "**over\nlines **",
+            "* item *\n* **item**",
+            // The second marker already opens emphasis.
+            "**a **b**",
+            // Tightening the single asterisks would undo the bold.
+            "*note: **2 * 3**",
+            // The first asterisk belongs to a marker that is half emphasis.
+            "**a* *b",
+            "| **a | b ** |\n| - | - |",
+            // No emphasis opens between a letter and punctuation.
+            "foo**«bar» **",
+        ] {
+            assert_eq!(tighten_emphasis(text), text);
+        }
+    }
+
+    #[test]
+    fn tightened_emphasis_keeps_its_emoji_and_mentions() {
+        let custom = CustomEmojis::new([(
+            "party-parrot".to_string(),
+            "https://chat.example.com/api/v4/emoji/e1/image".to_string(),
+        )]);
+        let message = PreparedMessage::new("**:party-parrot: Привет, @ann! **", &custom);
+        assert_eq!(
+            message.text().as_ref(),
+            "**![:party-parrot:](https://chat.example.com/api/v4/emoji/e1/image) \
+             Привет, [@ann](mention:ann)!**"
         );
     }
 
