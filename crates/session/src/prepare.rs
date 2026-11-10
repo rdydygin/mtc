@@ -528,12 +528,13 @@ fn autolink(text: &str) -> String {
 }
 
 /// Drop trailing punctuation, which usually ends the sentence rather than the
-/// URL. A closing parenthesis stays when it balances one inside the URL, as in
+/// URL, and trailing emphasis markers, which close what the URL stands in.
+/// A closing parenthesis stays when it balances one inside the URL, as in
 /// `https://en.wikipedia.org/wiki/Rust_(programming_language)`.
 fn trim_url_end(url: &str) -> &str {
     let mut url = url;
     loop {
-        let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '*', '_', '~']);
         let trimmed = match trimmed.strip_suffix(')') {
             Some(inner) if inner.matches('(').count() <= inner.matches(')').count() => inner,
             _ => trimmed,
@@ -703,6 +704,13 @@ mod tests {
     }
 
     #[test]
+    fn tightened_emphasis_may_end_in_a_url() {
+        let message =
+            PreparedMessage::new("**read https://example.com **", &CustomEmojis::default());
+        assert_eq!(message.text().as_ref(), "**read <https://example.com>**");
+    }
+
+    #[test]
     fn autolinks_bare_urls_only() {
         assert_eq!(
             autolink("see https://example.com/a."),
@@ -720,6 +728,10 @@ mod tests {
         assert_eq!(
             autolink("(see https://example.com/a)."),
             "(see <https://example.com/a>)."
+        );
+        assert_eq!(
+            autolink("**https://example.com/a** _https://x.y/a_b_ ~~https://x.y/~c~~"),
+            "**<https://example.com/a>** _<https://x.y/a_b>_ ~~<https://x.y/~c>~~"
         );
     }
 
