@@ -348,12 +348,12 @@ fn tighten_emphasis(text: &str) -> String {
     let mut pairs = Vec::new();
     loose_pairs(&tree, text, &mut pairs);
     // In source order, and never a pair inside another.
-    pairs.sort_by_key(|(open, _)| open.start);
+    pairs.sort_by_key(|pair| pair.open.start);
     let mut end = 0;
-    pairs.retain(|(open, close)| {
-        let outside = open.start >= end;
+    pairs.retain(|pair| {
+        let outside = pair.open.start >= end;
         if outside {
-            end = close.end;
+            end = pair.close.end;
         }
         outside
     });
@@ -376,14 +376,28 @@ fn tighten_emphasis(text: &str) -> String {
     text.to_string()
 }
 
-/// An opening and a closing emphasis marker: where each lies in the text.
-type MarkerPair = (Range<usize>, Range<usize>);
+/// An opening and a closing marker that whitespace keeps from being
+/// emphasis: where each lies in the text.
+struct LoosePair {
+    open: Range<usize>,
+    close: Range<usize>,
+    /// Where their whitespace may move to: anywhere, except that out of
+    /// emphasis the pair sits in it would loosen that emphasis in turn.
+    room: Range<usize>,
+}
 
-/// Collect the marker pairs under `node` that whitespace keeps from being
-/// emphasis: two runs of `*` of one length, left as text by the parser under
-/// one parent and on one line, with whitespace inside exactly one of them.
-/// Whitespace inside both is more likely arithmetic, as in `2 * 3 * 4`.
-fn loose_pairs(node: &mdast::Node, text: &str, pairs: &mut Vec<MarkerPair>) {
+/// Collect the loose pairs under `node`: two runs of `*` of one length, left
+/// as text by the parser under one parent and on one line, with whitespace
+/// inside exactly one of them. Whitespace inside both is more likely
+/// arithmetic, as in `2 * 3 * 4`.
+fn loose_pairs(node: &mdast::Node, text: &str, pairs: &mut Vec<LoosePair>) {
+    let room = match node {
+        mdast::Node::Emphasis(_) | mdast::Node::Strong(_) | mdast::Node::Delete(_) => {
+            enclosed(node)
+        }
+        _ => None,
+    };
+    let room = room.unwrap_or(0..text.len());
     let mut markers = Vec::new();
     for child in node.children().into_iter().flatten() {
         match child {
@@ -408,10 +422,22 @@ fn loose_pairs(node: &mdast::Node, text: &str, pairs: &mut Vec<MarkerPair>) {
         };
         let inside = &text[open.end..rest[close].start];
         if inside.starts_with(char::is_whitespace) != inside.ends_with(char::is_whitespace) {
-            pairs.push((open.clone(), rest[close].clone()));
+            pairs.push(LoosePair {
+                open: open.clone(),
+                close: rest[close].clone(),
+                room: room.clone(),
+            });
             markers = &rest[close + 1..];
         }
     }
+}
+
+/// Where the text that `node`'s own markers enclose lies in the source.
+fn enclosed(node: &mdast::Node) -> Option<Range<usize>> {
+    let children = node.children()?;
+    let start = children.first()?.position()?.start.offset;
+    let end = children.last()?.position()?.end.offset;
+    Some(start..end)
 }
 
 /// Collect the runs of `*` in `source`, the source of a text node.
@@ -439,15 +465,16 @@ fn literal_asterisks(text: &str, source: Range<usize>, markers: &mut Vec<Range<u
 }
 
 /// `text` with the whitespace inside each of `pairs` moved outside it, and
-/// where each pair then lies, markers included.
-fn tighten(text: &str, pairs: &[MarkerPair]) -> (String, Vec<Range<usize>>) {
+/// where each pair then lies, markers included. The whitespace is dropped
+/// where there is some already, or no room for it.
+fn tighten(text: &str, pairs: &[LoosePair]) -> (String, Vec<Range<usize>>) {
     let mut out = String::with_capacity(text.len());
     let mut spans = Vec::with_capacity(pairs.len());
     let mut copied = 0;
-    for (open, close) in pairs {
+    for LoosePair { open, close, room } in pairs {
         let inside = &text[open.end..close.start];
         out.push_str(&text[copied..open.start]);
-        if out.ends_with(|c: char| !sheds_space(c)) {
+        if open.start > room.start && out.ends_with(|c: char| !c.is_whitespace()) {
             out.push_str(&inside[..inside.len() - inside.trim_start().len()]);
         }
         let start = out.len();
@@ -455,19 +482,14 @@ fn tighten(text: &str, pairs: &[MarkerPair]) -> (String, Vec<Range<usize>>) {
         out.push_str(inside.trim());
         out.push_str(&text[close.clone()]);
         spans.push(start..out.len());
-        if text[close.end..].starts_with(|c: char| !sheds_space(c)) {
+        let after = &text[close.end..];
+        if close.end < room.end && after.starts_with(|c: char| !c.is_whitespace()) {
             out.push_str(&inside[inside.trim_end().len()..]);
         }
         copied = close.end;
     }
     out.push_str(&text[copied..]);
     (out, spans)
-}
-
-/// Whether whitespace moved next to `c` is dropped instead: `c` is
-/// whitespace already, or a marker that the whitespace would loosen in turn.
-fn sheds_space(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '*' | '_' | '~')
 }
 
 /// Collect where `node`'s emphasis lies in the source, markers included.
@@ -652,8 +674,14 @@ mod tests {
         assert_eq!(tighten_emphasis("**Note: **the rest"), "**Note:** the rest");
         assert_eq!(tighten_emphasis("so** bold** it is"), "so **bold** it is");
         assert_eq!(tighten_emphasis("a ** bold** b"), "a **bold** b");
-        // A space moved next to the closing underscore would undo the italics.
+        // A space moved out to just inside the italics or the strikethrough
+        // the bold sits in would undo them.
         assert_eq!(tighten_emphasis("_a **b **_"), "_a **b**_");
+        assert_eq!(tighten_emphasis("~~** a** b~~"), "~~**a** b~~");
+        // Next to markers of their own, the words still need their space.
+        assert_eq!(tighten_emphasis("**a **_b_"), "**a** _b_");
+        assert_eq!(tighten_emphasis("~~a~~** b**"), "~~a~~ **b**");
+        assert_eq!(tighten_emphasis("**a **_b"), "**a** _b");
         assert_eq!(
             tighten_emphasis("*italic * and ***both ***"),
             "*italic* and ***both***"
