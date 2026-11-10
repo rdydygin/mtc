@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc, time::SystemTime};
+use std::{borrow::Cow, ops::Range, sync::Arc, time::SystemTime};
 
 use gpui_kit::{Context, Entity, EventEmitter, SharedString, Task};
 use mattermost::{ChannelId, Client, Millis, Post, PostId, PostList, Reaction, UserId};
@@ -582,10 +582,11 @@ impl Timeline {
                 post.metadata
                     .reactions
                     .iter()
-                    .map(|r| r.emoji_name.as_str()),
+                    .map(|r| Cow::from(r.emoji_name.as_str())),
             );
         }
         if !names.is_empty() {
+            let names = names.iter().map(|name| name.as_ref());
             self.emoji.update(cx, |emoji, cx| emoji.ensure(names, cx));
         }
     }

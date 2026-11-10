@@ -7,7 +7,7 @@
 //! chat) render as ordinary text, which is far cheaper than a Markdown
 //! document with its own parser state.
 
-use std::{ops::Range, sync::Arc};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 
 use markdown::mdast;
 
@@ -66,10 +66,10 @@ pub fn emojify(text: &str, custom: &CustomEmojis) -> String {
         }
         Piece::Shortcode(name) => {
             // Standard emoji win: the server refuses custom names that clash.
-            if let Some(emoji) = emoji_for(name) {
+            if let Some(emoji) = emoji_for(&name) {
                 out.push_str(emoji);
                 true
-            } else if let Some(url) = custom.image_url(name) {
+            } else if let Some(url) = custom.image_url(&name) {
                 out.push_str(&format!("![:{name}:]({url})"));
                 true
             } else {
@@ -82,16 +82,17 @@ pub fn emojify(text: &str, custom: &CustomEmojis) -> String {
 
 /// The `:shortcode:` names outside code in `text` that could be custom
 /// emoji: well formed and not a standard emoji. Some may name nothing.
-pub fn custom_emoji_names(text: &str) -> Vec<&str> {
+pub fn custom_emoji_names(text: &str) -> Vec<Cow<'_, str>> {
     let mut names = Vec::new();
     if text.contains(':') {
-        scan(text, |piece| {
-            if let Piece::Shortcode(name) = piece
-                && emoji_for(name).is_none()
-            {
-                names.push(name);
+        scan(text, |piece| match piece {
+            Piece::Text(_) => true,
+            Piece::Shortcode(name) => {
+                if emoji_for(&name).is_none() {
+                    names.push(name);
+                }
+                false
             }
-            matches!(piece, Piece::Text(_))
         });
     }
     names
@@ -120,8 +121,8 @@ fn is_name_char(c: char) -> bool {
 enum Piece<'a> {
     /// Text to keep as it is.
     Text(&'a str),
-    /// A `:name:` outside code.
-    Shortcode(&'a str),
+    /// The name in a `:name:` outside code.
+    Shortcode(Cow<'a, str>),
 }
 
 /// Split `text` into plain text and `:shortcode:`s outside code. `piece`
@@ -161,14 +162,12 @@ fn scan_line<'a>(line: &'a str, piece: &mut impl FnMut(Piece<'a>) -> bool) {
         }
         // `after` starts with ':'.
         let candidate = &after[1..];
-        let end = candidate
-            .find(|c: char| !is_name_char(c))
-            .unwrap_or(candidate.len());
+        let end = name_end(candidate);
         let name = &candidate[..end];
         if !in_code
             && !name.is_empty()
             && candidate[end..].starts_with(':')
-            && piece(Piece::Shortcode(name))
+            && piece(Piece::Shortcode(unescape_name(name)))
         {
             rest = &candidate[end + 1..];
             continue;
@@ -177,6 +176,32 @@ fn scan_line<'a>(line: &'a str, piece: &mut impl FnMut(Piece<'a>) -> bool) {
         rest = candidate;
     }
     piece(Piece::Text(rest));
+}
+
+/// Where the emoji name that starts `text` ends. An underscore may be
+/// written `\_`: editors that escape Markdown do that to every one, and the
+/// text would show the same name either way.
+fn name_end(text: &str) -> usize {
+    let mut end = 0;
+    loop {
+        let rest = &text[end..];
+        if rest.starts_with(r"\_") {
+            end += 2;
+        } else if rest.starts_with(is_name_char) {
+            end += 1;
+        } else {
+            return end;
+        }
+    }
+}
+
+/// An emoji name without the backslashes [`name_end`] let through.
+fn unescape_name(name: &str) -> Cow<'_, str> {
+    if name.contains('\\') {
+        name.replace(r"\_", "_").into()
+    } else {
+        name.into()
+    }
 }
 
 /// Look up a Mattermost emoji name, which mostly follows GitHub shortcodes.
@@ -439,6 +464,29 @@ mod tests {
         );
         assert!(
             !PreparedMessage::new("no :party-parrot: here", &CustomEmojis::default()).is_rich()
+        );
+    }
+
+    #[test]
+    fn shortcodes_may_escape_their_underscores() {
+        let custom = CustomEmojis::new([(
+            "party_parrot".to_string(),
+            "https://chat.example.com/api/v4/emoji/e1/image".to_string(),
+        )]);
+        assert_eq!(
+            emojify(r":party\_parrot: :white\_check\_mark:", &custom),
+            "![:party_parrot:](https://chat.example.com/api/v4/emoji/e1/image) ✅"
+        );
+        for text in [
+            r":not\_an\_emoji:",
+            r"`:party\_parrot:`",
+            r":party\parrot: :party\\_parrot:",
+        ] {
+            assert_eq!(emojify(text, &custom), text);
+        }
+        assert_eq!(
+            custom_emoji_names(r":party\_parrot: :white\_check\_mark: :a\b:"),
+            ["party_parrot"]
         );
     }
 
