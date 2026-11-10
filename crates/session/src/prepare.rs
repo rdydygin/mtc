@@ -7,7 +7,9 @@
 //! chat) render as ordinary text, which is far cheaper than a Markdown
 //! document with its own parser state.
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
+
+use markdown::mdast;
 
 use crate::CustomEmojis;
 
@@ -200,58 +202,82 @@ pub fn mention_username(url: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
-/// Turn `@username` outside code into a link that [`mention_username`] reads
-/// back. As in Mattermost, an `@` inside a word (an email address) starts no
-/// mention, and a trailing `.`, `-`, or `_` ends the sentence, not the name.
-/// `@channel`, `@all`, and `@here` stay text: they name no one person.
+/// Turn `@username` in a message's text into a link that [`mention_username`]
+/// reads back. As in Mattermost, an `@` inside a word (an email address)
+/// starts no mention, and a trailing `.`, `-`, or `_` ends the sentence, not
+/// the name. `@channel`, `@all`, and `@here` stay text: they name no one
+/// person.
+///
+/// Only text counts: code in all its forms, math, HTML, and links (whose text
+/// can't hold another link) are left as written. Telling them apart takes the
+/// Markdown parser the text view uses, so it runs only on messages with an
+/// `@` that could start a mention.
 fn link_mentions(text: &str) -> String {
-    if !text.contains('@') {
+    let maybe_mention = text
+        .match_indices('@')
+        .any(|(ix, _)| mention_at(&text[ix + 1..]).is_some());
+    if !maybe_mention {
         return text.to_string();
     }
+    let Ok(tree) = markdown::to_mdast(text, &parse_options()) else {
+        return text.to_string();
+    };
+    let mut runs: Vec<Range<usize>> = Vec::new();
+    text_runs(&tree, &mut runs);
     let mut out = String::with_capacity(text.len() + 32);
-    let mut in_fence = false;
-    for (line_ix, line) in text.split('\n').enumerate() {
-        if line_ix > 0 {
-            out.push('\n');
-        }
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-        }
-        if in_fence || !line.contains('@') {
-            out.push_str(line);
-            continue;
-        }
-        let mut in_code = false;
-        // Unclosed `[`s: inside a link's text, where links can't nest.
-        let mut brackets = 0usize;
-        let mut copied = 0;
-        let mut prev = None;
-        for (ix, c) in line.char_indices() {
-            match c {
-                '`' => in_code = !in_code,
-                '[' if !in_code => brackets += 1,
-                ']' if !in_code => brackets = brackets.saturating_sub(1),
-                '@' if !in_code && brackets == 0 && starts_mention(prev) => {
-                    // Part of a URL or a link's target, such as
-                    // `https://example.com/?to=@ann` or `[x](mailto:@ann)`.
-                    let token = line[..ix].rsplit(char::is_whitespace).next();
-                    let in_link = token.is_some_and(|t| t.contains("://") || t.contains("]("));
-                    if let Some(name) = mention_at(&line[ix + 1..]).filter(|_| !in_link) {
-                        out.push_str(&line[copied..ix]);
-                        out.push_str(&format!(
-                            "[@{name}]({MENTION_SCHEME}{})",
-                            name.to_ascii_lowercase()
-                        ));
-                        copied = ix + 1 + name.len();
-                    }
-                }
-                _ => {}
+    let mut copied = 0;
+    for run in runs {
+        let mut prev = text[..run.start].chars().next_back();
+        for (ix, c) in text[run.clone()].char_indices() {
+            let at = run.start + ix;
+            if c == '@'
+                && starts_mention(prev)
+                && let Some(name) = mention_at(&text[at + 1..run.end])
+            {
+                out.push_str(&text[copied..at]);
+                out.push_str(&format!(
+                    "[@{name}]({MENTION_SCHEME}{})",
+                    name.to_ascii_lowercase()
+                ));
+                copied = at + 1 + name.len();
             }
             prev = Some(c);
         }
-        out.push_str(&line[copied..]);
     }
+    out.push_str(&text[copied..]);
     out
+}
+
+/// The parser options `TextView` renders Markdown with: GitHub's dialect,
+/// with math.
+fn parse_options() -> markdown::ParseOptions {
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.math_text = true;
+    options.constructs.math_flow = true;
+    options
+}
+
+/// Collect where `node`'s text lies in the source, in order, outside links.
+/// Runs that touch are joined, so a name split across two text nodes reads
+/// as one.
+fn text_runs(node: &mdast::Node, runs: &mut Vec<Range<usize>>) {
+    match node {
+        mdast::Node::Text(text) => {
+            if let Some(position) = &text.position {
+                let run = position.start.offset..position.end.offset;
+                match runs.last_mut() {
+                    Some(last) if last.end == run.start => last.end = run.end,
+                    _ => runs.push(run),
+                }
+            }
+        }
+        mdast::Node::Link(_) | mdast::Node::LinkReference(_) => {}
+        _ => {
+            for child in node.children().into_iter().flatten() {
+                text_runs(child, runs);
+            }
+        }
+    }
 }
 
 /// Whether an `@` after `prev` can start a mention: not inside a word or a
@@ -445,6 +471,10 @@ mod tests {
             "(cc [@Bob.Smith](mention:bob.smith), [@c-d_e](mention:c-d_e).)"
         );
         assert_eq!(link_mentions("**@ann**"), "**[@ann](mention:ann)**");
+        assert_eq!(
+            link_mentions("> @ann\n- @bob `@x`\n\n| a |\n| - |\n| @cy |"),
+            "> [@ann](mention:ann)\n- [@bob](mention:bob) `@x`\n\n| a |\n| - |\n| [@cy](mention:cy) |"
+        );
         assert_eq!(mention_username("mention:ann"), Some("ann"));
         assert_eq!(mention_username("https://example.com"), None);
     }
@@ -458,6 +488,10 @@ mod tests {
             "[@ann](https://example.com) [x](mailto:@ann) [cc @ann](https://x.y)",
             "@channel @Here @all: lunch",
             "@1password \\@ann @ @_x",
+            "``@ann`` and `` a ` @ann ``",
+            "~~~\n@ann\n~~~\n\n````\n```\n@ann\n````",
+            "    @ann\n\npara\n\n    @ann",
+            "$@ann$\n\n<div>\n@ann\n</div>",
         ] {
             assert_eq!(link_mentions(text), text);
         }

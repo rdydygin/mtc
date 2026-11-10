@@ -6822,6 +6822,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "log",
+ "markdown",
  "mattermost",
  "serde_json",
 ]
