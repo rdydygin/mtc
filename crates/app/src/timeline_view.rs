@@ -504,10 +504,10 @@ impl TimelineView {
                     });
                 }
             }
-            PostAction::MessageAuthor => {
+            PostAction::MessageUser(user) => {
                 let task = self
                     .session
-                    .update(cx, |s, cx| s.open_direct_channel(post.user_id.clone(), cx));
+                    .update(cx, |s, cx| s.open_direct_channel(user, cx));
                 cx.spawn_in(window, async move |this, cx| match task.await {
                     Ok(channel) => {
                         let _ = this
@@ -586,6 +586,7 @@ impl TimelineView {
             .thread_entry(self.kind.root().is_none())
             .highlighted(self.flashed.as_ref() == Some(entry.id()))
             .client(session.client().clone())
+            .directory(session.directory().clone())
             .custom_emoji(session.custom_emoji().clone())
             .into_any_element()
     }

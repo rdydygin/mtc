@@ -91,6 +91,14 @@ pub enum Delivery {
     Failed,
 }
 
+fn prepare(post: &Post, custom: &CustomEmojis) -> PreparedMessage {
+    if post.is_system() {
+        PreparedMessage::system(&post.message, custom)
+    } else {
+        PreparedMessage::new(&post.message, custom)
+    }
+}
+
 /// One post as the UI shows it.
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -101,7 +109,7 @@ pub struct Entry {
 
 impl Entry {
     fn new(post: Post, delivery: Delivery, custom: &CustomEmojis) -> Self {
-        let message = PreparedMessage::new(&post.message, custom);
+        let message = prepare(&post, custom);
         Self {
             post: Arc::new(post),
             message,
@@ -131,7 +139,7 @@ impl Entry {
         if !self.post.message.contains(':') {
             return false;
         }
-        let message = PreparedMessage::new(&self.post.message, custom);
+        let message = prepare(&self.post, custom);
         let changed = message != self.message;
         self.message = message;
         changed

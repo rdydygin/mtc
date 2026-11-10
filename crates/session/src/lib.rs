@@ -20,10 +20,11 @@ mod session;
 mod threads;
 mod timeline;
 
-pub use directory::Directory;
+pub use directory::{Directory, UsernameLookup};
 pub use emoji::{CustomEmojis, EmojiStore};
 pub use prepare::{
-    PreparedMessage, custom_emoji_names, emoji_for, emoji_name, emojify, needs_rich_text,
+    PreparedMessage, custom_emoji_names, emoji_for, emoji_name, emojify, mention_username,
+    needs_rich_text,
 };
 pub use search::{SEARCH_PAGE_SIZE, search_terms};
 pub use session::{ChannelEntry, Connection, Session, SessionEvent};

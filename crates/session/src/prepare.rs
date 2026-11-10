@@ -2,8 +2,8 @@
 //!
 //! Runs once when a post enters a timeline, never during render: emoji
 //! shortcodes become Unicode (or, for the server's custom emoji, an inline
-//! image), bare URLs become CommonMark autolinks, and the message is
-//! classified as plain or rich. Plain messages (the majority in
+//! image), `@username`s become links to the person, bare URLs become
+//! CommonMark autolinks, and the message is classified as plain or rich. Plain messages (the majority in
 //! chat) render as ordinary text, which is far cheaper than a Markdown
 //! document with its own parser state.
 
@@ -20,7 +20,17 @@ pub struct PreparedMessage {
 
 impl PreparedMessage {
     pub fn new(message: &str, custom: &CustomEmojis) -> Self {
-        let text = autolink(&emojify(message, custom));
+        Self::from_text(autolink(&link_mentions(&emojify(message, custom))))
+    }
+
+    /// A system message, such as "@ann joined the channel." These are drawn
+    /// as plain text, so their mentions stay as written rather than turning
+    /// into link syntax.
+    pub fn system(message: &str, custom: &CustomEmojis) -> Self {
+        Self::from_text(autolink(&emojify(message, custom)))
+    }
+
+    fn from_text(text: String) -> Self {
         let rich = needs_rich_text(&text);
         Self {
             text: text.into(),
@@ -175,6 +185,95 @@ pub fn emoji_for(name: &str) -> Option<&'static str> {
         other => other,
     };
     emojis::get_by_shortcode(name).map(|e| e.as_str())
+}
+
+/// What a mention links to: this, then the username.
+const MENTION_SCHEME: &str = "mention:";
+
+/// Mentions that address everyone in the channel, not one person.
+const GROUP_MENTIONS: [&str; 3] = ["all", "channel", "here"];
+
+/// The username a mention link leads to, for a link [`PreparedMessage::new`]
+/// made from `@username`.
+pub fn mention_username(url: &str) -> Option<&str> {
+    url.strip_prefix(MENTION_SCHEME)
+        .filter(|name| !name.is_empty())
+}
+
+/// Turn `@username` outside code into a link that [`mention_username`] reads
+/// back. As in Mattermost, an `@` inside a word (an email address) starts no
+/// mention, and a trailing `.`, `-`, or `_` ends the sentence, not the name.
+/// `@channel`, `@all`, and `@here` stay text: they name no one person.
+fn link_mentions(text: &str) -> String {
+    if !text.contains('@') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut in_fence = false;
+    for (line_ix, line) in text.split('\n').enumerate() {
+        if line_ix > 0 {
+            out.push('\n');
+        }
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+        if in_fence || !line.contains('@') {
+            out.push_str(line);
+            continue;
+        }
+        let mut in_code = false;
+        // Unclosed `[`s: inside a link's text, where links can't nest.
+        let mut brackets = 0usize;
+        let mut copied = 0;
+        let mut prev = None;
+        for (ix, c) in line.char_indices() {
+            match c {
+                '`' => in_code = !in_code,
+                '[' if !in_code => brackets += 1,
+                ']' if !in_code => brackets = brackets.saturating_sub(1),
+                '@' if !in_code && brackets == 0 && starts_mention(prev) => {
+                    // Part of a URL or a link's target, such as
+                    // `https://example.com/?to=@ann` or `[x](mailto:@ann)`.
+                    let token = line[..ix].rsplit(char::is_whitespace).next();
+                    let in_link = token.is_some_and(|t| t.contains("://") || t.contains("]("));
+                    if let Some(name) = mention_at(&line[ix + 1..]).filter(|_| !in_link) {
+                        out.push_str(&line[copied..ix]);
+                        out.push_str(&format!(
+                            "[@{name}]({MENTION_SCHEME}{})",
+                            name.to_ascii_lowercase()
+                        ));
+                        copied = ix + 1 + name.len();
+                    }
+                }
+                _ => {}
+            }
+            prev = Some(c);
+        }
+        out.push_str(&line[copied..]);
+    }
+    out
+}
+
+/// Whether an `@` after `prev` can start a mention: not inside a word or a
+/// path, and not escaped.
+fn starts_mention(prev: Option<char>) -> bool {
+    !prev.is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '/' | '\\' | '@'))
+}
+
+/// The username at the start of `rest`, the text after an `@`: a letter,
+/// then letters, digits, `.`, `-`, and `_`, without trailing punctuation.
+fn mention_at(rest: &str) -> Option<&str> {
+    if !rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+        .unwrap_or(rest.len());
+    let name = rest[..end].trim_end_matches(['.', '-', '_']);
+    (!GROUP_MENTIONS
+        .iter()
+        .any(|group| name.eq_ignore_ascii_case(group)))
+    .then_some(name)
 }
 
 /// Wrap bare `http(s)://` URLs in `<…>` so Markdown renders them as links.
@@ -336,6 +435,41 @@ mod tests {
             autolink("(see https://example.com/a)."),
             "(see <https://example.com/a>)."
         );
+    }
+
+    #[test]
+    fn mentions_become_links_to_the_person() {
+        assert_eq!(link_mentions("hi @ann!"), "hi [@ann](mention:ann)!");
+        assert_eq!(
+            link_mentions("(cc @Bob.Smith, @c-d_e.)"),
+            "(cc [@Bob.Smith](mention:bob.smith), [@c-d_e](mention:c-d_e).)"
+        );
+        assert_eq!(link_mentions("**@ann**"), "**[@ann](mention:ann)**");
+        assert_eq!(mention_username("mention:ann"), Some("ann"));
+        assert_eq!(mention_username("https://example.com"), None);
+    }
+
+    #[test]
+    fn mentions_skip_addresses_code_links_and_groups() {
+        for text in [
+            "mail bob@example.com",
+            "`@ann` and\n```\n@ann\n```",
+            "https://medium.com/@ann and https://x.y/?to=@ann",
+            "[@ann](https://example.com) [x](mailto:@ann) [cc @ann](https://x.y)",
+            "@channel @Here @all: lunch",
+            "@1password \\@ann @ @_x",
+        ] {
+            assert_eq!(link_mentions(text), text);
+        }
+    }
+
+    #[test]
+    fn mentions_make_a_message_rich_except_in_system_messages() {
+        let none = CustomEmojis::default();
+        assert!(PreparedMessage::new("hi @ann", &none).is_rich());
+        let system = PreparedMessage::system("@ann joined the channel.", &none);
+        assert_eq!(system.text().as_ref(), "@ann joined the channel.");
+        assert!(!system.is_rich());
     }
 
     #[test]

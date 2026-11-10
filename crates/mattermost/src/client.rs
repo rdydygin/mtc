@@ -458,6 +458,14 @@ impl Client {
         self.post("users/ids".into(), ids).await
     }
 
+    /// The users with these usernames. Names no one has are left out.
+    pub async fn users_by_usernames(&self, usernames: Vec<String>) -> Result<Vec<User>> {
+        if usernames.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.post("users/usernames".into(), usernames).await
+    }
+
     /// The members of each group message, keyed by channel. The server
     /// names group messages after members' usernames; clients rebuild the
     /// name from these profiles.

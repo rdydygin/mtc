@@ -9,13 +9,25 @@ use mattermost::{Client, Status, User, UserId};
 
 use crate::EmojiStore;
 
+/// Where looking up a username stands, short of having found the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsernameLookup {
+    /// Asked for; the answer hasn't arrived.
+    Pending,
+    /// No one has the username.
+    Missing,
+    /// The lookup failed. Asking again tries again.
+    Failed,
+}
+
 /// Users and their presence, fetched on demand.
 ///
 /// Callers ask for users with [`Directory::ensure`]; requests made within one
 /// short window are coalesced into a single `users/ids` call, so a page of
 /// posts by forty authors costs one request, not forty. Users remembered
 /// from an earlier run ([`Directory::remember`]) show at once and are asked
-/// for again the same way.
+/// for again the same way. People mentioned by name are looked up one at a
+/// time, as they're clicked ([`Directory::ensure_username`]).
 pub struct Directory {
     client: Client,
     /// Where the custom emoji in users' statuses are looked up.
@@ -28,6 +40,8 @@ pub struct Directory {
     /// can tell when it is out of date.
     revision: u64,
     statuses: HashMap<UserId, Status>,
+    /// Usernames asked about that aren't known users.
+    usernames: HashMap<String, UsernameLookup>,
     queued: HashSet<UserId>,
     in_flight: HashSet<UserId>,
     flush_task: Option<Task<()>>,
@@ -47,6 +61,7 @@ impl Directory {
             remembered: HashSet::new(),
             revision: 0,
             statuses: HashMap::new(),
+            usernames: HashMap::new(),
             queued: HashSet::new(),
             in_flight: HashSet::new(),
             flush_task: None,
@@ -59,6 +74,17 @@ impl Directory {
 
     pub fn users(&self) -> impl Iterator<Item = &Arc<User>> {
         self.users.values()
+    }
+
+    /// The known user with `username`. Usernames are lowercase.
+    pub fn user_by_username(&self, username: &str) -> Option<&Arc<User>> {
+        self.users.values().find(|user| user.username == username)
+    }
+
+    /// Where looking up `username` stands, if it was asked for and hasn't
+    /// found the user.
+    pub fn username_lookup(&self, username: &str) -> Option<UsernameLookup> {
+        self.usernames.get(username).copied()
     }
 
     /// Changes whenever a user is added or changed.
@@ -99,6 +125,55 @@ impl Directory {
                 let _ = this.update(cx, |this, cx| this.flush(cx));
             }));
         }
+    }
+
+    /// Look up the user with `username`, such as someone a message mentions,
+    /// unless known or already asked about. A user remembered from an earlier
+    /// run is confirmed, as [`Self::ensure`] does.
+    pub fn ensure_username(&mut self, username: &str, cx: &mut Context<Self>) {
+        if let Some(user) = self.user_by_username(username) {
+            let id = user.id.clone();
+            self.ensure([id], cx);
+            return;
+        }
+        if matches!(
+            self.usernames.get(username),
+            Some(UsernameLookup::Pending | UsernameLookup::Missing)
+        ) {
+            return;
+        }
+        let username = username.to_string();
+        self.usernames
+            .insert(username.clone(), UsernameLookup::Pending);
+        cx.notify();
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let users = client.users_by_usernames(vec![username.clone()]).await;
+            let statuses = match &users {
+                Ok(users) if !users.is_empty() => client
+                    .statuses_by_ids(users.iter().map(|user| user.id.clone()).collect())
+                    .await
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let _ = this.update(cx, |this, cx| match users {
+                Ok(users) if users.is_empty() => {
+                    this.usernames.insert(username, UsernameLookup::Missing);
+                    cx.notify();
+                }
+                Ok(users) => {
+                    this.usernames.remove(&username);
+                    this.statuses.extend(statuses);
+                    this.insert(users, cx);
+                }
+                Err(err) => {
+                    log::warn!("looking up @{username}: {err:#}");
+                    this.usernames.insert(username, UsernameLookup::Failed);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn flush(&mut self, cx: &mut Context<Self>) {
@@ -236,12 +311,12 @@ mod tests {
 
     use gpui_kit::{AppContext as _, Entity, TestAppContext};
     use mattermost::{
-        Client, User,
+        Client, Status, User,
         testing::{Network, Reply, Request, SlowServer},
     };
     use serde_json::json;
 
-    use super::Directory;
+    use super::{Directory, UsernameLookup};
     use crate::EmojiStore;
 
     fn route(request: &Request) -> Reply {
@@ -310,6 +385,65 @@ mod tests {
         directory.update(cx, |d, cx| d.ensure(["ann".into()], cx));
         cx.run_until_parked();
         assert_eq!(requests(&server), 1);
+    }
+
+    /// A server whose username lookups all answer `users`.
+    fn usernames_server(users: serde_json::Value) -> SlowServer {
+        SlowServer::start(
+            Network::new(Duration::from_millis(50)),
+            move |request| match request.path() {
+                "/api/v4/users/usernames" => Reply::json(users.clone()),
+                "/api/v4/users/status/ids" => {
+                    Reply::json(json!([{ "user_id": "ann", "status": "online" }]))
+                }
+                _ => Reply::not_found(),
+            },
+        )
+    }
+
+    fn username_lookups(server: &SlowServer) -> usize {
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.path() == "/api/v4/users/usernames")
+            .count()
+    }
+
+    #[gpui_kit::test]
+    fn a_username_finds_the_user_and_their_presence(cx: &mut TestAppContext) {
+        let server = usernames_server(json!([{ "id": "ann", "username": "ann" }]));
+        let directory = start(&server, cx);
+        directory.update(cx, |d, cx| {
+            d.ensure_username("ann", cx);
+            assert_eq!(d.username_lookup("ann"), Some(UsernameLookup::Pending));
+        });
+        wait_until(cx, |cx| {
+            directory.read_with(cx, |d, _| d.user_by_username("ann").is_some())
+        });
+        directory.read_with(cx, |d, _| {
+            assert_eq!(d.username_lookup("ann"), None);
+            assert_eq!(d.status(&"ann".into()), Status::Online);
+        });
+
+        directory.update(cx, |d, cx| d.ensure_username("ann", cx));
+        cx.run_until_parked();
+        assert_eq!(username_lookups(&server), 1, "a known user costs nothing");
+    }
+
+    #[gpui_kit::test]
+    fn a_username_no_one_has_is_asked_about_once(cx: &mut TestAppContext) {
+        let server = usernames_server(json!([]));
+        let directory = start(&server, cx);
+        directory.update(cx, |d, cx| d.ensure_username("nobody", cx));
+        wait_until(cx, |cx| {
+            directory.read_with(cx, |d, _| {
+                d.username_lookup("nobody") == Some(UsernameLookup::Missing)
+            })
+        });
+
+        directory.update(cx, |d, cx| d.ensure_username("nobody", cx));
+        cx.run_until_parked();
+        assert_eq!(username_lookups(&server), 1);
     }
 
     #[gpui_kit::test]
