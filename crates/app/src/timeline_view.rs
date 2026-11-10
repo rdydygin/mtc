@@ -7,7 +7,6 @@ use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, StyledExt as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
     h_flex,
-    message_scroller::{MessageScroller, MessageScrollerState},
     popover::Popover,
     spinner::Spinner,
     text::{TextView, TextViewState},
@@ -29,6 +28,7 @@ use crate::{
     http::avatar_url,
     image_viewer,
     post_row::{PostAction, PostActionHandler, PostRow},
+    post_scroller::{PostScroller, PostScrollerState},
     time,
 };
 
@@ -53,7 +53,7 @@ pub struct TimelineView {
     kind: TimelineKind,
     session: Entity<Session>,
     timeline: Entity<Timeline>,
-    scroller: Entity<MessageScrollerState>,
+    scroller: Entity<PostScrollerState>,
     composer: Entity<Composer>,
     /// Parsed Markdown for rich posts, kept for the life of the view so
     /// scrolling back never re-parses.
@@ -91,7 +91,7 @@ impl TimelineView {
     ) -> Self {
         let timeline = session.update(cx, |s, cx| s.timeline(kind.clone(), cx));
         let count = timeline.read(cx).entries().len();
-        let scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
+        let scroller = cx.new(|cx| PostScrollerState::new(count, cx));
         let placeholder = Self::placeholder(&kind, &session, cx);
         let target = UploadTarget {
             client: session.read(cx).client().clone(),
@@ -321,10 +321,13 @@ impl TimelineView {
         Some(ix)
     }
 
-    fn on_scroll(&mut self, scroller: Entity<MessageScrollerState>, cx: &mut Context<Self>) {
-        let top = scroller.read(cx).logical_scroll_top().item_ix;
+    fn on_scroll(&mut self, scroller: Entity<PostScrollerState>, cx: &mut Context<Self>) {
+        let scroller = scroller.read(cx);
+        // Posts that don't fill the viewport leave the oldest of them on
+        // screen with no way to scroll up to it.
+        let near_top = scroller.fits() || scroller.logical_scroll_top().item_ix < PREFETCH_ROWS;
         let timeline = self.timeline.read(cx);
-        if top < PREFETCH_ROWS && timeline.has_older() && !timeline.is_loading_older() {
+        if near_top && timeline.has_older() && !timeline.is_loading_older() {
             self.timeline.update(cx, |t, cx| t.load_older(cx));
         }
     }
@@ -851,26 +854,19 @@ impl TimelineView {
             _ => {
                 let view = cx.entity().downgrade();
                 let loading_older = timeline.is_loading_older();
-                let row_style = {
-                    let mut style = StyleRefinement::default();
-                    style.padding.left = Some(gpui_kit::px(0.).into());
-                    style.padding.right = Some(gpui_kit::px(0.).into());
-                    style.padding.bottom = Some(gpui_kit::px(0.).into());
-                    style
-                };
                 div()
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .child(
-                        MessageScroller::new("posts", self.scroller.clone(), move |ix, _, cx| {
+                    .child(PostScroller::new(
+                        "posts",
+                        self.scroller.clone(),
+                        move |ix, _, cx| {
                             view.upgrade()
                                 .map(|v| v.read(cx).render_row(ix, &v.downgrade(), cx))
                                 .unwrap_or_else(|| div().into_any_element())
-                        })
-                        .with_row_style(row_style)
-                        .with_bottom_fade(theme.background),
-                    )
+                        },
+                    ))
                     .when(loading_older, |this| {
                         this.child(
                             h_flex()
@@ -996,7 +992,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use gpui_kit::{Bounds, TestAppContext, WindowBounds, WindowOptions, point, px, size};
+    use gpui_kit::{Bounds, Pixels, TestAppContext, WindowBounds, WindowOptions, point, px, size};
     use mattermost::{
         Client, TeamId, User,
         testing::{Network, Reply, Request, SlowServer},
@@ -1062,6 +1058,15 @@ mod tests {
         server: &SlowServer,
         cx: &mut TestAppContext,
     ) -> (Entity<TimelineView>, Rc<RefCell<Vec<PostId>>>) {
+        open_channel_in(px(600.), server, cx)
+    }
+
+    /// [`open_channel`] in a window of the given height.
+    fn open_channel_in(
+        height: Pixels,
+        server: &SlowServer,
+        cx: &mut TestAppContext,
+    ) -> (Entity<TimelineView>, Rc<RefCell<Vec<PostId>>>) {
         cx.executor().allow_parking();
         cx.update(gpui_kit::init);
         let client = Client::new_unverified(&server.url(), "token").unwrap();
@@ -1076,7 +1081,7 @@ mod tests {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: point(px(0.), px(0.)),
-                    size: size(px(800.), px(600.)),
+                    size: size(px(800.), height),
                 })),
                 ..Default::default()
             };
@@ -1098,7 +1103,7 @@ mod tests {
             .detach()
         });
         wait_until(cx, |cx| {
-            view.read_with(cx, |v, cx| v.timeline.read(cx).entries().len() == 60)
+            view.read_with(cx, |v, cx| v.timeline.read(cx).entries().len() >= 60)
         });
         (view, threads)
     }
@@ -1109,6 +1114,16 @@ mod tests {
             .iter()
             .filter(|r| r.path().contains("before="))
             .count()
+    }
+
+    #[gpui_kit::test]
+    fn posts_that_dont_fill_the_window_bring_older_ones(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        // Tall enough to show the newest page with room to spare.
+        let (view, _) = open_channel_in(px(4000.), &server, cx);
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, cx| v.timeline.read(cx).entries().len() == 120)
+        });
     }
 
     #[gpui_kit::test]
