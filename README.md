@@ -203,11 +203,15 @@ notifications) is itself registered as the `Core` extension.
 
 ## Notes
 
-- The session token is stored in `state.json` in the platform config directory
+- On macOS the session token is kept in the login keychain (a generic password named
+  `mtc`, with the server address as its account); a token saved by an older version is
+  moved there on the next launch. Because releases are ad-hoc signed, macOS may ask once
+  after each update whether mtc may use it; choose Always Allow. Preferences and the
+  rest of the session are stored in `state.json` in the platform config directory
   (`~/Library/Application Support/mtc` on macOS, `~/.config/mtc` on Linux,
-  `%APPDATA%\mtc` on Windows). On macOS and Linux the file is owner-only; on Windows
-  it relies on your profile folder's permissions. Moving it to the system keychain is a
-  natural next step.
+  `%APPDATA%\mtc` on Windows). Where there is no keychain (Linux and Windows for now),
+  or it refuses, the token stays in that file: owner-only on macOS and Linux, relying on
+  your profile folder's permissions on Windows.
 - Not implemented yet: search across all channels, @mention autocomplete, multiple
   servers.
 

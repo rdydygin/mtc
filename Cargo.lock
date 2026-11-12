@@ -4551,6 +4551,7 @@ dependencies = [
  "log",
  "mattermost",
  "reqwest",
+ "security-framework",
  "semver",
  "serde",
  "serde_json",
