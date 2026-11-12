@@ -1,14 +1,10 @@
 //! The session token in the system keychain, one item per server.
 //!
 //! On macOS the token is a generic password in the login keychain (service
-//! [`SERVICE`], account the server URL). Elsewhere there is no keychain yet:
+//! `mtc`, account the server URL). Elsewhere there is no keychain yet:
 //! [`set`] fails, and [`crate::persist`] keeps the token in its file as before.
 
 use anyhow::Result;
-
-/// The keychain item's service, as Keychain Access shows it under Name.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const SERVICE: &str = "mtc";
 
 /// The token saved for `server`, or `None` if there is none.
 pub fn get(server: &str) -> Result<Option<String>> {
@@ -30,7 +26,8 @@ mod imp {
     use anyhow::{Context as _, Result};
     use security_framework::passwords;
 
-    use super::SERVICE;
+    /// The keychain item's service, as Keychain Access shows it under Name.
+    const SERVICE: &str = "mtc";
 
     /// `errSecItemNotFound`
     const NOT_FOUND: i32 = -25300;
