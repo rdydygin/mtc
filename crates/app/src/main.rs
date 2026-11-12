@@ -16,6 +16,7 @@ mod download;
 mod extensions;
 mod http;
 mod image_viewer;
+mod keychain;
 mod lang_icon;
 mod login;
 mod palette;
