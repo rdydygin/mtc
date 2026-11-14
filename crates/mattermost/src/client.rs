@@ -9,9 +9,9 @@ use url::Url;
 use crate::{
     runtime,
     types::{
-        Channel, ChannelId, ChannelMember, ChannelUnreadAt, CustomStatus, Emoji, EmojiId, FileInfo,
-        Millis, Post, PostId, PostList, PostSearch, Preference, Status, Team, TeamId, User,
-        UserAutocomplete, UserId, UserStatus, UserThread, UserThreads,
+        AutocompleteCommand, Channel, ChannelId, ChannelMember, ChannelUnreadAt, CustomStatus,
+        Emoji, EmojiId, FileInfo, Millis, Post, PostId, PostList, PostSearch, Preference, Status,
+        Team, TeamId, User, UserAutocomplete, UserId, UserStatus, UserThread, UserThreads,
     },
 };
 
@@ -827,6 +827,12 @@ impl Client {
         .await
     }
 
+    /// List the team's autocomplete-enabled server slash commands.
+    pub async fn autocomplete_commands(&self, team: &TeamId) -> Result<Vec<AutocompleteCommand>> {
+        self.get(format!("teams/{team}/commands/autocomplete"))
+            .await
+    }
+
     /// Run a server-side slash command such as `/invite` in `channel`.
     pub async fn execute_command(
         &self,
@@ -992,6 +998,34 @@ mod tests {
 
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         futures::executor::block_on(future)
+    }
+
+    #[test]
+    fn command_autocomplete_requests_the_team_list() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            if request.method() == "GET"
+                && request.path() == "/api/v4/teams/team/commands/autocomplete"
+            {
+                Reply::json(
+                    json!([{"trigger":"poll", "auto_complete_hint":"[question]", "auto_complete_desc":"Create a poll"}]),
+                )
+            } else {
+                Reply::not_found()
+            }
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let commands = block_on(client.autocomplete_commands(&"team".into())).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].trigger(), "poll");
+        assert_eq!(commands[0].hint(), "[question]");
+        assert_eq!(commands[0].description(), "Create a poll");
+        assert!(
+            server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "GET"
+                    && r.path() == "/api/v4/teams/team/commands/autocomplete")
+        );
     }
 
     #[test]

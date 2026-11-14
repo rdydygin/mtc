@@ -11,9 +11,9 @@ use gpui_kit::{
     WeakEntity,
 };
 use mattermost::{
-    ApiError, Channel, ChannelId, ChannelMember, ChannelType, Client, CustomStatus, Event,
-    EventStream, FAVORITE_CHANNEL, FileInfo, Millis, Post, PostId, Preference, Reaction, Status,
-    Team, TeamId, User, UserId,
+    ApiError, AutocompleteCommand, Channel, ChannelId, ChannelMember, ChannelType, Client,
+    CustomStatus, Event, EventStream, FAVORITE_CHANNEL, FileInfo, Millis, Post, PostId, Preference,
+    Reaction, Status, Team, TeamId, User, UserId,
 };
 
 use crate::{
@@ -164,6 +164,9 @@ pub struct Session {
     directory: Entity<Directory>,
     teams: Vec<Team>,
     team: Option<TeamId>,
+    commands: HashMap<TeamId, Vec<AutocompleteCommand>>,
+    _commands_task: Option<Task<()>>,
+    commands_generation: u64,
     channels: HashMap<ChannelId, ChannelEntry>,
     /// Completed lists invalidate older channel hydration.
     channel_list_generation: u64,
@@ -268,6 +271,9 @@ impl Session {
             directory,
             teams: Vec::new(),
             team: preferred_team,
+            commands: HashMap::new(),
+            _commands_task: None,
+            commands_generation: 0,
             channels: HashMap::new(),
             channel_list_generation: 0,
             team_revision: 0,
@@ -447,6 +453,7 @@ impl Session {
         // fills one round trip sooner. The list corrects a stale guess.
         let guess = self.team.clone();
         if guess.is_some() {
+            self.refresh_commands(cx);
             self.load_channels(cx);
         }
         let client = self.client.clone();
@@ -471,6 +478,7 @@ impl Session {
                         }
                     }
                     if this.team != guess || guess.is_none() {
+                        this.refresh_commands(cx);
                         this.channels.clear();
                         this.channels_state = LoadState::NotLoaded;
                         this.load_channels(cx);
@@ -500,11 +508,43 @@ impl Session {
         }
         self.team_revision += 1;
         self.team = Some(team);
+        self.refresh_commands(cx);
         self.channels.clear();
         self.channel_list_generation += 1;
         self.channels_state = LoadState::NotLoaded;
         self.load_channels(cx);
         cx.notify();
+    }
+
+    /// Cached server commands for the selected team, available during refreshes.
+    pub fn autocomplete_commands(&self) -> &[AutocompleteCommand] {
+        self.team
+            .as_ref()
+            .and_then(|team| self.commands.get(team))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn refresh_commands(&mut self, cx: &mut Context<Self>) {
+        self._commands_task = None;
+        self.commands_generation += 1;
+        let generation = self.commands_generation;
+        let Some(team) = self.team.clone() else {
+            return;
+        };
+        let client = self.client.clone();
+        self._commands_task = Some(cx.spawn(async move |this, cx| {
+            let result = client.autocomplete_commands(&team).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.commands_generation != generation {
+                    return;
+                }
+                if let Ok(commands) = result {
+                    this.commands.insert(team, commands);
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn load_channels(&mut self, cx: &mut Context<Self>) {
@@ -1821,6 +1861,7 @@ impl Session {
                     if self.teams.is_empty() {
                         self.load_teams(cx);
                     } else {
+                        self.refresh_commands(cx);
                         self.load_channels(cx);
                     }
                     self.load_favorites(cx);
@@ -2246,6 +2287,82 @@ mod slow_network_tests {
             .detach();
         wait_until(cx, |_| result.borrow().is_some());
         result.borrow_mut().take().unwrap()
+    }
+
+    #[gpui_kit::test]
+    fn commands_cache_by_team_refresh_on_switch_and_reconnect_and_keep_cache_on_error(
+        cx: &mut TestAppContext,
+    ) {
+        let version = Arc::new(AtomicUsize::new(1));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let version = version.clone();
+            move |request| {
+                if request.method() == "GET"
+                    && matches!(
+                        request.path(),
+                        "/api/v4/teams/team/commands/autocomplete"
+                            | "/api/v4/teams/other/commands/autocomplete"
+                    )
+                {
+                    let n = version.load(Ordering::SeqCst);
+                    if n == 4 {
+                        return Reply::not_found();
+                    }
+                    return Reply::json(json!([{"trigger":format!("cmd{n}")}]));
+                }
+                route(request)
+            }
+        });
+        let session = start(&server, cx);
+        let loaded = |cx: &mut TestAppContext, name: &str| {
+            session.read_with(cx, |s, _| {
+                s.autocomplete_commands()
+                    .first()
+                    .is_some_and(|c| c.trigger() == name)
+            })
+        };
+        wait_until(cx, |cx| loaded(cx, "cmd1"));
+        let count = || {
+            server
+                .requests()
+                .iter()
+                .filter(|r| {
+                    r.method() == "GET" && r.path() == "/api/v4/teams/team/commands/autocomplete"
+                })
+                .count()
+        };
+        let initial = count();
+        session.update(cx, |s, cx| s.select_team("team".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(count(), initial, "selecting the same team reuses its list");
+        version.store(2, Ordering::SeqCst);
+        session.update(cx, |s, cx| s.select_team("other".into(), cx));
+        assert!(session.read_with(cx, |s, _| s.autocomplete_commands().is_empty()));
+        wait_until(cx, |cx| loaded(cx, "cmd2"));
+        session.update(cx, |s, cx| s.select_team("team".into(), cx));
+        assert!(
+            loaded(cx, "cmd1"),
+            "switching back immediately exposes that team's cache"
+        );
+        wait_until(cx, |cx| loaded(cx, "cmd2"));
+        assert_eq!(count(), initial + 1);
+        version.store(3, Ordering::SeqCst);
+        session.update(cx, |s, cx| {
+            s.has_connected = true;
+            s.handle_event(mattermost::Event::Connected, cx);
+        });
+        wait_until(cx, |cx| loaded(cx, "cmd3"));
+        assert_eq!(count(), initial + 2);
+        version.store(4, Ordering::SeqCst);
+        let failures = failures(&session, cx);
+        session.update(cx, |s, cx| s.handle_event(mattermost::Event::Connected, cx));
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| {
+                s._commands_task.as_ref().is_some_and(|t| t.is_ready())
+            })
+        });
+        assert!(loaded(cx, "cmd3"));
+        assert!(failures.borrow().is_empty());
     }
 
     #[gpui_kit::test]
