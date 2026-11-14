@@ -6,7 +6,7 @@
 //! first row after them, so rows map one-to-one onto timeline entries and
 //! the virtual list never has to translate indices.
 
-use std::{rc::Rc, sync::Arc};
+use std::{collections::HashMap, rc::Rc, sync::Arc};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -525,18 +525,17 @@ impl PostRow {
         }
         // Group by emoji, keeping first-use order.
         let mut groups: Vec<(&str, usize, bool)> = Vec::new();
+        let mut indices = HashMap::new();
         for reaction in reactions {
             let mine = reaction.user_id == self.me;
-            match groups
-                .iter_mut()
-                .find(|(name, ..)| *name == reaction.emoji_name)
-            {
-                Some(group) => {
-                    group.1 += 1;
-                    group.2 |= mine;
-                }
-                None => groups.push((&reaction.emoji_name, 1, mine)),
-            }
+            let ix = *indices
+                .entry(reaction.emoji_name.as_str())
+                .or_insert_with(|| {
+                    groups.push((&reaction.emoji_name, 0, false));
+                    groups.len() - 1
+                });
+            groups[ix].1 += 1;
+            groups[ix].2 |= mine;
         }
         Some(
             h_flex()

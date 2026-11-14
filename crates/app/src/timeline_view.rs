@@ -55,7 +55,7 @@ pub struct TimelineView {
     timeline: Entity<Timeline>,
     scroller: Entity<PostScrollerState>,
     composer: Entity<Composer>,
-    /// Parsed Markdown for rich posts, kept for the life of the view so
+    /// Parsed Markdown for live rich posts, kept so
     /// scrolling back never re-parses.
     rich_text: HashMap<PostId, Entity<TextViewState>>,
     /// The first post the user hasn't seen.
@@ -263,6 +263,12 @@ impl TimelineView {
         match event {
             TimelineEvent::Reset => self.rebuild(cx),
             TimelineEvent::Spliced { old, new_count } => {
+                if !old.is_empty() {
+                    let timeline = self.timeline.read(cx);
+                    let live: std::collections::HashSet<&PostId> =
+                        timeline.entries().iter().map(|e| e.id()).collect();
+                    self.rich_text.retain(|id, _| live.contains(id));
+                }
                 for ix in old.start..old.start + new_count {
                     self.sync_rich_text(ix, cx);
                 }
@@ -1114,6 +1120,34 @@ mod tests {
             .iter()
             .filter(|r| r.path().contains("before="))
             .count()
+    }
+
+    #[gpui_kit::test]
+    fn deleting_a_post_releases_its_parsed_rich_text(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            if request.path().split('?').next() == Some("/api/v4/channels/town/posts") {
+                let mut page = posts(60..120);
+                page["posts"]["n70"]["message"] = json!("**rich post**");
+                page["posts"]["n71"]["message"] = json!("**keep this post**");
+                Reply::json(page)
+            } else {
+                route(request)
+            }
+        });
+        let (view, _) = open_channel(&server, cx);
+        let (timeline, parsed) = view.read_with(cx, |v, _| {
+            (
+                v.timeline.clone(),
+                v.rich_text[&PostId::from("n70")].downgrade(),
+            )
+        });
+        timeline.update(cx, |t, cx| t.remove(&"n70".into(), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            assert!(!v.rich_text.contains_key(&PostId::from("n70")));
+            assert!(v.rich_text.contains_key(&PostId::from("n71")));
+        });
+        assert!(parsed.upgrade().is_none());
     }
 
     #[gpui_kit::test]
