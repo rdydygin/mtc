@@ -1,15 +1,20 @@
 //! The message field.
 //!
 //! Enter sends, Shift-Enter adds a line, Up in an empty field edits your
-//! last message, Escape cancels an edit, and Tab completes a slash command.
+//! last message, Escape dismisses suggestions or cancels an edit. Tab or Enter
+//! accepts a visible suggestion; Enter sends when there are no suggestions.
 //! The composer only reports intent; its owner decides what sending means.
 //!
 //! Files come in through the attach button, drag and drop, or pasting an
 //! image. Each uploads at once, so sending is instant; a message can't be
 //! sent while an upload is still running.
 
+mod suggestions;
+
+use suggestions::{Kind, Suggestion, Token, channel_matches, token_at, user_matches};
+
 use gpui_kit::assets::IconName;
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _,
@@ -17,21 +22,22 @@ use gpui_kit::component::{
         Attachment, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentStatus,
         AttachmentTitle,
     },
+    avatar::Avatar,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{
-        Escape, IndentInline, InputEvent, MoveDown, MoveUp, Position, Textarea, TextareaState,
-    },
+    input::{Enter, Escape, IndentInline, InputEvent, MoveDown, MoveUp, Textarea, TextareaState},
     list::ListItem,
     v_flex,
 };
 use gpui_kit::{
-    AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Image, ImageFormat, ImageSource, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement as _, PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, WeakEntity, Window, div, prelude::FluentBuilder as _,
+    AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity, EntityInputHandler as _,
+    EventEmitter, FocusHandle, Focusable, Image, ImageFormat, ImageSource, InteractiveElement as _,
+    IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div,
+    prelude::FluentBuilder as _,
 };
-use mattermost::{ChannelId, Client, FileInfo};
+use mattermost::{ChannelId, Client, FileInfo, TeamId, UserAutocomplete};
+use session::Session;
 
 use crate::extensions;
 
@@ -79,8 +85,15 @@ pub struct Composer {
     editing: bool,
     saved_draft: Option<String>,
     focus_handle: FocusHandle,
-    selected_command: usize,
-    commands_dismissed: bool,
+    selected_suggestion: usize,
+    dismissed: Option<Token>,
+    token: Option<Token>,
+    composing: bool,
+    session: Option<Entity<Session>>,
+    lookup_team: Option<TeamId>,
+    lookup_generation: u64,
+    remote_users: Vec<Arc<mattermost::User>>,
+    _lookup: Option<Task<()>>,
     target: UploadTarget,
     files: Vec<PendingFile>,
     next_file_id: u64,
@@ -105,17 +118,25 @@ impl Composer {
                 .placeholder(placeholder)
         });
         if let Some(draft) = draft {
-            input.update(cx, |state, cx| state.set_value(draft, window, cx));
+            input.update(cx, |state, cx| {
+                state.set_value(draft.clone(), window, cx);
+                state.set_selected_range(draft.len()..draft.len(), cx);
+            });
         }
         let subscription =
             cx.subscribe_in(
                 &input,
                 window,
                 |this, input, event, window, cx| match event {
-                    InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
+                    InputEvent::PressEnter { shift: false, .. } => {
+                        if !this.composing {
+                            this.submit(window, cx);
+                        }
+                    }
                     InputEvent::Change => {
-                        this.selected_command = 0;
-                        this.commands_dismissed = false;
+                        this.selected_suggestion = 0;
+                        this.dismissed = None;
+                        this.refresh_suggestions(window, cx);
                         if !input.read(cx).value().is_empty() {
                             cx.emit(ComposerEvent::Typing);
                         }
@@ -125,6 +146,11 @@ impl Composer {
                     _ => {}
                 },
             );
+        // Input observation also tracks caret/selection and IME changes, which
+        // do not emit InputEvent::Change.
+        let caret = cx.observe_in(&input, window, |this, _, window, cx| {
+            this.refresh_suggestions(window, cx);
+        });
         let focus_handle = cx.focus_handle();
         let focus_in = cx.on_focus_in(&focus_handle, window, |_, _, cx| cx.notify());
         let focus_out = cx.on_focus_out(&focus_handle, window, |_, _, _, cx| cx.notify());
@@ -133,12 +159,19 @@ impl Composer {
             editing: false,
             saved_draft: None,
             focus_handle,
-            selected_command: 0,
-            commands_dismissed: false,
+            selected_suggestion: 0,
+            dismissed: None,
+            token: None,
+            composing: false,
+            session: None,
+            lookup_team: None,
+            lookup_generation: 0,
+            remote_users: Vec::new(),
+            _lookup: None,
             target,
             files: Vec::new(),
             next_file_id: 0,
-            _subscriptions: vec![subscription, focus_in, focus_out],
+            _subscriptions: vec![subscription, caret, focus_in, focus_out],
         }
     }
 
@@ -353,10 +386,11 @@ impl Composer {
     }
 
     pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_command = 0;
-        self.commands_dismissed = false;
+        self.selected_suggestion = 0;
+        self.dismissed = None;
         self.input.update(cx, |state, cx| {
-            state.set_value(text.to_string(), window, cx)
+            state.set_value(text.to_string(), window, cx);
+            state.set_selected_range(text.len()..text.len(), cx);
         });
         // Programmatic set_value deliberately suppresses InputEvent::Change.
         // Callers establish editing/saved_draft before replacing the input.
@@ -394,6 +428,141 @@ impl Composer {
         cx.emit(ComposerEvent::CancelEdit);
     }
 
+    /// Share the live directory and joined channels with this conversation.
+    pub fn with_session(
+        mut self,
+        session: Entity<Session>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let directory = session.read(cx).directory().clone();
+        self._subscriptions
+            .push(cx.observe(&directory, |_, _, cx| cx.notify()));
+        self._subscriptions
+            .push(cx.observe_in(&session, window, |this, _, window, cx| {
+                this.refresh_suggestions(window, cx);
+                cx.notify();
+            }));
+        self.session = Some(session);
+        self.refresh_suggestions(window, cx);
+        self
+    }
+
+    fn current_token(&self, cx: &gpui_kit::App) -> Option<Token> {
+        let input = self.input.read(cx);
+        if self.composing || !input.selected_range().is_empty() {
+            return None;
+        }
+        let token = token_at(&input.value(), input.cursor())?;
+        if token.kind == Kind::Command && self.editing {
+            return None;
+        }
+        Some(token)
+    }
+
+    fn refresh_suggestions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composing = self.input.update(cx, |input, cx| {
+            input.marked_text_range(window, cx).is_some()
+        });
+        let token = self.current_token(cx);
+        let team = self
+            .session
+            .as_ref()
+            .and_then(|s| s.read(cx).team().map(|t| t.id.clone()));
+        if token == self.token && team == self.lookup_team {
+            return;
+        }
+        self.lookup_generation += 1;
+        self._lookup = None;
+        self.remote_users.clear();
+        self.selected_suggestion = 0;
+        self.dismissed = None;
+        self.token = token.clone();
+        self.lookup_team = team.clone();
+        cx.notify();
+        let (Some(token), Some(team)) = (token, team) else {
+            return;
+        };
+        if token.kind != Kind::Person {
+            return;
+        }
+        let client = self.target.client.clone();
+        let channel = self.target.channel.clone();
+        let generation = self.lookup_generation;
+        self._lookup = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(180))
+                .await;
+            // Check again after debounce: the caret may have moved before its
+            // observer runs. Requests already on the wire have the same guard.
+            if !this
+                .update(cx, |this, cx| {
+                    this.lookup_is_current(generation, &token, cx)
+                })
+                .unwrap_or(false)
+            {
+                return;
+            }
+            if let Ok(users) = client
+                .autocomplete_users(&team, &channel, &token.query)
+                .await
+            {
+                let _ = this.update(cx, |this, cx| {
+                    this.receive_users(generation, &token, users, cx)
+                });
+            }
+        }));
+    }
+
+    fn lookup_is_current(&self, generation: u64, token: &Token, cx: &gpui_kit::App) -> bool {
+        self.lookup_generation == generation
+            && self.dismissed.as_ref() != Some(token)
+            && self.current_token(cx).as_ref() == Some(token)
+            && self
+                .session
+                .as_ref()
+                .and_then(|s| s.read(cx).team().map(|t| &t.id))
+                == self.lookup_team.as_ref()
+    }
+
+    fn receive_users(
+        &mut self,
+        generation: u64,
+        token: &Token,
+        users: UserAutocomplete,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.lookup_is_current(generation, token, cx) {
+            return;
+        }
+        // Preserve the active person if server ranking inserts rows above it.
+        let selected = self
+            .suggestion_matches(cx)
+            .get(self.selected_suggestion)
+            .map(|s| s.id.clone());
+        self.remote_users = users
+            .users()
+            .iter()
+            .chain(users.out_of_channel())
+            .cloned()
+            .map(Arc::new)
+            .collect();
+        if let Some(session) = &self.session {
+            let directory = session.read(cx).directory().clone();
+            directory.update(cx, |d, cx| {
+                d.insert(self.remote_users.iter().map(|u| u.as_ref().clone()), cx)
+            });
+        }
+        if let Some(selected) = selected {
+            self.selected_suggestion = self
+                .suggestion_matches(cx)
+                .iter()
+                .position(|s| s.id == selected)
+                .unwrap_or(0);
+        }
+        cx.notify();
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !event.keystroke.modifiers.modified() {
             self.handle_key(&event.keystroke.key, window, cx);
@@ -402,26 +571,44 @@ impl Composer {
 
     /// Input actions run before raw key events, so both paths share this handler.
     fn handle_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let matches = self.command_matches(cx);
+        self.refresh_suggestions(window, cx);
+        if self.composing {
+            cx.propagate();
+            return;
+        }
+        let matches = self.suggestion_matches(cx);
         if !matches.is_empty() {
             match key {
                 "up" => {
-                    self.selected_command =
-                        (self.selected_command + matches.len() - 1) % matches.len();
+                    self.selected_suggestion =
+                        (self.selected_suggestion + matches.len() - 1) % matches.len()
                 }
-                "down" => {
-                    self.selected_command = (self.selected_command + 1) % matches.len();
+                "down" => self.selected_suggestion = (self.selected_suggestion + 1) % matches.len(),
+                "tab" | "enter" => {
+                    let completion =
+                        &matches[self.selected_suggestion.min(matches.len() - 1)].completion;
+                    self.complete_suggestion(completion, window, cx);
                 }
-                "tab" => {
-                    let completion = &matches[self.selected_command.min(matches.len() - 1)].0;
-                    self.complete_command(completion, window, cx);
+                "escape" => {
+                    self.dismissed = self.current_token(cx);
+                    self.lookup_generation += 1;
+                    self._lookup = None;
                 }
-                "escape" => self.commands_dismissed = true,
                 _ => {
                     cx.propagate();
                     return;
                 }
             }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        // A lookup can have no local rows yet. Escape still dismisses that
+        // pending surface, rather than letting its eventual response reopen it.
+        if key == "escape" && self._lookup.is_some() && self.current_token(cx).is_some() {
+            self.dismissed = self.current_token(cx);
+            self.lookup_generation += 1;
+            self._lookup = None;
             cx.notify();
             cx.stop_propagation();
             return;
@@ -439,94 +626,163 @@ impl Composer {
         }
     }
 
-    fn complete_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let text = format!("/{name} ");
-        self.set_text(&text, window, cx);
-        self.input.update(cx, |state, cx| {
-            state.set_cursor_position(
-                Position::new(0, text.encode_utf16().count() as u32),
-                window,
-                cx,
-            );
-        });
-    }
-
-    /// Slash commands matching a partially typed `/name`.
-    fn command_matches(
-        &self,
-        cx: &gpui_kit::App,
-    ) -> Vec<(SharedString, SharedString, SharedString)> {
-        if self.commands_dismissed || self.editing {
-            return Vec::new();
-        }
-        let text = self.input.read(cx).value();
-        let Some(prefix) = text.strip_prefix('/') else {
-            return Vec::new();
-        };
-        if prefix.contains(char::is_whitespace) {
-            return Vec::new();
-        }
-        extensions::slash_commands(cx)
-            .iter()
-            .filter(|c| c.name().starts_with(prefix))
-            .take(6)
-            .map(|c| {
-                (
-                    c.name().clone(),
-                    c.hint_text().clone(),
-                    c.description().clone(),
-                )
-            })
-            .collect()
-    }
-
-    fn render_command_matches(
-        &self,
+    fn complete_suggestion(
+        &mut self,
+        completion: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        let _ = window;
-        let matches = self.command_matches(cx);
+    ) {
+        let Some(token) = self.current_token(cx) else {
+            return;
+        };
+        // Use the input's edit operation to retain undo history and place the
+        // caret after the inserted space. GPUI's input handler uses UTF-16.
+        let text = self.text(cx);
+        let range = text[..token.range.start].encode_utf16().count()
+            ..text[..token.range.end].encode_utf16().count();
+        self.input.update(cx, |state, cx| {
+            state.replace_text_in_range(Some(range), &format!("{completion} "), window, cx);
+        });
+        self.refresh_suggestions(window, cx);
+        self.focus_handle(cx).focus(window, cx);
+    }
+
+    fn suggestion_matches(&self, cx: &gpui_kit::App) -> Vec<Suggestion> {
+        let Some(token) = self.current_token(cx) else {
+            return Vec::new();
+        };
+        if self.dismissed.as_ref() == Some(&token) {
+            return Vec::new();
+        }
+        match token.kind {
+            Kind::Command => extensions::slash_commands(cx)
+                .iter()
+                .filter(|c| c.name().starts_with(&token.query))
+                .take(6)
+                .map(|c| Suggestion {
+                    id: format!("command-{}", c.name()),
+                    completion: format!("/{}", c.name()),
+                    label: format!("/{}", c.name()),
+                    detail: format!("{} {}", c.hint_text(), c.description())
+                        .trim()
+                        .to_string(),
+                    user: None,
+                })
+                .collect(),
+            Kind::Channel => {
+                let Some(session) = &self.session else {
+                    return Vec::new();
+                };
+                let session = session.read(cx);
+                let Some(team) = session.team() else {
+                    return Vec::new();
+                };
+                channel_matches(
+                    session.channels().map(|e| e.channel()),
+                    &team.id,
+                    &token.query,
+                )
+            }
+            Kind::Person => {
+                let mut local = self
+                    .session
+                    .as_ref()
+                    .map(|s| {
+                        s.read(cx)
+                            .directory()
+                            .read(cx)
+                            .users()
+                            .filter(|u| user_matches(u, &token.query))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                local.sort_by_key(|u| (u.username.to_lowercase(), u.id.clone()));
+                let mut seen = HashSet::new();
+                let remote_current = self.token.as_ref() == Some(&token);
+                let mut matches: Vec<_> = self
+                    .remote_users
+                    .iter()
+                    .filter(|_| remote_current)
+                    .chain(local.iter())
+                    .filter(|u| user_matches(u, &token.query) && seen.insert(u.id.clone()))
+                    .take(6)
+                    .cloned()
+                    .map(Suggestion::person)
+                    .collect();
+                for (name, description) in [
+                    ("here", "Notify online members"),
+                    ("channel", "Notify channel members"),
+                    ("all", "Notify everyone"),
+                ] {
+                    if name.starts_with(&token.query) {
+                        matches.push(Suggestion {
+                            id: format!("mention-{name}"),
+                            completion: format!("@{name}"),
+                            label: format!("@{name}"),
+                            detail: description.into(),
+                            user: None,
+                        });
+                    }
+                }
+                matches
+            }
+        }
+    }
+
+    fn render_suggestions(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let matches = self.suggestion_matches(cx);
         if matches.is_empty() {
             return None;
         }
+        let selected = self.selected_suggestion.min(matches.len() - 1);
         let theme = cx.theme();
         Some(
             v_flex()
                 .py_1()
                 .border_b_1()
                 .border_color(theme.border)
-                .children(matches.into_iter().enumerate().map(
-                    |(ix, (name, hint, description))| {
-                        let completion = name.clone();
-                        ListItem::new(SharedString::from(format!("command-{name}")))
-                            .selected(ix == self.selected_command)
-                            .aria_selected(ix == self.selected_command)
-                            .accessibility_label(format!("/{name} {hint}: {description}"))
-                            .text_sm()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(div().font_semibold().child(format!("/{name}")))
-                                    .when(!hint.is_empty(), |this| {
-                                        this.child(
-                                            div().text_color(theme.muted_foreground).child(hint),
-                                        )
-                                    })
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_color(theme.muted_foreground)
-                                            .child(description),
-                                    ),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.complete_command(&completion, window, cx);
-                            }))
-                    },
-                )),
+                .children(matches.into_iter().enumerate().map(|(ix, suggestion)| {
+                    let completion = suggestion.completion.clone();
+                    let avatar = suggestion.user.as_ref().map(|user| {
+                        Avatar::new().name(suggestion.label.clone()).size_6().src(
+                            crate::http::avatar_url(
+                                &self.target.client,
+                                user.id.as_str(),
+                                user.last_picture_update,
+                            ),
+                        )
+                    });
+                    ListItem::new(SharedString::from(suggestion.id))
+                        .selected(ix == selected)
+                        .aria_selected(ix == selected)
+                        .accessibility_label(format!("{}: {}", suggestion.label, suggestion.detail))
+                        .text_sm()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .min_w_0()
+                                .children(avatar)
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_semibold()
+                                        .child(suggestion.label),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(theme.muted_foreground)
+                                        .child(suggestion.detail),
+                                ),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.complete_suggestion(&completion, window, cx)
+                        }))
+                })),
         )
     }
 }
@@ -539,8 +795,8 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let command_matches = self
-            .render_command_matches(window, cx)
+        let suggestions = self
+            .render_suggestions(cx)
             .map(IntoElement::into_any_element);
         let files = self.render_files(cx).map(IntoElement::into_any_element);
         let can_submit = self.can_submit(cx);
@@ -560,6 +816,13 @@ impl Render for Composer {
                     this.border_color(theme.ring)
                 })
                 .capture_key_down(cx.listener(Self::on_key_down))
+                .capture_action(cx.listener(|this, action: &Enter, window, cx| {
+                    if action.shift {
+                        cx.propagate();
+                    } else {
+                        this.handle_key("enter", window, cx);
+                    }
+                }))
                 .capture_action(
                     cx.listener(|this, _: &MoveUp, window, cx| this.handle_key("up", window, cx)),
                 )
@@ -606,7 +869,7 @@ impl Render for Composer {
                             ),
                     )
                 })
-                .children(command_matches)
+                .children(suggestions)
                 .children(files)
                 .child(
                     // Buttons sit in lanes one line tall, aligned to the
@@ -778,28 +1041,92 @@ mod tests {
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{AnyWindowHandle, TestAppContext, WindowOptions};
 
+    use mattermost::testing::{Network, Reply, Request, SlowServer};
+    use serde_json::json;
+    use std::time::Instant;
+
     use super::*;
 
+    fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting");
+            cx.executor().advance_clock(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn route(request: &Request) -> Reply {
+        match (
+            request.method(),
+            request.path().split('?').next().unwrap_or_default(),
+        ) {
+            ("GET", "/api/v4/users/me/teams") => Reply::json(json!([{"id":"team", "name":"team"}])),
+            ("GET", "/api/v4/users/me/teams/team/channels") => Reply::json(json!([
+                {"id":"town", "team_id":"team", "name":"town-square", "display_name":"Town Square"},
+                {"id":"talk", "team_id":"team", "name":"town-talk", "display_name":"Town Talk"}
+            ])),
+            ("GET", "/api/v4/users/autocomplete") => Reply::json(json!({
+                "users":[{"id":"ann", "username":"anna", "first_name":"Anna", "last_name":"Smith"}],
+                "out_of_channel":[{"id":"amy", "username":"amy", "first_name":"Amy"}]
+            })),
+            (
+                "GET",
+                "/api/v4/users/me/teams/team/channels/members"
+                | "/api/v4/users/me/preferences/favorite_channel"
+                | "/api/v4/emoji",
+            )
+            | ("POST", "/api/v4/users/status/ids") => Reply::json(json!([])),
+            _ => Reply::not_found(),
+        }
+    }
+
     fn open_composer(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Composer>) {
+        open_connected_composer(None, cx)
+    }
+
+    fn open_connected_composer(
+        server: Option<&SlowServer>,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<Composer>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             extensions::init(cx);
+        });
+        let session = server.map(|server| {
+            cx.executor().allow_parking();
+            let client = Client::new_unverified(&server.url(), "token").unwrap();
+            let me = serde_json::from_value(json!({"id":"me", "username":"zoe"})).unwrap();
+            let session = cx.new(|cx| Session::new(client, me, Some("team".into()), cx));
+            wait_until(cx, |cx| {
+                session.read_with(cx, |s, _| s.is_loaded() && s.team().is_some())
+            });
+            session
         });
         let composer = Rc::new(RefCell::new(None));
         let (handle, _) = cx.update(|cx| {
             let composer = composer.clone();
             gpui_kit::open_window(WindowOptions::default(), cx, move |window, cx| {
                 let view = cx.new(|cx| {
-                    Composer::new(
-                        "Message",
-                        Some("Unsent draft".into()),
-                        UploadTarget {
-                            client: Client::new_unverified("http://localhost:1", "token").unwrap(),
-                            channel: "town".into(),
-                        },
-                        window,
-                        cx,
-                    )
+                    let target = UploadTarget {
+                        client: session
+                            .as_ref()
+                            .map(|s| s.read(cx).client().clone())
+                            .unwrap_or_else(|| {
+                                Client::new_unverified("http://localhost:1", "token").unwrap()
+                            }),
+                        channel: "town".into(),
+                    };
+                    let composer =
+                        Composer::new("Message", Some("Unsent draft".into()), target, window, cx);
+                    match session {
+                        Some(session) => composer.with_session(session, window, cx),
+                        None => composer,
+                    }
                 });
                 view.focus_handle(cx).focus(window, cx);
                 *composer.borrow_mut() = Some(view.clone());
@@ -810,6 +1137,326 @@ mod tests {
         let composer = composer.borrow_mut().take().unwrap();
         cx.run_until_parked();
         (handle, composer)
+    }
+
+    #[gpui_kit::test]
+    fn mentions_replace_only_the_caret_token_and_enter_then_sends(cx: &mut TestAppContext) {
+        let (handle, composer) = open_composer(cx);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let sent = sent.clone();
+            cx.subscribe(&composer, move |_, event, _| {
+                if let ComposerEvent::Submit { text, .. } = event {
+                    sent.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| {
+                c.set_text("🙂 say (@he), next", window, cx);
+                c.input
+                    .update(cx, |input, cx| input.set_selected_range(13..13, cx));
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("mention-here").selected(), Some(true));
+            window.press("enter", cx);
+            assert_eq!(composer.read(cx).text(cx), "🙂 say (@here ), next");
+            assert_eq!(composer.read(cx).input.read(cx).cursor(), 16);
+            assert!(sent.borrow().is_empty());
+            window.input("now", cx);
+            assert_eq!(composer.read(cx).text(cx), "🙂 say (@here now), next");
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(&*sent.borrow(), &["🙂 say (@here now), next"]);
+    }
+
+    #[gpui_kit::test]
+    fn mentions_and_channels_share_keyboard_selection_and_dismissal(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("~town", window, cx));
+            window.render_frame(cx);
+            assert_eq!(window.find("channel-town").selected(), Some(true));
+            window.press("down", cx);
+            assert_eq!(window.find("channel-talk").selected(), Some(true));
+            window.press("tab", cx);
+            assert_eq!(composer.read(cx).text(cx), "~town-talk ");
+            composer.update(cx, |c, cx| c.set_text("@", window, cx));
+            window.press("up", cx);
+            assert_eq!(window.find("mention-all").selected(), Some(true));
+            window.press("escape", cx);
+            assert_eq!(composer.read(cx).text(cx), "@");
+            assert!(composer.read(cx).suggestion_matches(cx).is_empty());
+            assert!(composer.focus_handle(cx).is_focused(window));
+            window.input("he", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("tab", cx);
+            assert_eq!(composer.read(cx).text(cx), "@here ");
+            composer.update(cx, |c, cx| c.set_text("@he", window, cx));
+            window.press("shift-enter", cx);
+            assert_eq!(composer.read(cx).text(cx), "@he\n");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn autocomplete_is_debounced_ranked_and_rejects_stale_responses(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        let searches = || {
+            server
+                .requests()
+                .into_iter()
+                .filter(|r| {
+                    r.method() == "GET" && r.path().starts_with("/api/v4/users/autocomplete?")
+                })
+                .collect::<Vec<_>>()
+        };
+        // A local result is usable without waiting for the server.
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| {
+                let directory = c.session.as_ref().unwrap().read(cx).directory().clone();
+                directory.update(cx, |d, cx| {
+                    d.insert(
+                        [
+                            serde_json::from_value(json!({"id":"alice", "username":"alice"}))
+                                .unwrap(),
+                        ],
+                        cx,
+                    )
+                });
+                c.set_text("", window, cx);
+            });
+            window.input("@", cx);
+            window.input("a", cx);
+            assert_eq!(
+                composer.read(cx).suggestion_matches(cx)[0].completion,
+                "@alice"
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(searches().is_empty());
+        wait_until(cx, |cx| {
+            composer.read_with(cx, |c, _| c.remote_users.len() == 2)
+        });
+        assert_eq!(searches().len(), 1);
+        let requests = searches();
+        let path = requests
+            .iter()
+            .find(|r| r.path().contains("name=a"))
+            .unwrap()
+            .path()
+            .to_string();
+        assert!(
+            path.contains("in_team=team")
+                && path.contains("in_channel=town")
+                && path.contains("name=a"),
+            "{path}"
+        );
+        composer.read_with(cx, |c, cx| {
+            assert_eq!(
+                c.suggestion_matches(cx)
+                    .iter()
+                    .map(|s| s.completion.as_str())
+                    .collect::<Vec<_>>(),
+                ["@anna", "@amy", "@alice", "@all"]
+            );
+        });
+        assert_eq!(
+            composer.read_with(cx, |c, _| c.selected_suggestion),
+            2,
+            "preserve Alice when ranking inserts other users above her"
+        );
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| {
+                let generation = c.lookup_generation;
+                let token = c.current_token(cx).unwrap();
+                // Even returning to exactly the same query must not accept an
+                // earlier generation (the A → B → A race).
+                c.set_text("@b", window, cx);
+                c.refresh_suggestions(window, cx);
+                c.set_text("@a", window, cx);
+                c.refresh_suggestions(window, cx);
+                let stale =
+                    serde_json::from_value(json!({"users":[{"id":"wrong", "username":"a_wrong"}]}))
+                        .unwrap();
+                c.receive_users(generation, &token, stale, cx);
+                assert!(c.remote_users.is_empty());
+                // A response arriving after a caret move is rejected even if
+                // the input observer has not run yet.
+                let generation = c.lookup_generation;
+                c.input.update(cx, |s, cx| s.set_selected_range(0..0, cx));
+                c.receive_users(
+                    generation,
+                    &token,
+                    serde_json::from_value(json!({"users":[{"id":"wrong"}]})).unwrap(),
+                    cx,
+                );
+                assert!(c.remote_users.is_empty());
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn moving_the_caret_opens_suggestions_and_escape_cancels_pending_lookup(
+        cx: &mut TestAppContext,
+    ) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("@he next", window, cx));
+            assert!(composer.read(cx).suggestion_matches(cx).is_empty());
+            for _ in 0..5 {
+                window.press("left", cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(window.find("mention-here").selected(), Some(true));
+            window.press("tab", cx);
+            assert_eq!(composer.read(cx).text(cx), "@here  next");
+            composer.update(cx, |c, cx| c.set_text("@zz", window, cx));
+            composer.update(cx, |c, cx| c.refresh_suggestions(window, cx));
+            assert!(composer.read(cx)._lookup.is_some());
+            assert!(composer.read(cx).suggestion_matches(cx).is_empty());
+            window.press("escape", cx);
+            composer.read_with(cx, |c, cx| {
+                assert!(c._lookup.is_none());
+                assert!(c.dismissed.is_some());
+                assert_eq!(c.text(cx), "@zz");
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn url_suffixes_send_without_accepting_a_suggestion(cx: &mut TestAppContext) {
+        let (handle, composer) = open_composer(cx);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let sent = sent.clone();
+            cx.subscribe(&composer, move |_, event, _| {
+                if let ComposerEvent::Submit { text, .. } = event {
+                    sent.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        let urls = [
+            "https://example.com/?@he",
+            "https://example.com/#@he",
+            "www.example.com/?@he",
+        ];
+        for url in urls {
+            cx.update_window(handle, |_, window, cx| {
+                composer.update(cx, |c, cx| c.set_text(url, window, cx));
+                assert!(composer.read(cx).suggestion_matches(cx).is_empty());
+                window.press("enter", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            composer.read_with(cx, |c, cx| assert!(c.text(cx).is_empty()));
+        }
+        assert_eq!(&*sent.borrow(), &urls);
+    }
+
+    #[gpui_kit::test]
+    fn dismissing_or_replacing_a_lookup_closes_its_stalled_connection(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            if request.method() == "GET"
+                && request.path().split('?').next() == Some("/api/v4/users/autocomplete")
+            {
+                Reply::json(json!({"users": [], "out_of_channel": []})).stall_after(1)
+            } else {
+                route(request)
+            }
+        });
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        let matches = |request: &Request, name: &str| {
+            request.method() == "GET"
+                && request.path().split('?').next() == Some("/api/v4/users/autocomplete")
+                && request.path().ends_with(&format!("&name={name}"))
+        };
+        let set_query = |text: &str, cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| {
+                composer.update(cx, |c, cx| c.set_text(text, window, cx));
+            })
+            .unwrap();
+        };
+
+        // No local rows: Escape must cancel the pending HTTP operation too.
+        set_query("@zz", cx);
+        wait_until(cx, |_| server.requests().iter().any(|r| matches(r, "zz")));
+        assert!(
+            !server
+                .closed_stalled_requests()
+                .iter()
+                .any(|r| matches(r, "zz"))
+        );
+        cx.update_window(handle, |_, window, cx| window.press("escape", cx))
+            .unwrap();
+        wait_until(cx, |_| {
+            server
+                .closed_stalled_requests()
+                .iter()
+                .any(|r| matches(r, "zz"))
+        });
+
+        // A newer query must abort the old request while starting its own.
+        set_query("@a", cx);
+        wait_until(cx, |_| server.requests().iter().any(|r| matches(r, "a")));
+        set_query("@b", cx);
+        wait_until(cx, |_| {
+            server
+                .closed_stalled_requests()
+                .iter()
+                .any(|r| matches(r, "a"))
+        });
+        wait_until(cx, |_| server.requests().iter().any(|r| matches(r, "b")));
+        assert!(
+            !server
+                .closed_stalled_requests()
+                .iter()
+                .any(|r| matches(r, "b"))
+        );
+        cx.update_window(handle, |_, window, cx| window.press("escape", cx))
+            .unwrap();
+        wait_until(cx, |_| {
+            server
+                .closed_stalled_requests()
+                .iter()
+                .any(|r| matches(r, "b"))
+        });
+    }
+
+    #[gpui_kit::test]
+    fn composing_and_selected_text_do_not_offer_or_accept_suggestions(cx: &mut TestAppContext) {
+        let (handle, composer) = open_composer(cx);
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| {
+                c.set_text("@he", window, cx);
+                c.input.update(cx, |s, cx| s.set_selected_range(1..3, cx));
+                assert!(c.suggestion_matches(cx).is_empty());
+                c.input.update(cx, |s, cx| {
+                    s.set_selected_range(0..3, cx);
+                    s.replace_and_mark_text_in_range(None, "@he", Some(3..3), window, cx);
+                });
+                c.refresh_suggestions(window, cx);
+                assert!(c.composing);
+                assert!(c.suggestion_matches(cx).is_empty());
+            });
+            window.press("tab", cx);
+            assert!(!composer.read(cx).text(cx).contains("@here"));
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
@@ -886,27 +1533,27 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
-            let matches = composer.read(cx).command_matches(cx);
+            let matches = composer.read(cx).suggestion_matches(cx);
             assert_eq!(matches.len(), 6);
             assert!(
                 composer.focus_handle(cx).is_focused(window),
                 "composer must be focused"
             );
             window.press("up", cx);
-            assert_eq!(composer.read(cx).selected_command, 5);
+            assert_eq!(composer.read(cx).selected_suggestion, 5);
             window.press("down", cx);
-            assert_eq!(composer.read(cx).selected_command, 0);
+            assert_eq!(composer.read(cx).selected_suggestion, 0);
             window.press("down", cx);
-            assert_eq!(
-                window.find(format!("command-{}", matches[1].0)).selected(),
-                Some(true)
-            );
+            assert_eq!(window.find(matches[1].id.clone()).selected(), Some(true));
             window.press("tab", cx);
-            assert_eq!(composer.read(cx).text(cx), format!("/{} ", matches[1].0));
+            assert_eq!(
+                composer.read(cx).text(cx),
+                format!("{} ", matches[1].completion)
+            );
             window.input("argument", cx);
             assert_eq!(
                 composer.read(cx).text(cx),
-                format!("/{} argument", matches[1].0)
+                format!("{} argument", matches[1].completion)
             );
         })
         .unwrap();
@@ -918,7 +1565,7 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.press("escape", cx);
-            assert!(composer.read(cx).command_matches(cx).is_empty());
+            assert!(composer.read(cx).suggestion_matches(cx).is_empty());
             assert_eq!(composer.read(cx).text(cx), "/");
             window.press("right", cx);
             window.input("s", cx);
@@ -927,12 +1574,12 @@ mod tests {
         cx.run_until_parked();
         composer.read_with(cx, |c, cx| {
             assert!(
-                !c.command_matches(cx).is_empty(),
+                !c.suggestion_matches(cx).is_empty(),
                 "text={:?}, dismissed={}",
                 c.text(cx),
-                c.commands_dismissed
+                c.dismissed.is_some()
             );
-            assert_eq!(c.selected_command, 0);
+            assert_eq!(c.selected_suggestion, 0);
         });
         assert_eq!(*edits.borrow(), 0);
         cx.update_window(handle, |_, window, cx| {

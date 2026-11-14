@@ -102,6 +102,25 @@ pub struct User {
     pub props: serde_json::Map<String, serde_json::Value>,
 }
 
+/// People in the channel first, followed by matching people elsewhere in the team.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct UserAutocomplete {
+    // Some servers serialize an empty Go slice as null.
+    users: Option<Vec<User>>,
+    out_of_channel: Option<Vec<User>>,
+}
+
+impl UserAutocomplete {
+    pub fn users(&self) -> &[User] {
+        self.users.as_deref().unwrap_or_default()
+    }
+
+    pub fn out_of_channel(&self) -> &[User] {
+        self.out_of_channel.as_deref().unwrap_or_default()
+    }
+}
+
 /// A user-set status such as "🗓 In a meeting", shown beside their name.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
