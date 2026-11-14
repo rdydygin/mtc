@@ -355,7 +355,7 @@ mod tests {
     use gpui_kit::{AppContext as _, Entity, TestAppContext};
     use mattermost::{
         Client, Status, User,
-        testing::{Network, Reply, Request, SlowServer},
+        testing::{Gate, Network, Reply, Request, SlowServer},
     };
     use serde_json::json;
 
@@ -443,24 +443,31 @@ mod tests {
         lookup: fn(&mut Directory, &mut gpui_kit::Context<Directory>),
     ) {
         for status in [200, 503] {
-            let server =
-                SlowServer::start(Network::new(Duration::from_millis(50)), move |request| {
-                    match request.path() {
-                        "/api/v4/users/ids" | "/api/v4/users/usernames" => Reply::json(json!([
+            let statuses = Gate::default();
+            let server = SlowServer::start(Network::new(Duration::ZERO), {
+                let statuses = statuses.clone();
+                move |request| match (request.method(), request.path()) {
+                    ("POST", "/api/v4/users/ids" | "/api/v4/users/usernames") => {
+                        Reply::json(json!([
                             { "id": "ann", "username": "ann" }
-                        ])),
-                        "/api/v4/users/status/ids" => Reply::json(json!([])).status(status),
-                        _ => Reply::not_found(),
+                        ]))
                     }
-                });
+                    ("POST", "/api/v4/users/status/ids") => Reply::json(json!([]))
+                        .status(status)
+                        .wait_for(statuses.clone()),
+                    _ => Reply::not_found(),
+                }
+            });
             let directory = start(&server, cx);
             directory.update(cx, lookup);
             wait_until(cx, |_| {
                 server
                     .requests()
                     .iter()
-                    .any(|r| r.path() == "/api/v4/users/status/ids")
+                    .any(|r| r.method() == "POST" && r.path() == "/api/v4/users/status/ids")
             });
+            directory.read_with(cx, |d, _| assert!(!d.status_requests.is_empty()));
+            statuses.open();
             wait_until(cx, |cx| {
                 directory.read_with(cx, |d, _| d.status_requests.is_empty())
             });
@@ -488,20 +495,35 @@ mod tests {
             (Status::Online, Status::DoNotDisturb),
             (Status::DoNotDisturb, Status::Online),
         ] {
-            let server = SlowServer::start(Network::new(Duration::from_millis(50)), move |_| {
-                Reply::json(json!([
-                    { "user_id": "me", "status": old.as_str() },
-                    { "user_id": "ann", "status": "away" }
-                ]))
+            let statuses = Gate::default();
+            let server = SlowServer::start(Network::new(Duration::ZERO), {
+                let statuses = statuses.clone();
+                move |request| match (request.method(), request.path()) {
+                    ("POST", "/api/v4/users/status/ids") => Reply::json(json!([
+                        { "user_id": "me", "status": old.as_str() },
+                        { "user_id": "ann", "status": "away" }
+                    ]))
+                    .wait_for(statuses.clone()),
+                    _ => Reply::not_found(),
+                }
             });
             let directory = start(&server, cx);
             directory.update(cx, |d, cx| {
                 d.set_status("me".into(), new, cx);
                 d.refresh_statuses(vec!["me".into(), "ann".into()], cx);
             });
-            wait_until(cx, |_| !server.requests().is_empty());
+            wait_until(cx, |_| {
+                server
+                    .requests()
+                    .iter()
+                    .any(|r| r.method() == "POST" && r.path() == "/api/v4/users/status/ids")
+            });
             // Even a repeated status event supersedes the pending REST read.
             directory.update(cx, |d, cx| d.set_status("me".into(), new, cx));
+            directory.read_with(cx, |d, _| {
+                assert_eq!(d.status(&"ann".into()), Status::Offline)
+            });
+            statuses.open();
             wait_until(cx, |cx| {
                 directory.read_with(cx, |d, _| d.status(&"ann".into()) == Status::Away)
             });
@@ -512,19 +534,22 @@ mod tests {
     #[gpui_kit::test]
     fn user_lookups_keep_newer_status_changes(cx: &mut TestAppContext) {
         for by_username in [false, true] {
-            let server =
-                SlowServer::start(
-                    Network::new(Duration::from_millis(50)),
-                    |request| match request.path() {
-                        "/api/v4/users/ids" | "/api/v4/users/usernames" => Reply::json(json!([
+            let statuses = Gate::default();
+            let server = SlowServer::start(Network::new(Duration::ZERO), {
+                let statuses = statuses.clone();
+                move |request| match (request.method(), request.path()) {
+                    ("POST", "/api/v4/users/ids" | "/api/v4/users/usernames") => {
+                        Reply::json(json!([
                             { "id": "ann", "username": "ann" }
-                        ])),
-                        "/api/v4/users/status/ids" => Reply::json(json!([
-                            { "user_id": "ann", "status": "online" }
-                        ])),
-                        _ => Reply::not_found(),
-                    },
-                );
+                        ]))
+                    }
+                    ("POST", "/api/v4/users/status/ids") => Reply::json(json!([
+                        { "user_id": "ann", "status": "online" }
+                    ]))
+                    .wait_for(statuses.clone()),
+                    _ => Reply::not_found(),
+                }
+            });
             let directory = start(&server, cx);
             directory.update(cx, |d, cx| {
                 if by_username {
@@ -537,11 +562,13 @@ mod tests {
                 server
                     .requests()
                     .iter()
-                    .any(|r| r.path() == "/api/v4/users/status/ids")
+                    .any(|r| r.method() == "POST" && r.path() == "/api/v4/users/status/ids")
             });
             directory.update(cx, |d, cx| {
                 d.set_status("ann".into(), Status::DoNotDisturb, cx)
             });
+            directory.read_with(cx, |d, _| assert!(d.user(&"ann".into()).is_none()));
+            statuses.open();
             wait_until(cx, |cx| {
                 directory.read_with(cx, |d, _| d.user(&"ann".into()).is_some())
             });

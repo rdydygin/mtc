@@ -1867,43 +1867,46 @@ mod slow_network_tests {
     #[gpui_kit::test]
     fn channel_hydration_and_list_refresh_keep_completion_order(cx: &mut TestAppContext) {
         for hydrate_first in [true, false] {
-            let armed = Arc::new(AtomicBool::new(false));
-            let delay = armed.clone();
-            let waiting = Arc::new(AtomicBool::new(false));
-            let blocked = waiting.clone();
-            let (release, receive) = std::sync::mpsc::channel();
-            let receive = std::sync::Mutex::new(receive);
-            let lists = AtomicUsize::new(0);
-            let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
-                let path = request.path().split('?').next().unwrap_or_default();
-                let delayed = if hydrate_first {
-                    "/api/v4/users/me/teams/team/channels"
-                } else {
-                    "/api/v4/channels/design/members/me"
-                };
-                if path == delayed && delay.swap(false, Ordering::SeqCst) {
-                    blocked.store(true, Ordering::SeqCst);
-                    receive
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(10))
-                        .expect("release delayed response");
-                }
-                match path {
-                    "/api/v4/users/me/teams/team/channels" => {
+            let refreshing = Arc::new(AtomicBool::new(false));
+            let list = Gate::default();
+            let channel = Gate::default();
+            let member = Gate::default();
+            let server = SlowServer::start(Network::new(Duration::ZERO), {
+                let refreshing = refreshing.clone();
+                let list = list.clone();
+                let channel = channel.clone();
+                let member = member.clone();
+                let lists = AtomicUsize::new(0);
+                move |request| match (
+                    request.method(),
+                    request.path().split('?').next().unwrap_or_default(),
+                ) {
+                    ("GET", "/api/v4/users/me/teams/team/channels") => {
                         let snapshot = lists.fetch_add(1, Ordering::SeqCst);
-                        Reply::json(json!([{
+                        let reply = Reply::json(json!([{
                             "id": "town", "team_id": "team", "name": "town-square", "type": "O",
                             "display_name": format!("Snapshot {snapshot}")
-                        }]))
+                        }]));
+                        if refreshing.load(Ordering::SeqCst) {
+                            reply.wait_for(list.clone())
+                        } else {
+                            reply
+                        }
                     }
-                    "/api/v4/channels/design" => Reply::json(json!({
+                    ("GET", "/api/v4/users/me/teams/team/channels/members")
+                        if refreshing.load(Ordering::SeqCst) =>
+                    {
+                        route(request).wait_for(list.clone())
+                    }
+                    ("GET", "/api/v4/channels/design") => Reply::json(json!({
                         "id": "design", "team_id": "team", "name": "design", "type": "P"
-                    })),
-                    "/api/v4/channels/design/members/me" => Reply::json(json!({
+                    }))
+                    .wait_for(channel.clone()),
+                    ("GET", "/api/v4/channels/design/members/me") => Reply::json(json!({
                         "channel_id": "design", "user_id": "me", "last_viewed_at": 10,
                         "notify_props": { "mark_unread": "mention" }
-                    })),
+                    }))
+                    .wait_for(member.clone()),
                     _ => route(request),
                 }
             });
@@ -1911,33 +1914,53 @@ mod slow_network_tests {
             wait_until(cx, |cx| {
                 session.read_with(cx, |s, _| s.is_loaded() && s.team().is_some())
             });
-            armed.store(true, Ordering::SeqCst);
-            if hydrate_first {
-                session.update(cx, |s, cx| s.load_channels(cx));
-                wait_until(cx, |_| waiting.load(Ordering::SeqCst));
-            }
+            refreshing.store(true, Ordering::SeqCst);
+            session.update(cx, |s, cx| s.load_channels(cx));
             let task = session.update(cx, |s, cx| s.ensure_channel(&"design".into(), cx));
             let result = Rc::new(RefCell::new(None));
             let slot = result.clone();
             cx.spawn(async move |_| *slot.borrow_mut() = Some(task.await))
                 .detach();
+            // Both operations have started, but neither can complete yet.
+            wait_until(cx, |_| {
+                let requests = server.requests();
+                [
+                    "/api/v4/users/me/teams/team/channels",
+                    "/api/v4/users/me/teams/team/channels/members",
+                ]
+                .iter()
+                .all(|path| {
+                    requests
+                        .iter()
+                        .filter(|r| r.method() == "GET" && r.path() == *path)
+                        .count()
+                        == 2
+                }) && requested(&server, "GET", "/api/v4/channels/design")
+            });
+            assert!(result.borrow().is_none());
+            session.read_with(cx, |s, _| {
+                assert_eq!(
+                    s.channel(&"town".into()).unwrap().channel().display_name,
+                    "Snapshot 0"
+                );
+                assert!(s.channel(&"design".into()).is_none());
+            });
+            let mut viewed_at = None;
             if hydrate_first {
+                channel.open();
+                wait_until(cx, |_| {
+                    requested(&server, "GET", "/api/v4/channels/design/members/me")
+                });
+                assert!(result.borrow().is_none());
+                member.open();
                 wait_until(cx, |_| result.borrow().is_some());
                 assert!(result.borrow().as_ref().unwrap().is_ok());
-                session.update(cx, |s, cx| {
+                viewed_at = Some(session.update(cx, |s, cx| {
                     s.open_channel(&"design".into(), cx);
-                });
-            } else {
-                wait_until(cx, |_| waiting.load(Ordering::SeqCst));
-                session.update(cx, |s, cx| s.load_channels(cx));
+                    s.channel(&"design".into()).unwrap().last_viewed_at()
+                }));
             }
-            let viewed_at = session.read_with(cx, |s, _| {
-                s.channel(&"design".into())
-                    .map(super::ChannelEntry::last_viewed_at)
-            });
-            if hydrate_first {
-                release.send(()).unwrap();
-            }
+            list.open();
             wait_until(cx, |cx| {
                 session.read_with(cx, |s, _| {
                     s.channel(&"town".into())
@@ -1962,7 +1985,13 @@ mod slow_network_tests {
                     })
                 });
             } else {
-                release.send(()).unwrap();
+                assert!(result.borrow().is_none());
+                channel.open();
+                wait_until(cx, |_| {
+                    requested(&server, "GET", "/api/v4/channels/design/members/me")
+                });
+                assert!(result.borrow().is_none());
+                member.open();
                 wait_until(cx, |_| result.borrow().is_some());
                 assert!(result.borrow().as_ref().unwrap().is_err());
             }
@@ -1975,7 +2004,7 @@ mod slow_network_tests {
         let dnd = Arc::new(AtomicBool::new(false));
         let remote = dnd.clone();
         let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
-            if request.path() == "/api/v4/users/status/ids" {
+            if request.method() == "POST" && request.path() == "/api/v4/users/status/ids" {
                 let status = if remote.load(Ordering::SeqCst) {
                     "dnd"
                 } else {
