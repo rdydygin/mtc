@@ -10,8 +10,8 @@ use crate::{
     runtime,
     types::{
         Channel, ChannelId, ChannelMember, CustomStatus, Emoji, EmojiId, FileInfo, Millis, Post,
-        PostId, PostList, PostSearch, Preference, Status, Team, TeamId, User, UserId, UserStatus,
-        UserThread, UserThreads,
+        PostId, PostList, PostSearch, Preference, Status, Team, TeamId, User, UserAutocomplete,
+        UserId, UserStatus, UserThread, UserThreads,
     },
 };
 
@@ -200,30 +200,45 @@ impl Client {
         T: DeserializeOwned + Send + 'static,
         B: Serialize + Send + 'static,
     {
-        let inner = self.inner.clone();
-        runtime::run(async move {
-            let url = inner.server.join(&format!("api/v4/{path}"))?;
-            let mut request = inner
-                .http
-                .request(method, url)
-                .bearer_auth(&inner.token)
-                .header("X-Requested-With", "XMLHttpRequest")
-                .timeout(API_TIMEOUT);
-            if let Some(body) = body {
-                request = request.json(&body);
-            }
-            let response = check(request.send().await.map_err(connect_error)?).await?;
-            // Decode from bytes so an empty body can stand in for `()`.
-            let bytes = response.bytes().await.map_err(connect_error)?;
-            let bytes = if bytes.is_empty() {
-                &b"null"[..]
-            } else {
-                &bytes[..]
-            };
-            serde_json::from_slice(bytes)
-                .with_context(|| format!("unexpected response from {path}"))
-        })
+        runtime::run(Self::request_on_runtime(
+            self.inner.clone(),
+            method,
+            path,
+            body,
+        ))
         .await
+    }
+
+    /// The HTTP operation itself; the caller chooses its cancellation policy.
+    async fn request_on_runtime<T, B>(
+        inner: Arc<Inner>,
+        method: Method,
+        path: String,
+        body: Option<B>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned + Send + 'static,
+        B: Serialize + Send + 'static,
+    {
+        let url = inner.server.join(&format!("api/v4/{path}"))?;
+        let mut request = inner
+            .http
+            .request(method, url)
+            .bearer_auth(&inner.token)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .timeout(API_TIMEOUT);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = check(request.send().await.map_err(connect_error)?).await?;
+        // Decode from bytes so an empty body can stand in for `()`.
+        let bytes = response.bytes().await.map_err(connect_error)?;
+        let bytes = if bytes.is_empty() {
+            &b"null"[..]
+        } else {
+            &bytes[..]
+        };
+        serde_json::from_slice(bytes).with_context(|| format!("unexpected response from {path}"))
     }
 
     async fn get<T: DeserializeOwned + Send + 'static>(&self, path: String) -> Result<T> {
@@ -781,6 +796,28 @@ impl Client {
         Ok(PostSearch::from_page(found.list, found.matches, per_page))
     }
 
+    /// Complete a mention, ranked by membership of the channel and team.
+    /// Dropping the awaiting future aborts the obsolete HTTP lookup.
+    pub async fn autocomplete_users(
+        &self,
+        team: &TeamId,
+        channel: &ChannelId,
+        name: &str,
+    ) -> Result<UserAutocomplete> {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("in_team", team.as_str())
+            .append_pair("in_channel", channel.as_str())
+            .append_pair("name", name)
+            .finish();
+        runtime::run_cancellable(Self::request_on_runtime::<_, ()>(
+            self.inner.clone(),
+            Method::GET,
+            format!("users/autocomplete?{query}"),
+            None,
+        ))
+        .await
+    }
+
     /// Search users by name for autocomplete and starting conversations.
     pub async fn search_users(&self, term: &str, limit: usize) -> Result<Vec<User>> {
         self.post(
@@ -875,6 +912,46 @@ mod tests {
 
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         futures::executor::block_on(future)
+    }
+
+    #[test]
+    fn mention_autocomplete_encodes_scope_and_decodes_ranked_groups() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            if request.method() == "GET"
+                && request.path().starts_with("/api/v4/users/autocomplete?")
+            {
+                Reply::json(json!({
+                    "users": [{"id": "in", "username": "anna"}],
+                    "out_of_channel": [{"id": "out", "username": "amy"}],
+                }))
+            } else {
+                Reply::not_found()
+            }
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let result =
+            block_on(client.autocomplete_users(&"team".into(), &"channel".into(), "a+b &ю"))
+                .unwrap();
+        assert_eq!(result.users()[0].username, "anna");
+        assert_eq!(result.out_of_channel()[0].username, "amy");
+        let requests = server.requests();
+        let request = requests
+            .iter()
+            .find(|r| r.method() == "GET" && r.path().starts_with("/api/v4/users/autocomplete?"))
+            .unwrap();
+        let url = Url::parse(&format!("http://localhost{}", request.path())).unwrap();
+        let query: HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(query.get("in_team").unwrap(), "team");
+        assert_eq!(query.get("in_channel").unwrap(), "channel");
+        assert_eq!(query.get("name").unwrap(), "a+b &ю");
+        for value in [
+            json!({}),
+            json!({"users": null, "out_of_channel": null}),
+            json!({"users": [], "out_of_channel": []}),
+        ] {
+            let empty: UserAutocomplete = serde_json::from_value(value).unwrap();
+            assert!(empty.users().is_empty() && empty.out_of_channel().is_empty());
+        }
     }
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {
