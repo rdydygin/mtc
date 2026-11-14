@@ -117,6 +117,16 @@ links open joined channels. If a message cannot be opened, a notification offers
 Other message links open web pages (`http` and `https`) and email addresses (`mailto`);
 other link types show a notification and are not sent to system handlers.
 
+Bot, webhook, and integration messages show their attachments below the message:
+author, title, Markdown text, fields, pictures, and footer. Short fields sit side by
+side and stack when the conversation narrows. **Show more** expands long text;
+**Show less** collapses it. Picture previews open in the image viewer. Links follow
+the same web/email allowlist and in-app Mattermost navigation as ordinary messages.
+When a message has no text, its attachment fallback (or pretext, title, and text; field titles and values when those are empty)
+appears in search, thread previews, notifications, and **Copy text**.
+Integration actions are readonly: **Open in browser** opens the message in Mattermost
+to use its buttons and menus. Interactive integration actions are a follow-up.
+
 Search a conversation's messages with ⌘F, or all channels in the current team with ⌘⇧F.
 Switch between **This conversation** and **All channels** in the search pane (Tab reaches
 the scope buttons). Team results name their channel or direct message; opening one
@@ -256,6 +266,19 @@ Dependencies point downward. The app depends on `gpui-kit` alone for UI.
   the posts that name one. Most chat messages are plain
   text and skip Markdown entirely. Rich posts keep their parsed state per post, so
   scrolling back never re-parses.
+- **Bounded integration attachments.** At ingest, attachments are limited to 10 cards,
+  20 fields per card, 8 KiB per text value, 512 bytes per label, 2 KiB per URL,
+  and a shared 32 KiB source budget per post (UTF-8-safe). Unknown keys and odd
+  value types are ignored. Prepared text and parsed Markdown documents are retained;
+  cards render no HTML. A post admits at most eight distinct HTTP(S) image URLs,
+  shared by ordinary message Markdown, attachment Markdown,
+  and explicit integration images/icons. Known custom emoji from the signed-in
+  server’s emoji endpoint use a separate allowance of 200 distinct images per post;
+  they do not consume the eight-image budget. Non-HTTP(S) and excess Markdown images
+  become literal alt text; excess explicit images become links. Collapsed previews
+  reuse the admitted URLs. Images use the existing authenticated cache and 32 MiB
+  response cap; external hosts never receive the session token. Named status bars
+  use theme tokens; supplied hex colors are adjusted for boundary contrast.
 - **Instant switching.** The 8 most recent channel views stay alive with their scroll
   position, parsed text, and draft. Timelines are cached a little longer (24).
 - **Batched lookups.** Author lookups requested within one frame become a single

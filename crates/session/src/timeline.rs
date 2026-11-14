@@ -103,11 +103,15 @@ pub enum Delivery {
     Failed,
 }
 
-fn prepare(post: &Post, custom: &CustomEmojis) -> PreparedMessage {
+fn prepare(
+    post: &Post,
+    custom: &CustomEmojis,
+    images: &mut crate::image_policy::ImageBudget,
+) -> PreparedMessage {
     if post.is_system() {
-        PreparedMessage::system(&post.message, custom)
+        PreparedMessage::system_with_images(&post.message, custom, images)
     } else {
-        PreparedMessage::new(&post.message, custom)
+        PreparedMessage::with_images(&post.message, custom, images)
     }
 }
 
@@ -132,16 +136,20 @@ fn set_reaction(post: &mut Post, reaction: &Reaction, added: bool) -> bool {
 pub struct Entry {
     post: Arc<Post>,
     message: PreparedMessage,
+    attachments: Arc<[crate::MessageAttachment]>,
     delivery: Delivery,
     revision: u64,
 }
 
 impl Entry {
     fn new(post: Post, delivery: Delivery, custom: &CustomEmojis) -> Self {
-        let message = prepare(&post, custom);
+        let mut images = crate::image_policy::ImageBudget::default();
+        let message = prepare(&post, custom, &mut images);
+        let attachments = crate::MessageAttachment::parse_with_images(&post, custom, &mut images);
         Self {
             post: Arc::new(post),
             message,
+            attachments,
             delivery,
             revision: 0,
         }
@@ -159,6 +167,10 @@ impl Entry {
         &self.message
     }
 
+    pub fn attachments(&self) -> &Arc<[crate::MessageAttachment]> {
+        &self.attachments
+    }
+
     pub fn delivery(&self) -> Delivery {
         self.delivery
     }
@@ -166,11 +178,15 @@ impl Entry {
     /// Prepare the message again for a new set of custom emoji. Returns
     /// whether the display text changed.
     fn reprepare(&mut self, custom: &CustomEmojis) -> bool {
-        if !self.post.message.contains(':') {
+        if !self.post.message.contains(':') && self.attachments.is_empty() {
             return false;
         }
-        let message = prepare(&self.post, custom);
-        let changed = message != self.message;
+        let mut images = crate::image_policy::ImageBudget::default();
+        let message = prepare(&self.post, custom, &mut images);
+        let attachments =
+            crate::MessageAttachment::parse_with_images(&self.post, custom, &mut images);
+        let changed = message != self.message || attachments != self.attachments;
+        self.attachments = attachments;
         self.message = message;
         changed
     }
@@ -662,6 +678,7 @@ impl Timeline {
                     let reactions = entry.post.metadata.reactions.clone();
                     entry.post = current.post.clone();
                     entry.message = current.message.clone();
+                    entry.attachments = current.attachments.clone();
                     Arc::make_mut(&mut entry.post).metadata.reactions = reactions;
                 }
             }
@@ -824,14 +841,22 @@ impl Timeline {
         let entries = &self.entries[range];
         let ids: Vec<UserId> = entries.iter().map(|e| e.post.user_id.clone()).collect();
         self.directory.update(cx, |d, cx| d.ensure(ids, cx));
-        self.request_emoji(entries.iter().map(|e| e.post.as_ref()), cx);
+        self.request_emoji(entries, cx);
     }
 
     /// Look up the custom emoji that `posts` use in messages and reactions.
-    fn request_emoji<'a>(&self, posts: impl IntoIterator<Item = &'a Post>, cx: &mut Context<Self>) {
+    fn request_emoji(&self, entries: &[Entry], cx: &mut Context<Self>) {
         let mut names = Vec::new();
-        for post in posts {
+        for entry in entries {
+            let post = &entry.post;
             names.extend(custom_emoji_names(&post.message));
+            for attachment in entry.attachments.iter() {
+                names.extend(
+                    custom_emoji_names(attachment.emoji_source())
+                        .into_iter()
+                        .map(|n| Cow::Owned(n.into_owned())),
+                );
+            }
             names.extend(
                 post.metadata
                     .reactions
@@ -929,6 +954,83 @@ mod tests {
                 .advance_clock(std::time::Duration::from_millis(50));
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[gpui_kit::test]
+    fn entry_has_one_image_budget_for_message_and_attachments(cx: &mut TestAppContext) {
+        let (timeline, _) = timeline(cx);
+        let mut post = post("images", 1);
+        post.message = (0..crate::image_policy::MAX_POST_IMAGES)
+            .map(|i| format!("![body](https://example.com/{i})\n"))
+            .collect();
+        post.props.insert("attachments".into(),serde_json::json!([{"text":"![excess](https://example.com/excess)","image_url":"https://example.com/explicit"}]));
+        timeline.update(cx, |t, cx| t.upsert(post, cx));
+        timeline.read_with(cx, |t, _| {
+            let entry = &t.entries()[0];
+            assert_eq!(
+                entry.message().text().matches("![").count(),
+                crate::image_policy::MAX_POST_IMAGES
+            );
+            assert_eq!(
+                entry.attachments()[0].text().full().text().as_ref(),
+                "excess"
+            );
+            assert!(entry.attachments()[0].image_url().is_empty());
+            assert_eq!(entry.attachments()[0].image_links().len(), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn attachments_are_prepared_on_ingest_and_refreshed_on_edit_and_emoji(cx: &mut TestAppContext) {
+        let (timeline, _) = timeline(cx);
+        let mut bot = post("bot", 1);
+        bot.message.clear();
+        bot.props.insert(
+            "attachments".into(),
+            serde_json::json!([{"text":"@ann :partyparrot:"}]),
+        );
+        timeline.update(cx, |t, cx| t.upsert(bot.clone(), cx));
+        timeline.read_with(cx, |t, _| {
+            assert_eq!(
+                t.entries()[0].attachments()[0]
+                    .text()
+                    .full()
+                    .text()
+                    .as_ref(),
+                "[@ann](mention:ann) :partyparrot:"
+            )
+        });
+        timeline.update(cx, |t, cx| {
+            t.set_custom_emoji(
+                CustomEmojis::new([("partyparrot".into(), "https://example.com/emoji.png".into())]),
+                cx,
+            )
+        });
+        timeline.read_with(cx, |t, _| {
+            assert!(
+                t.entries()[0].attachments()[0]
+                    .text()
+                    .full()
+                    .text()
+                    .contains("![:partyparrot:]")
+            )
+        });
+        bot.props.insert(
+            "attachments".into(),
+            serde_json::json!([{"text":"Updated"}]),
+        );
+        bot.update_at = 2;
+        timeline.update(cx, |t, cx| t.upsert(bot, cx));
+        timeline.read_with(cx, |t, _| {
+            assert_eq!(
+                t.entries()[0].attachments()[0]
+                    .text()
+                    .full()
+                    .text()
+                    .as_ref(),
+                "Updated"
+            )
+        });
     }
 
     #[gpui_kit::test]

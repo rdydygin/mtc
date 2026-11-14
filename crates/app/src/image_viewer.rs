@@ -43,10 +43,40 @@ pub fn open(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let images = images
+        .into_iter()
+        .map(|file| {
+            let url = client.file_image_url(&file).into();
+            ViewerImage { file, url }
+        })
+        .collect();
+    open_images(Some(client), images, index, window, cx);
+}
+
+struct ViewerImage {
+    file: FileInfo,
+    url: SharedString,
+}
+
+/// URL images share the file viewer's sizing, cache, focus and dismissal. They
+/// have no Mattermost file ID, so do not offer a file-API download command.
+pub(crate) fn open_remote(url: SharedString, window: &mut Window, cx: &mut App) {
+    let mut file = FileInfo::default();
+    file.name = "Attachment image".into();
+    open_images(None, vec![ViewerImage { file, url }], 0, window, cx);
+}
+
+fn open_images(
+    client: Option<Client>,
+    images: Vec<ViewerImage>,
+    index: usize,
+    window: &mut Window,
+    cx: &mut App,
+) {
     if images.is_empty() || window.has_active_dialog(cx) {
         return;
     }
-    let images: Rc<[FileInfo]> = images.into();
+    let images: Rc<[ViewerImage]> = images.into();
     let current = cx.new(|_| index.min(images.len() - 1));
     let focus = cx.focus_handle();
     let initial_focus = Cell::new(true);
@@ -55,7 +85,7 @@ pub fn open(
             focus.focus(window, cx);
         }
         let ix = *current.read(cx);
-        let file = images[ix].clone();
+        let file = images[ix].file.clone();
         let rem = window.rem_size();
         let viewport = window.viewport_size();
         let bounds = size(
@@ -88,7 +118,7 @@ pub fn open(
                 cx.stop_propagation();
             }
         };
-        let picture = img(client.file_image_url(&file))
+        let picture = img(images[ix].url.clone())
             .w(shown.width)
             .h(shown.height)
             .object_fit(ObjectFit::Contain)
@@ -107,12 +137,11 @@ pub fn open(
                         .justify_center()
                         .text_sm()
                         .text_color(muted)
-                        .child("This picture can’t be shown here. Download it to open it.")
+                        .child("This picture can’t be shown here.")
                         .into_any_element()
                 }
             });
-        let download = {
-            let client = client.clone();
+        let download = client.clone().map(|client| {
             let file = file.clone();
             Button::new("download-image")
                 .small()
@@ -124,7 +153,7 @@ pub fn open(
                         cx.reveal_path(path)
                     })
                 })
-        };
+        });
         let navigation = (count > 1).then(|| {
             let (back, forward) = (step.clone(), step.clone());
             h_flex()
@@ -182,10 +211,14 @@ pub fn open(
                                     .truncate()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
-                                    .child(details(&file)),
+                                    .child(if client.is_some() {
+                                        details(&file)
+                                    } else {
+                                        String::new()
+                                    }),
                             )
                             .children(navigation)
-                            .child(download),
+                            .children(download),
                     ),
             )
     });

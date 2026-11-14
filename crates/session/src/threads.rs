@@ -650,7 +650,7 @@ impl FollowedThread {
 /// out once rather than on every frame: Markdown markers dropped, standard
 /// emoji drawn, and for a post without text, what it carries.
 fn preview(post: &Post) -> SharedString {
-    let message = emojify(&post.message, &CustomEmojis::default());
+    let message = emojify(&crate::post_text(post), &CustomEmojis::default());
     let mut text = String::with_capacity(message.len());
     for line in message.lines() {
         let line = line.trim();
@@ -681,20 +681,7 @@ fn preview(post: &Post) -> SharedString {
     if !files.is_empty() {
         return files.join(", ").into();
     }
-    // Integrations often post attachments with no message of their own.
-    post.props
-        .get("attachments")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .flat_map(|attachment| ["fallback", "title", "text"].map(|key| attachment.get(key)))
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .map(str::trim)
-        .find(|text| !text.is_empty())
-        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
-        .unwrap_or_default()
-        .into()
+    SharedString::default()
 }
 
 /// A line without its heading, quote, or list marker.
@@ -894,5 +881,11 @@ mod tests {
         file.name = "report.pdf".into();
         files.metadata.files.push(file);
         assert_eq!(preview(&files), "report.pdf");
+        let mut fields = post("");
+        fields.props.insert(
+            "attachments".into(),
+            serde_json::json!([{"fields":[{"title":"Build","value":"**Passed** :rocket:"}]}]),
+        );
+        assert_eq!(preview(&fields), "Build: Passed 🚀");
     }
 }

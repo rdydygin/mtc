@@ -12,33 +12,75 @@ use std::{borrow::Cow, ops::Range, sync::Arc};
 
 use markdown::mdast;
 
-use crate::CustomEmojis;
+use crate::{
+    CustomEmojis,
+    image_policy::{ImageBudget, filter_images},
+};
 
 /// A message ready for display.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedMessage {
     text: Arc<str>,
     rich: bool,
+    images: ImageBudget,
 }
 
 impl PreparedMessage {
     pub fn new(message: &str, custom: &CustomEmojis) -> Self {
+        Self::with_images(message, custom, &mut ImageBudget::default())
+    }
+
+    pub(crate) fn with_images(
+        message: &str,
+        custom: &CustomEmojis,
+        images: &mut ImageBudget,
+    ) -> Self {
         let text = tighten_emphasis(&emojify(message, custom));
-        Self::from_text(autolink(&link_mentions(&text)))
+        Self::from_text(
+            filter_images(autolink(&link_mentions(&text)), images, custom),
+            images,
+        )
+    }
+
+    pub(crate) fn truncated(
+        &self,
+        max: usize,
+        images: &ImageBudget,
+        custom: &CustomEmojis,
+    ) -> Option<Self> {
+        (self.text.len() > max).then(|| {
+            let text = format!("{}…", &self.text[..self.text.floor_char_boundary(max)]);
+            Self::from_text(
+                filter_images(text, &mut images.restricted(), custom),
+                images,
+            )
+        })
     }
 
     /// A system message, such as "@ann joined the channel." These are drawn
     /// as plain text, so their mentions stay as written rather than turning
     /// into link syntax.
     pub fn system(message: &str, custom: &CustomEmojis) -> Self {
-        Self::from_text(autolink(&emojify(message, custom)))
+        Self::system_with_images(message, custom, &mut ImageBudget::default())
     }
 
-    fn from_text(text: String) -> Self {
+    pub(crate) fn system_with_images(
+        message: &str,
+        custom: &CustomEmojis,
+        images: &mut ImageBudget,
+    ) -> Self {
+        Self::from_text(
+            filter_images(autolink(&emojify(message, custom)), images, custom),
+            images,
+        )
+    }
+
+    fn from_text(text: String, images: &ImageBudget) -> Self {
         let rich = needs_rich_text(&text);
         Self {
             text: text.into(),
             rich,
+            images: images.clone(),
         }
     }
 
@@ -46,6 +88,12 @@ impl PreparedMessage {
     /// otherwise.
     pub fn text(&self) -> &Arc<str> {
         &self.text
+    }
+
+    /// Authoritative image admission for rendering and intrinsic-size measurement.
+    /// A parsed image may load only a URL admitted during this post's preparation.
+    pub fn allows_image(&self, url: &str) -> bool {
+        self.images.allows(url)
     }
 
     /// Whether the text needs Markdown rendering.
@@ -589,6 +637,111 @@ pub fn needs_rich_text(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_image_admission_is_an_immutable_snapshot() {
+        let custom = CustomEmojis::default();
+        let mut budget = ImageBudget::default();
+        let first =
+            PreparedMessage::with_images("$![one](https://example.com/one)$", &custom, &mut budget);
+        let second =
+            PreparedMessage::with_images("![two](https://example.com/two)", &custom, &mut budget);
+        assert!(first.allows_image("https://example.com/one"));
+        assert!(!first.allows_image("https://example.com/two"));
+        assert!(second.allows_image("https://example.com/two"));
+        assert!(!second.allows_image("data:image/png;base64,AAAA"));
+        assert!(!second.allows_image("file:///tmp/image.png"));
+        let preview = second.truncated(5, &budget, &custom).unwrap();
+        assert!(!preview.allows_image("https://example.com/other"));
+    }
+
+    #[test]
+    fn twelve_server_emoji_do_not_consume_the_external_image_budget() {
+        let client =
+            mattermost::Client::new_unverified("https://chat.example.com", "token").unwrap();
+        let mut custom = CustomEmojis::for_server(&client);
+        for i in 0..12 {
+            custom.insert(
+                format!("team_emoji_{i}"),
+                client.custom_emoji_url(&format!("id{i}").into()),
+            );
+        }
+        // Even after all external slots are spent, every known server emoji remains.
+        let external = (0..9)
+            .map(|i| format!("![external {i}](https://example.com/{i}) "))
+            .collect::<String>();
+        let emoji = (0..12)
+            .map(|i| format!(":team_emoji_{i}: "))
+            .collect::<String>();
+        let mut budget = ImageBudget::default();
+        let prepared = PreparedMessage::with_images(
+            &format!("{external}{emoji}{}", "tail ".repeat(200)),
+            &custom,
+            &mut budget,
+        );
+        assert_eq!(prepared.text().matches("![").count(), 20);
+        assert!(!prepared.text().contains("https://example.com/8"));
+        for i in 0..12 {
+            assert!(prepared.text().contains(&format!("![:team_emoji_{i}:]")));
+        }
+        let preview = prepared
+            .truncated(prepared.text().len() - 10, &budget, &custom)
+            .unwrap();
+        assert_eq!(preview.text().matches("![").count(), 20);
+    }
+
+    #[gpui_kit::test]
+    fn emoji_store_keeps_server_provenance_for_preparation(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let client =
+            mattermost::Client::new_unverified("https://chat.example.com", "token").unwrap();
+        let store = cx.new(|_| crate::EmojiStore::new(client));
+        store.update(cx, |store, cx| {
+            store.add(
+                (0..12)
+                    .map(|i| {
+                        let mut emoji = mattermost::Emoji::default();
+                        emoji.id = format!("id{i}").into();
+                        emoji.name = format!("team_emoji_{i}");
+                        emoji
+                    })
+                    .collect(),
+                cx,
+            )
+        });
+        let custom = store.read_with(cx, |store, _| store.custom().clone());
+        let source = (0..12)
+            .map(|i| format!(":team_emoji_{i}: "))
+            .collect::<String>();
+        assert_eq!(
+            PreparedMessage::new(&source, &custom)
+                .text()
+                .matches("![")
+                .count(),
+            12
+        );
+    }
+
+    #[test]
+    fn arbitrary_emoji_url_maps_still_obey_the_untrusted_image_budget() {
+        let custom =
+            CustomEmojis::new([("partyparrot".into(), "https://example.com/emoji".into())]);
+        let message = format!(
+            ":partyparrot: ![bad](data:image/png;base64,AAAA) {}",
+            (0..100)
+                .map(|i| format!("![image {i}](https://example.com/{i}) "))
+                .collect::<String>()
+        );
+        let prepared = PreparedMessage::new(&message, &custom);
+        assert!(!prepared.text().contains("data:image"));
+        assert!(prepared.text().contains("bad"));
+        assert_eq!(
+            prepared.text().matches("![").count(),
+            crate::image_policy::MAX_POST_IMAGES
+        );
+        assert!(prepared.text().contains("![:partyparrot:]"));
+        assert!(!prepared.text().contains("https://example.com/7"));
+    }
 
     #[test]
     fn converts_shortcodes_outside_code() {

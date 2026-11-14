@@ -20,12 +20,14 @@ use crate::{
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CustomEmojis {
     urls: Arc<HashMap<String, Arc<str>>>,
+    endpoint: Option<Arc<str>>,
 }
 
 impl CustomEmojis {
     /// A set of `(name, image URL)` pairs.
     pub fn new(emoji: impl IntoIterator<Item = (String, String)>) -> Self {
         Self {
+            endpoint: None,
             urls: Arc::new(
                 emoji
                     .into_iter()
@@ -33,6 +35,32 @@ impl CustomEmojis {
                     .collect(),
             ),
         }
+    }
+
+    /// Only a signed-in server-backed snapshot can exempt emoji from the
+    /// untrusted image budget; arbitrary URL maps carry no origin authority.
+    pub(crate) fn for_server(client: &Client) -> Self {
+        Self {
+            endpoint: Some(format!("{}api/v4/emoji/", client.server()).into()),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn is_trusted_image(&self, alt: &str, url: &str) -> bool {
+        let Some(name) = alt.strip_prefix(':').and_then(|s| s.strip_suffix(':')) else {
+            return false;
+        };
+        let Some(endpoint) = &self.endpoint else {
+            return false;
+        };
+        is_emoji_name(name)
+            && self
+                .image_url(name)
+                .is_some_and(|known| known.as_ref() == url)
+            && url
+                .strip_prefix(endpoint.as_ref())
+                .and_then(|path| path.strip_suffix("/image"))
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
     }
 
     /// The image of the custom emoji `name`. Accepts the `:name:` form some
@@ -104,9 +132,10 @@ pub struct EmojiStore {
 
 impl EmojiStore {
     pub fn new(client: Client) -> Self {
+        let custom = CustomEmojis::for_server(&client);
         Self {
             client,
-            custom: CustomEmojis::default(),
+            custom,
             remembered: HashSet::new(),
             queued: HashSet::new(),
             requested: HashSet::new(),

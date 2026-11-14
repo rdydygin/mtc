@@ -61,6 +61,7 @@ pub struct TimelineView {
     /// Parsed Markdown for live rich posts, kept so
     /// scrolling back never re-parses.
     rich_text: HashMap<PostId, Entity<TextViewState>>,
+    attachment_cards: HashMap<PostId, Rc<crate::post_row::AttachmentCards>>,
     /// The first post the user hasn't seen.
     unread_ix: Option<usize>,
     editing: Option<PostId>,
@@ -143,6 +144,7 @@ impl TimelineView {
             composer,
             row_ids: Vec::new(),
             rich_text: HashMap::new(),
+            attachment_cards: HashMap::new(),
             unread_ix: None,
             editing: None,
             revealing: None,
@@ -300,6 +302,7 @@ impl TimelineView {
         self.row_ids = entries.iter().map(|e| e.id().clone()).collect();
         let live: std::collections::HashSet<&PostId> = entries.iter().map(|e| e.id()).collect();
         self.rich_text.retain(|id, _| live.contains(id));
+        self.attachment_cards.retain(|id, _| live.contains(id));
         for ix in 0..entries.len() {
             self.sync_rich_text(ix, cx);
         }
@@ -323,6 +326,7 @@ impl TimelineView {
                     let live: std::collections::HashSet<&PostId> =
                         timeline.entries().iter().map(|e| e.id()).collect();
                     self.rich_text.retain(|id, _| live.contains(id));
+                    self.attachment_cards.retain(|id, _| live.contains(id));
                 }
                 for ix in old.start..old.start + new_count {
                     self.sync_rich_text(ix, cx);
@@ -363,6 +367,21 @@ impl TimelineView {
         let Some(entry) = self.timeline.read(cx).entries().get(ix).cloned() else {
             return;
         };
+        if entry.attachments().is_empty() {
+            self.attachment_cards.remove(entry.id());
+        } else if !self
+            .attachment_cards
+            .get(entry.id())
+            .is_some_and(|cards| cards.matches(entry.attachments()))
+        {
+            self.attachment_cards.insert(
+                entry.id().clone(),
+                Rc::new(crate::post_row::AttachmentCards::new(
+                    entry.attachments().clone(),
+                    cx,
+                )),
+            );
+        }
         let message = entry.message();
         if !message.is_rich() {
             self.rich_text.remove(entry.id());
@@ -567,7 +586,20 @@ impl TimelineView {
                     .update(cx, |s, cx| s.mark_post_unread(&post, cx));
             }
             PostAction::CopyText => {
-                cx.write_to_clipboard(ClipboardItem::new_string(post.message.clone()));
+                cx.write_to_clipboard(ClipboardItem::new_string(session::post_text(&post)));
+            }
+            PostAction::OpenInBrowser => {
+                let session = self.session.read(cx);
+                let url = format!(
+                    "{}{}pl/{}",
+                    session.client().server(),
+                    session
+                        .team()
+                        .map(|t| format!("{}/", t.name))
+                        .unwrap_or_default(),
+                    post.id
+                );
+                crate::post_row::open_external_link(&url, window, cx);
             }
             PostAction::CopyLink => {
                 let session = self.session.read(cx);
@@ -702,6 +734,7 @@ impl TimelineView {
             .day_label(day_label)
             .unread_divider(unread_divider)
             .rich_text(self.rich_text.get(entry.id()).cloned())
+            .attachment_cards(self.attachment_cards.get(entry.id()).cloned())
             .thread_entry(self.kind.root().is_none())
             .highlighted(self.flashed.as_ref() == Some(entry.id()))
             .client(session.client().clone())
@@ -1519,6 +1552,45 @@ mod tests {
             let ix = v.find_unread(cx).unwrap();
             assert_eq!(v.timeline.read(cx).entries()[ix].id().as_str(), "n90");
         });
+    }
+
+    #[gpui_kit::test]
+    fn attachment_copy_and_browser_handoff_use_the_post(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (view, _) = open_channel(&server, cx);
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, cx| v.session.read(cx).team().is_some())
+        });
+        let timeline = view.read_with(cx, |v, _| v.timeline.clone());
+        timeline.update(cx, |t, cx| {
+            let mut post = t.entries().last().unwrap().post().as_ref().clone();
+            post.message.clear();
+            post.update_at += 1;
+            post.props.insert(
+                "attachments".into(),
+                serde_json::json!([{"fields":[{"title":"Deploy","value":"complete"}]}]),
+            );
+            t.upsert(post, cx);
+        });
+        let id = timeline.read_with(cx, |t, _| t.entries().last().unwrap().id().clone());
+        let handle = cx.update(|cx| cx.windows()[0]);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.handle_post_action(&id, PostAction::CopyText, window, cx)
+            });
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                "Deploy: complete"
+            );
+            view.update(cx, |v, cx| {
+                v.handle_post_action(&id, PostAction::OpenInBrowser, window, cx)
+            });
+        })
+        .unwrap();
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(format!("{}/team/pl/{id}", server.url()).as_str())
+        );
     }
 
     #[gpui_kit::test]

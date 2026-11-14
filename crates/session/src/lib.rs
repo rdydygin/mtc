@@ -11,8 +11,10 @@
 //!
 //! Nothing here renders; the UI crate mirrors these models.
 
+mod attachments;
 mod directory;
 mod emoji;
+mod image_policy;
 mod prepare;
 mod retry;
 mod search;
@@ -20,6 +22,7 @@ mod session;
 mod threads;
 mod timeline;
 
+pub use attachments::{AttachmentColor, AttachmentText, MessageAttachment, post_text};
 pub use directory::{Directory, UsernameLookup};
 pub use emoji::{CustomEmojis, EmojiStore, emoji_matches};
 pub use prepare::{

@@ -86,6 +86,15 @@ impl SearchView {
             .map(|p| p.id.clone());
         let mut offset = self.collection_scroll.logical_scroll_top();
         let anchor = self.results.get(offset.item_ix).map(|p| p.id.clone());
+        self.result_text = rows
+            .iter()
+            .map(|post| {
+                (
+                    post.id.clone(),
+                    session::emojify(&session::post_text(post), &CustomEmojis::default()),
+                )
+            })
+            .collect();
         self.results = rows;
         self.selected = selected
             .and_then(|id| self.results.iter().position(|p| p.id == id))
