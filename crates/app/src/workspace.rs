@@ -864,9 +864,19 @@ impl Workspace {
                 ("Send", "Enter".to_string()),
                 ("New line", "Shift-Enter".to_string()),
                 ("Edit your last message (empty field)", "Up".to_string()),
-                ("Select a slash suggestion", "Up / Down".to_string()),
-                ("Dismiss suggestions or cancel edit", "Escape".to_string()),
-                ("Complete the selected slash command", "Tab".to_string()),
+                ("Select a composer suggestion", "Up / Down".to_string()),
+                (
+                    "Select / choose a reaction emoji",
+                    "Up / Down / Enter".to_string(),
+                ),
+                (
+                    "Dismiss suggestions, emoji picker, or edit",
+                    "Escape".to_string(),
+                ),
+                (
+                    "Complete the selected suggestion",
+                    "Tab / Enter".to_string(),
+                ),
                 ("Zoom in, out, actual size", zoom.join(" ")),
             ];
             // Dialog accepts pixels and clamps this rem-derived width to the viewport.

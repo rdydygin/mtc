@@ -729,6 +729,15 @@ impl Client {
         self.post("emoji/names".into(), names).await
     }
 
+    /// Search custom emoji by shortcode, including names absent from the local cache.
+    pub async fn search_emoji(&self, term: &str) -> Result<Vec<Emoji>> {
+        self.post(
+            "emoji/search".into(),
+            json!({"term": term, "prefix_only": false}),
+        )
+        .await
+    }
+
     /// One custom emoji by name, for servers without the batch lookup.
     /// Fails with [`ApiError::Status`] 404 when there is no such emoji.
     pub async fn custom_emoji_by_name(&self, name: &str) -> Result<Emoji> {

@@ -73,8 +73,17 @@ pub struct State {
     pub last_channel: Option<String>,
     pub updates: Updates,
     pub drafts: Drafts,
+    pub recent_emoji: Vec<String>,
     #[serde(skip)]
     pub draft_generation: u64,
+}
+
+impl State {
+    pub fn remember_emoji(&mut self, name: &str) {
+        self.recent_emoji.retain(|old| old != name);
+        self.recent_emoji.insert(0, name.to_owned());
+        self.recent_emoji.truncate(16);
+    }
 }
 
 /// Most recently changed last. This bounds draft storage to about 6.4 MiB.

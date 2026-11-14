@@ -8,6 +8,7 @@ pub(super) enum Kind {
     Command,
     Person,
     Channel,
+    Emoji,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +36,14 @@ pub(super) fn token_at(text: &str, caret: usize) -> Option<Token> {
         '/' if start == 0 => Kind::Command,
         '@' => Kind::Person,
         '~' => Kind::Channel,
+        ':' if before[start + 1..]
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .count()
+            >= 2 =>
+        {
+            Kind::Emoji
+        }
         _ => return None,
     };
     // Punctuation can start a token in prose, but a query/fragment marker
@@ -44,18 +53,19 @@ pub(super) fn token_at(text: &str, caret: usize) -> Option<Token> {
     if word.contains("://") || autolink.to_ascii_lowercase().starts_with("www.") {
         return None;
     }
-    if text[..start]
-        .chars()
-        .next_back()
-        .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '/' | '\\' | '@' | '~' | '.'))
-        || in_code(&text[..start])
+    if text[..start].chars().next_back().is_some_and(|c| {
+        c.is_alphanumeric() || matches!(c, '_' | '/' | '\\' | '@' | '~' | '.' | ':')
+    }) || in_code(&text[..start])
     {
         return None;
     }
-    let end = caret
+    let mut end = caret
         + text[caret..]
             .find(|c: char| !name_char(c))
             .unwrap_or(text.len() - caret);
+    if kind == Kind::Emoji && text[end..].starts_with(':') {
+        end += 1;
+    }
     Some(Token {
         kind,
         range: start..end,
@@ -113,7 +123,12 @@ fn in_code(text: &str) -> bool {
             }
         }
     }
-    fence.is_some() || inline != 0
+    fence.is_some()
+        || inline != 0
+        || text
+            .rsplit('\n')
+            .next()
+            .is_some_and(|line| line.starts_with("    ") || line.starts_with('\t'))
 }
 
 #[derive(Clone)]
@@ -185,6 +200,53 @@ pub(super) fn channel_matches<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indentation_only_blocks_tokens_on_the_current_line() {
+        for token in [":sm", "@ali", "~town"] {
+            for indent in ["    ", "\t"] {
+                let after = format!("{indent}code\n{token}");
+                assert!(token_at(&after, after.len()).is_some(), "{after:?}");
+                let inside = format!("previous line\n{indent}{token}");
+                assert!(token_at(&inside, inside.len()).is_none(), "{inside:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn emoji_tokens_require_a_boundary_and_two_letters_outside_code_or_urls() {
+        for text in [
+            ":sm",
+            "(:sm",
+            "hi :sm",
+            "🙂 :sm",
+            "`code` :sm",
+            "```\ncode\n```\n:sm",
+        ] {
+            let token = token_at(text, text.len()).unwrap();
+            assert_eq!(token.kind, Kind::Emoji);
+            assert_eq!(token.query, "sm");
+        }
+        for text in [
+            ":",
+            ":s",
+            "10:30",
+            "word:sm",
+            "::sm",
+            "\\:sm",
+            "https://host/:sm",
+            "www.host/:sm",
+            "` :sm",
+            "```\n:sm",
+            "~~~\n:sm",
+            "    :sm",
+            "\t:sm",
+            "mail:someone",
+        ] {
+            assert!(token_at(text, text.len()).is_none(), "{text}");
+        }
+        assert_eq!(token_at(":smile:", 3).unwrap().range, 0..7);
+    }
 
     #[test]
     fn urls_do_not_offer_mentions_or_channels() {
