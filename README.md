@@ -244,7 +244,9 @@ Dependencies point downward. The app depends on `gpui-kit` alone for UI.
 - **Avatars use GPUI's image cache.** An authenticated HTTP client (`app/src/http.rs`)
   attaches the token only for the signed-in server. Decoding happens off the UI thread.
 - **Resilient real-time.** The socket detects silent connections, reconnects with
-  backoff, and catches up live timelines with `posts?since=`.
+  backoff, and catches up live timelines with `posts?since=` on the first connection
+  as well as reconnects, after overlapping REST loads finish. Catch-up keeps newer
+  live changes and preserves the visible post and scroll offset when rows reorder.
 
 Failed conversation loads replace skeletons with **Retry**, including the remembered
 conversation at startup. Failed older-message pages, search pages, and file uploads
@@ -252,7 +254,15 @@ keep existing content and offer an inline retry.
 
 ### Effortless UX
 
-Posts send optimistically, with Retry or Discard if a send fails. Drafts are kept per
+Posts send optimistically, with Retry or Discard if a send fails. Unresolved sends
+(text, uploaded attachments, thread and pending ID) live in a session outbox even
+when their timeline leaves the cache. Failed sends survive switching conversations,
+including their uploaded attachments, but **do not survive quitting**.
+Retry reuses the original pending ID;
+a nonce in post props also lets REST catch-up confirm committed sends when the
+server omits the pending ID. Confirmation or Discard removes the outbox entry.
+Rejected deletes restore the post immediately; uncertain outcomes refetch it from the server.
+Followed threads remain listed until deletion is confirmed. Drafts are kept per
 conversation across app restarts (channels and threads), and a "New messages" divider marks where you left off. You also get
 typing indicators, presence dots, and mention badges. Native notifications cover
 mentions and DMs. Channel desktop preferences can restrict those notifications;

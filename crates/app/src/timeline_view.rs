@@ -56,6 +56,8 @@ pub struct TimelineView {
     timeline: Entity<Timeline>,
     scroller: Entity<PostScrollerState>,
     composer: Entity<Composer>,
+    /// Row identities before the next timeline event, for scroll anchoring.
+    row_ids: Vec<PostId>,
     /// Parsed Markdown for live rich posts, kept so
     /// scrolling back never re-parses.
     rich_text: HashMap<PostId, Entity<TextViewState>>,
@@ -139,6 +141,7 @@ impl TimelineView {
             timeline,
             scroller,
             composer,
+            row_ids: Vec::new(),
             rich_text: HashMap::new(),
             unread_ix: None,
             editing: None,
@@ -272,6 +275,29 @@ impl TimelineView {
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let entries = self.timeline.read(cx).entries().to_vec();
+        let anchor = {
+            let scroller = self.scroller.read(cx);
+            let offset = scroller.logical_scroll_top();
+            (!scroller.is_following_tail())
+                .then(|| {
+                    let id = self.row_ids.get(offset.item_ix)?;
+                    let ix = entries.iter().position(|e| {
+                        e.id() == id
+                            || e.post().pending_post_id == id.as_str()
+                            || e.post()
+                                .props
+                                .get("mtc_pending_id")
+                                .and_then(|v| v.as_str())
+                                == Some(id.as_str())
+                    })?;
+                    Some(gpui_kit::ListOffset {
+                        item_ix: ix,
+                        ..offset
+                    })
+                })
+                .flatten()
+        };
+        self.row_ids = entries.iter().map(|e| e.id().clone()).collect();
         let live: std::collections::HashSet<&PostId> = entries.iter().map(|e| e.id()).collect();
         self.rich_text.retain(|id, _| live.contains(id));
         for ix in 0..entries.len() {
@@ -279,7 +305,8 @@ impl TimelineView {
         }
         self.unread_ix = self.find_unread(cx);
         let count = entries.len();
-        self.scroller.update(cx, |s, cx| s.reset(count, cx));
+        self.scroller
+            .update(cx, |s, cx| s.reset_with_anchor(count, anchor, cx));
     }
 
     fn on_timeline_event(
@@ -322,6 +349,13 @@ impl TimelineView {
                 });
             }
         }
+        self.row_ids = self
+            .timeline
+            .read(cx)
+            .entries()
+            .iter()
+            .map(|e| e.id().clone())
+            .collect();
         cx.notify();
     }
 
@@ -1304,10 +1338,10 @@ mod tests {
         });
     }
 
-    #[gpui_kit::test]
-    fn catch_up_keeps_the_scroller_count_after_a_pending_post_moves(cx: &mut TestAppContext) {
+    fn catch_up_reorder(follow_tail: bool, cx: &mut TestAppContext) {
         let server = SlowServer::start(Network::new(Duration::from_millis(100)), |request| {
-            if request.path().starts_with("/api/v4/channels/town/posts?")
+            if request.method() == "GET"
+                && request.path().starts_with("/api/v4/channels/town/posts?")
                 && request.path().contains("since=")
             {
                 return Reply::json(json!({
@@ -1322,7 +1356,8 @@ mod tests {
             route(request)
         });
         let (view, _) = open_channel(&server, cx);
-        let timeline = view.read_with(cx, |v, _| v.timeline.clone());
+        let (timeline, scroller) =
+            view.read_with(cx, |v, _| (v.timeline.clone(), v.scroller.clone()));
         timeline.update(cx, |t, cx| {
             let mut pending = mattermost::Post::default();
             pending.id = "pending".into();
@@ -1332,15 +1367,41 @@ mod tests {
             t.insert_pending(pending, cx);
         });
         cx.run_until_parked();
+        if !follow_tail {
+            scroller.update(cx, |s, cx| {
+                s.reset_with_anchor(
+                    61,
+                    Some(gpui_kit::ListOffset {
+                        item_ix: 10,
+                        offset_in_item: px(7.),
+                    }),
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+        }
+        let before = scroller.read_with(cx, |s, _| s.logical_scroll_top());
+        let anchor = timeline.read_with(cx, |t, _| {
+            t.entries().get(before.item_ix).map(|e| e.id().clone())
+        });
         timeline.update(cx, |t, cx| t.catch_up(cx));
         wait_until(cx, |cx| {
             timeline.read_with(cx, |t, _| t.position(&"later".into()).is_some())
         });
         view.read_with(cx, |v, cx| {
-            assert_eq!(
-                v.scroller.read(cx).item_count(),
-                v.timeline.read(cx).entries().len()
-            );
+            let scroller = v.scroller.read(cx);
+            let timeline = v.timeline.read(cx);
+            assert_eq!(scroller.item_count(), timeline.entries().len());
+            assert_eq!(scroller.is_following_tail(), follow_tail);
+            if !follow_tail {
+                let after = scroller.logical_scroll_top();
+                assert_eq!(
+                    timeline.entries()[after.item_ix].id(),
+                    anchor.as_ref().unwrap()
+                );
+                assert_eq!(after.item_ix, before.item_ix + 1, "anchor moved by one row");
+                assert_eq!(after.offset_in_item, before.offset_in_item);
+            }
         });
     }
 
@@ -1388,6 +1449,16 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         disappearing_reaction_trigger_returns_focus(true, cx);
+    }
+
+    #[gpui_kit::test]
+    fn catch_up_reorder_preserves_visible_post_and_offset(cx: &mut TestAppContext) {
+        catch_up_reorder(false, cx);
+    }
+
+    #[gpui_kit::test]
+    fn catch_up_reorder_keeps_following_the_tail(cx: &mut TestAppContext) {
+        catch_up_reorder(true, cx);
     }
 
     #[gpui_kit::test]
