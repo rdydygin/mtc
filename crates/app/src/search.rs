@@ -602,8 +602,11 @@ fn excerpt(text: &str, terms: &[String]) -> (SharedString, Vec<Range<usize>>) {
     while !text.is_char_boundary(cut) {
         cut += 1;
     }
-    if let Some(space) = text[cut..first].find(char::is_whitespace) {
-        cut += space + 1;
+    if let Some((space, ch)) = text[cut..first]
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+    {
+        cut += space + ch.len_utf8();
     }
     let ellipsis = "…";
     let shift = |at: usize| at - cut + ellipsis.len();
@@ -651,6 +654,19 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn excerpts_advance_past_multibyte_whitespace() {
+        for prefix in ["x".repeat(130), "界".repeat(44)] {
+            for whitespace in ['\u{3000}', '\u{2003}'] {
+                let text = format!("{prefix}{whitespace}needle");
+                let (shown, ranges) = excerpt(&text, &["needle".into()]);
+                assert_eq!(shown.as_ref(), "…needle");
+                assert_eq!(ranges, vec![3..9]);
+                assert_eq!(&shown[ranges[0].clone()], "needle");
+            }
+        }
+    }
 
     fn route(request: &Request) -> Reply {
         match request.path().split('?').next().unwrap_or_default() {

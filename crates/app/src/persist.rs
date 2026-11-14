@@ -105,8 +105,8 @@ static WRITER: LazyLock<mpsc::Sender<Write>> = LazyLock::new(|| {
     std::thread::Builder::new()
         .name("mtc-persist".into())
         .spawn(move || {
+            let mut latest = None;
             while let Ok(first) = rx.recv() {
-                let mut latest = None;
                 let mut flushes = Vec::new();
                 for write in std::iter::once(first).chain(rx.try_iter()) {
                     match write {
@@ -114,8 +114,10 @@ static WRITER: LazyLock<mpsc::Sender<Write>> = LazyLock::new(|| {
                         Write::Flush(done) => flushes.push(done),
                     }
                 }
-                if let Some(bytes) = latest.and_then(|state| saver.save(&state)) {
-                    write_file(&bytes);
+                if let Some(state) = latest.as_ref()
+                    && let Err(err) = saver.write(state, write_file)
+                {
+                    log::warn!("saving state: {err}");
                 }
                 for done in flushes {
                     let _ = done.send(());
@@ -130,7 +132,7 @@ static WRITER: LazyLock<mpsc::Sender<Write>> = LazyLock::new(|| {
 /// signed-in server's token is saved there and left out of the file, and a
 /// token no longer in use is deleted from it.
 struct Saver {
-    /// The last bytes handed out, to skip saves that change nothing.
+    /// The last bytes successfully replaced, to skip unchanged saves.
     written: Option<Vec<u8>>,
     /// The server and token the keychain holds.
     in_keychain: Option<(String, String)>,
@@ -188,16 +190,26 @@ impl Saver {
             saved.token.clear();
         }
         match serde_json::to_vec_pretty(&on_disk) {
-            Ok(bytes) if self.written.as_ref() != Some(&bytes) => {
-                self.written = Some(bytes.clone());
-                Some(bytes)
-            }
+            Ok(bytes) if self.written.as_ref() != Some(&bytes) => Some(bytes),
             Ok(_) => None,
             Err(err) => {
                 log::warn!("saving state: {err}");
                 None
             }
         }
+    }
+
+    /// Mark the snapshot saved only after the file has been replaced.
+    fn write(
+        &mut self,
+        state: &State,
+        replace: impl FnOnce(&[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if let Some(bytes) = self.save(state) {
+            replace(&bytes)?;
+            self.written = Some(bytes);
+        }
+        Ok(())
     }
 
     fn forget(&self, server: &str) {
@@ -276,30 +288,29 @@ pub fn flush() {
     }
 }
 
-fn write_file(bytes: &[u8]) {
+fn write_file(bytes: &[u8]) -> std::io::Result<()> {
     let Some(path) = path() else {
-        return;
+        return Ok(());
     };
-    let result = (|| -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(tmp, &path)
-    })();
-    if let Err(err) = result {
-        log::warn!("saving state: {err}");
+    replace_file(&path, bytes)
+}
+
+fn replace_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
     }
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(tmp, path)
 }
 
 #[cfg(test)]
@@ -388,10 +399,47 @@ mod tests {
     }
 
     #[test]
+    fn failed_signout_is_retried_until_the_file_is_replaced() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("mtc-persist-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&signed_in("old", "secret")).unwrap(),
+        )
+        .unwrap();
+        let mut saver = Saver::new(None);
+        let state = State::default();
+        // A directory in place of the temporary file makes replacement fail.
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        fs::create_dir(&tmp).unwrap();
+        assert!(
+            saver
+                .write(&state, |bytes| replace_file(&path, bytes))
+                .is_err()
+        );
+        assert!(saver.written.is_none());
+        assert!(file(&fs::read(&path).unwrap()).session.is_some());
+        fs::remove_dir(&tmp).unwrap();
+        saver
+            .write(&state, |bytes| replace_file(&path, bytes))
+            .unwrap();
+        assert!(file(&fs::read(&path).unwrap()).session.is_none());
+        saver
+            .write(&state, |_| panic!("successful state was written again"))
+            .unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn unchanged_saves_write_nothing() {
         let mut saver = Saver::new(None);
         let state = signed_in("https://unchanged.example.com", "secret");
-        assert!(saver.save(&state).is_some());
-        assert!(saver.save(&state).is_none());
+        saver.write(&state, |_| Ok(())).unwrap();
+        saver
+            .write(&state, |_| panic!("unchanged state was written"))
+            .unwrap();
     }
 }

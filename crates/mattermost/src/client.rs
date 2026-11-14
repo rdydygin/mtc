@@ -15,6 +15,9 @@ use crate::{
     },
 };
 
+/// The largest image response kept in memory, including decompressed bytes.
+const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
 /// An authenticated Mattermost v4 client.
 ///
 /// Cloning is cheap: clones share one connection pool and one token. Every
@@ -616,14 +619,26 @@ impl Client {
             if same_origin {
                 request = request.bearer_auth(&inner.token);
             }
-            let response = request.send().await.map_err(connect_error)?;
+            let mut response = request.send().await.map_err(connect_error)?;
             let status = response.status().as_u16();
             let content_type = response
                 .headers()
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            let body = response.bytes().await.map_err(connect_error)?.to_vec();
+            if response
+                .content_length()
+                .is_some_and(|len| len > MAX_IMAGE_BYTES as u64)
+            {
+                bail!("The image exceeds the size limit.");
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(connect_error)? {
+                if chunk.len() > MAX_IMAGE_BYTES - body.len() {
+                    bail!("The image exceeds the size limit.");
+                }
+                body.extend_from_slice(&chunk);
+            }
             Ok(FetchedResource {
                 status,
                 content_type,
@@ -884,6 +899,41 @@ mod tests {
             })
             .collect();
         json!(channels)
+    }
+
+    #[test]
+    fn images_with_an_excessive_content_length_fail_before_reading() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |_| {
+            Reply::bytes(vec![0; MAX_IMAGE_BYTES + 1]).stall_after(0)
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let err = block_on(client.fetch(&server.url())).unwrap_err();
+        assert_eq!(err.to_string(), "The image exceeds the size limit.");
+    }
+
+    #[test]
+    fn images_without_a_known_length_are_limited_while_reading() {
+        let compressed = gzip(&vec![0; MAX_IMAGE_BYTES + 1]);
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |_| {
+            Reply::bytes(compressed.clone()).header("Content-Encoding", "gzip")
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let err = block_on(client.fetch(&server.url())).unwrap_err();
+        assert_eq!(err.to_string(), "The image exceeds the size limit.");
+    }
+
+    #[test]
+    fn images_within_the_limit_keep_their_status_type_and_body() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |_| {
+            Reply::bytes(vec![1, 2, 3])
+                .status(201)
+                .header("Content-Type", "image/png")
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let fetched = block_on(client.fetch(&server.url())).unwrap();
+        assert_eq!(fetched.status, 201);
+        assert_eq!(fetched.content_type.as_deref(), Some("image/png"));
+        assert_eq!(fetched.body, [1, 2, 3]);
     }
 
     #[test]
