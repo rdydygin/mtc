@@ -44,6 +44,7 @@ const REVEAL_PAGES: usize = 20;
 const FLASH: Duration = Duration::from_millis(2500);
 
 pub enum TimelineViewEvent {
+    OpenLink(String),
     OpenThread(PostId),
     OpenChannel(ChannelId),
     Close,
@@ -186,6 +187,11 @@ impl TimelineView {
             self.back_to_results = back;
             cx.notify();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flashed_post(&self) -> Option<&PostId> {
+        self.flashed.as_ref()
     }
 
     /// Scroll to `post`, created at `created`, and mark it for a moment.
@@ -503,6 +509,7 @@ impl TimelineView {
             return;
         };
         match action {
+            PostAction::OpenLink(url) => cx.emit(TimelineViewEvent::OpenLink(url)),
             PostAction::OpenThread => {
                 if self.kind.root().is_none() {
                     cx.emit(TimelineViewEvent::OpenThread(post.id.clone()));
