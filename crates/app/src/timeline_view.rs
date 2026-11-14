@@ -26,7 +26,7 @@ use crate::{
     download,
     extensions::{self, CommandContext, CommandOutcome},
     http::avatar_url,
-    image_viewer,
+    image_viewer, persist,
     post_row::{PostAction, PostActionHandler, PostRow},
     post_scroller::{PostScroller, PostScrollerState},
     time,
@@ -66,6 +66,8 @@ pub struct TimelineView {
     /// The post just revealed, marked for a moment so the eye finds it.
     flashed: Option<PostId>,
     _flash: Option<Task<()>>,
+    _draft_save: Option<Task<()>>,
+    draft_generation: u64,
     /// A thread opened over search results offers to go back to them.
     back_to_results: bool,
     _subscriptions: Vec<Subscription>,
@@ -97,10 +99,22 @@ impl TimelineView {
             client: session.read(cx).client().clone(),
             channel: kind.channel().clone(),
         };
+        let draft = draft.or_else(|| {
+            let s = session.read(cx);
+            persist::read_with(|state| {
+                state
+                    .drafts
+                    .get(s.client().server().as_str(), s.me().id.as_str(), &kind)
+            })
+        });
         let composer = cx.new(|cx| Composer::new(placeholder, draft, target, window, cx));
         let directory = session.read(cx).directory().clone();
 
         let subscriptions = vec![
+            cx.on_app_quit(|this, cx| {
+                this.stage_draft(cx);
+                async {}
+            }),
             cx.subscribe(&timeline, Self::on_timeline_event),
             cx.observe(&timeline, |this, _, cx| {
                 this.continue_reveal(cx);
@@ -124,6 +138,8 @@ impl TimelineView {
             revealing: None,
             flashed: None,
             _flash: None,
+            _draft_save: None,
+            draft_generation: persist::read_with(|s| s.draft_generation),
             back_to_results: false,
             _subscriptions: subscriptions,
         };
@@ -344,6 +360,17 @@ impl TimelineView {
 
     // ----- Commands ---------------------------------------------------------
 
+    pub(crate) fn stage_draft(&self, cx: &App) {
+        let session = self.session.read(cx);
+        persist::stage_draft(
+            session.client().server().as_str(),
+            session.me().id.as_str(),
+            self.draft_generation,
+            &self.kind,
+            &self.composer.read(cx).draft(cx),
+        );
+    }
+
     fn on_composer_event(
         &mut self,
         _: &Entity<Composer>,
@@ -352,6 +379,15 @@ impl TimelineView {
         cx: &mut Context<Self>,
     ) {
         match event {
+            ComposerEvent::DraftChanged => {
+                self.stage_draft(cx);
+                self._draft_save = Some(cx.spawn(async move |_, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    persist::save_staged();
+                }));
+            }
             ComposerEvent::Submit { text, files } => {
                 self.submit(text.clone(), files.clone(), window, cx)
             }

@@ -608,6 +608,10 @@ impl Workspace {
 
     fn save_draft(&mut self, view: &Entity<TimelineView>, cx: &mut Context<Self>) {
         let view = view.read(cx);
+        // Closing or evicting the view cancels its debounce. Capture the
+        // composer directly (including programmatic changes) and queue now.
+        view.stage_draft(cx);
+        persist::save_staged();
         match view.draft(cx) {
             Some(draft) => self.drafts.insert(view.kind().clone(), draft),
             None => self.drafts.remove(view.kind()),
@@ -1167,6 +1171,14 @@ mod tests {
         server: &SlowServer,
         cx: &mut TestAppContext,
     ) -> (AnyWindowHandle, Entity<Workspace>) {
+        open_workspace_as(server, "me", cx)
+    }
+
+    fn open_workspace_as(
+        server: &SlowServer,
+        user: &str,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<Workspace>) {
         cx.executor().allow_parking();
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -1176,7 +1188,7 @@ mod tests {
         });
         let client = Client::new_unverified(&server.url(), "token").unwrap();
         let mut me = User::default();
-        me.id = "me".into();
+        me.id = user.into();
         let workspace = std::rc::Rc::new(std::cell::RefCell::new(None));
         let (handle, _) = cx.update(|cx| {
             let workspace = workspace.clone();
@@ -1215,6 +1227,202 @@ mod tests {
             cx.executor().advance_clock(Duration::from_millis(50));
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[gpui_kit::test]
+    fn text_drafts_survive_restart_and_clear_on_send_and_signout(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            if request.method() == "POST" && request.path() == "/api/v4/posts" {
+                Reply::json(
+                    json!({"id":"sent", "channel_id":"town", "user_id":"me", "message":"channel draft", "create_at":50}),
+                )
+            } else {
+                route(request)
+            }
+        });
+        persist::update(|state| {
+            let mut me = User::default();
+            me.id = "me".into();
+            state.session = Some(persist::SavedSession {
+                server: Client::new_unverified(&server.url(), "token")
+                    .unwrap()
+                    .server()
+                    .to_string(),
+                token: "token".into(),
+                user: Some(me),
+                ..Default::default()
+            });
+        });
+        let (handle, workspace) = open_workspace(&server, cx);
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_channel(&"town".into(), window, cx));
+            window.render_frame(cx);
+            window.input("channel draft", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| {
+                w.open_thread("town".into(), "root".into(), window, cx)
+            });
+            window.render_frame(cx);
+            window.input("thread draft", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        // Closing before the 500 ms debounce must queue the edit itself:
+        // inspecting the writer does not save staged changes as flush would.
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.close_thread(window, cx));
+        })
+        .unwrap();
+        let kind = TimelineKind::Thread {
+            channel: "town".into(),
+            root: "root".into(),
+        };
+        let written = persist::written_for_test();
+        let owner_server = written.session.as_ref().unwrap().server.clone();
+        assert_eq!(
+            written.drafts.get(&owner_server, "me", &kind).as_deref(),
+            Some("thread draft")
+        );
+
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| {
+                w.open_thread("town".into(), "root".into(), window, cx)
+            });
+            window.render_frame(cx);
+            window.press("secondary-a", cx);
+            window.input("/shr", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("tab", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        // set_value used by slash completion doesn't emit InputEvent::Change.
+        assert_eq!(
+            persist::load()
+                .drafts
+                .get(&owner_server, "me", &kind)
+                .as_deref(),
+            Some("/shrug ")
+        );
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.close_thread(window, cx));
+        })
+        .unwrap();
+        let written = persist::written_for_test();
+        assert_eq!(
+            written.drafts.get(&owner_server, "me", &kind).as_deref(),
+            Some("/shrug ")
+        );
+        // Restart from the queued snapshot, without a quit/flush rescuing it.
+        let snapshot = persist::round_trip_for_test(&written);
+        persist::update(|state| *state = snapshot);
+        let (second, restored) = open_workspace(&server, cx);
+        cx.update_window(second, |_, window, cx| {
+            restored.update(cx, |w, cx| {
+                w.open_channel(&"town".into(), window, cx);
+                assert_eq!(
+                    w.active_view().unwrap().read(cx).draft(cx).as_deref(),
+                    Some("channel draft")
+                );
+                w.open_thread("town".into(), "root".into(), window, cx);
+                assert_eq!(
+                    w.thread.as_ref().unwrap().0.read(cx).draft(cx).as_deref(),
+                    Some("/shrug ")
+                );
+            });
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(second, |_, window, cx| {
+            restored.update(cx, |w, cx| w.close_thread(window, cx));
+        })
+        .unwrap();
+        let sent = persist::written_for_test();
+        assert!(
+            sent.drafts.get(&owner_server, "me", &kind).is_none(),
+            "closing before the debounce must queue the send-clear"
+        );
+        // Leave another draft for the sign-out assertion below.
+        cx.update_window(second, |_, window, cx| {
+            restored.update(cx, |w, cx| {
+                w.open_thread("town".into(), "root".into(), window, cx)
+            });
+            window.render_frame(cx);
+            window.input("discard on sign-out", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(second, |_, window, cx| {
+            restored.update(cx, |w, cx| w.close_thread(window, cx));
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        wait_until(cx, |_| {
+            server.requests().iter().any(|r| {
+                r.method() == "POST"
+                    && r.path() == "/api/v4/posts"
+                    && serde_json::from_slice::<serde_json::Value>(r.body()).unwrap()["message"]
+                        == "channel draft"
+            })
+        });
+        let channel = TimelineKind::Channel("town".into());
+        let saved = persist::load();
+        let owner = saved.session.as_ref().unwrap();
+        assert!(saved.drafts.get(&owner.server, "me", &channel).is_none());
+        crate::app_root::end_session();
+        let signed_out = persist::load();
+        assert!(
+            signed_out
+                .drafts
+                .get(
+                    &owner.server,
+                    "me",
+                    &TimelineKind::Thread {
+                        channel: "town".into(),
+                        root: "root".into()
+                    }
+                )
+                .is_none()
+        );
+        // A stale view cannot recreate a draft after sign-out.
+        persist::stage_draft(
+            &owner.server,
+            "me",
+            saved.draft_generation,
+            &channel,
+            "stale",
+        );
+        assert!(
+            persist::load()
+                .drafts
+                .get(&owner.server, "me", &channel)
+                .is_none()
+        );
+        persist::update(|state| {
+            let mut other = owner.clone();
+            other.user.as_mut().unwrap().id = "other".into();
+            state.session = Some(other);
+        });
+        let (third, other) = open_workspace_as(&server, "other", cx);
+        cx.update_window(third, |_, window, cx| {
+            other.update(cx, |w, cx| {
+                w.open_channel(&"town".into(), window, cx);
+                w.open_thread("town".into(), "root".into(), window, cx);
+                assert!(w.active_view().unwrap().read(cx).draft(cx).is_none());
+                assert!(w.thread.as_ref().unwrap().0.read(cx).draft(cx).is_none());
+            });
+        })
+        .unwrap();
+        persist::update(|state| state.session = None);
     }
 
     #[gpui_kit::test]

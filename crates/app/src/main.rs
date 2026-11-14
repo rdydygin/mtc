@@ -85,10 +85,10 @@ fn main() {
         sso::register_callback_schemes(cx);
         // State is saved, and ended sessions' caches deleted, in the
         // background; finish before the process ends.
-        cx.on_app_quit(|_| {
+        // Run the flush future after all quit hooks have captured composers.
+        cx.on_app_quit(|_| async {
             persist::flush();
             cache::flush();
-            async {}
         })
         .detach();
         cx.spawn(async move |cx| {

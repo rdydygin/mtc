@@ -215,7 +215,7 @@ keep existing content and offer an inline retry.
 ### Effortless UX
 
 Posts send optimistically, with Retry or Discard if a send fails. Drafts are kept per
-conversation, and a "New messages" divider marks where you left off. You also get
+conversation across app restarts (channels and threads), and a "New messages" divider marks where you left off. You also get
 typing indicators, presence dots, and mention badges. Native notifications cover
 mentions and DMs when the conversation isn't in view (on macOS the app must run as a `.app`
 bundle for these). Do Not Disturb silences message notifications. The app restores your
@@ -245,6 +245,13 @@ notifications) is itself registered as the `Core` extension.
   `%APPDATA%\mtc` on Windows). Where there is no keychain (Linux and Windows for now),
   or it refuses, the token stays in that file: owner-only on macOS and Linux, relying on
   your profile folder's permissions on Windows.
+- Text drafts share `state.json` and its owner-only permissions and background writer.
+  Writes are debounced for 500 ms; closing a thread or evicting a conversation queues
+  a save immediately, and quitting flushes the latest text. Drafts belong to
+  the signed-in server and user and are discarded on sign-out or account changes.
+  Up to 100 drafts of 64 KiB each are saved (UTF-8-safe truncation); the oldest changed
+  drafts are dropped first. Attachments are not persisted. While editing an older
+  message, the unsent draft is saved rather than the edit in progress.
 - Not implemented yet: @mention autocomplete, multiple servers.
 
 ## Development

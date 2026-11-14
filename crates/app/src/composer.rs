@@ -70,6 +70,8 @@ pub enum ComposerEvent {
     CancelEdit,
     /// The text changed; others may be told the user is typing.
     Typing,
+    /// The unsent text changed, including when it becomes empty.
+    DraftChanged,
 }
 
 pub struct Composer {
@@ -117,6 +119,7 @@ impl Composer {
                         if !input.read(cx).value().is_empty() {
                             cx.emit(ComposerEvent::Typing);
                         }
+                        cx.emit(ComposerEvent::DraftChanged);
                         cx.notify();
                     }
                     _ => {}
@@ -355,6 +358,9 @@ impl Composer {
         self.input.update(cx, |state, cx| {
             state.set_value(text.to_string(), window, cx)
         });
+        // Programmatic set_value deliberately suppresses InputEvent::Change.
+        // Callers establish editing/saved_draft before replacing the input.
+        cx.emit(ComposerEvent::DraftChanged);
         cx.notify();
     }
 
