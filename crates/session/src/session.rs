@@ -20,7 +20,7 @@ use crate::{
     CustomEmojis, Delivery, Directory, EmojiStore, FollowedThreads, ThreadsEvent, Timeline,
     TimelineKind,
     retry::{is_transient, retry},
-    timeline::{LoadState, now_millis},
+    timeline::{CLIENT_NONCE, LoadState, now_millis, send_ids},
 };
 
 /// How long a "typing" signal stays visible without being repeated.
@@ -196,6 +196,13 @@ pub struct Session {
     timelines: HashMap<TimelineKind, WeakEntity<Timeline>>,
     /// Recently used timelines, kept alive for instant switching.
     timeline_cache: Vec<Entity<Timeline>>,
+    timeline_subscriptions: HashMap<TimelineKind, Subscription>,
+    /// Unresolved sends outlive the bounded timeline cache, but not the session.
+    /// Kept in memory only; composer text drafts have separate persistence.
+    outbox: Vec<Post>,
+    sending: HashSet<PostId>,
+    /// Confirmations received while a local delete request is outstanding.
+    deleting: HashMap<PostId, bool>,
     typing: HashMap<(ChannelId, PostId), Vec<(UserId, Instant)>>,
     last_typing_sent: HashMap<(ChannelId, PostId), Instant>,
     connection: Connection,
@@ -279,6 +286,10 @@ impl Session {
             window_active: true,
             timelines: HashMap::new(),
             timeline_cache: Vec::new(),
+            timeline_subscriptions: HashMap::new(),
+            outbox: Vec::new(),
+            sending: HashSet::new(),
+            deleting: HashMap::new(),
             typing: HashMap::new(),
             last_typing_sent: HashMap::new(),
             connection: Connection::Connecting,
@@ -698,7 +709,32 @@ impl Session {
                 let custom_emoji = self.custom_emoji.clone();
                 let timeline =
                     cx.new(|_| Timeline::new(kind.clone(), client, directory, emoji, custom_emoji));
-                self.timelines.insert(kind, timeline.downgrade());
+                let subscription = cx.observe(&timeline, |this, timeline, cx| {
+                    if this.outbox.is_empty() {
+                        return;
+                    }
+                    let timeline = timeline.read(cx);
+                    let confirmed: Vec<_> = timeline
+                        .entries()
+                        .iter()
+                        .filter(|e| {
+                            e.delivery() == Delivery::Sent && e.post().user_id == this.me.id
+                        })
+                        .flat_map(|e| send_ids(e.post()).map(str::to_owned))
+                        .collect();
+                    this.confirm_sends(&confirmed);
+                });
+                self.timeline_subscriptions
+                    .insert(kind.clone(), subscription);
+                self.timelines.insert(kind.clone(), timeline.downgrade());
+                timeline.update(cx, |t, cx| {
+                    for post in self.outbox.iter().filter(|p| kind.accepts(p)) {
+                        t.insert_pending(post.clone(), cx);
+                        if !self.sending.contains(&post.id) {
+                            t.set_delivery(&post.id, Delivery::Failed, cx);
+                        }
+                    }
+                });
                 timeline
             }
         };
@@ -709,6 +745,8 @@ impl Session {
             self.timeline_cache.remove(0);
         }
         self.timelines.retain(|_, weak| weak.upgrade().is_some());
+        self.timeline_subscriptions
+            .retain(|kind, _| self.timelines.contains_key(kind));
         timeline.update(cx, |t, cx| t.load(cx));
         timeline
     }
@@ -722,6 +760,12 @@ impl Session {
             .values()
             .filter_map(WeakEntity::upgrade)
             .collect()
+    }
+
+    fn confirm_sends(&mut self, ids: &[String]) {
+        self.outbox.retain(|p| !ids.contains(&p.pending_post_id));
+        self.sending
+            .retain(|id| !ids.iter().any(|p| p == id.as_str()));
     }
 
     /// Load a channel found outside the startup list before showing it.
@@ -1162,11 +1206,18 @@ impl Session {
             return;
         }
         self.mark_viewed(kind.channel(), cx);
-        let now = now_millis();
-        let pending_id = format!("{}:{}", self.me.id, now);
+        let mut now = now_millis();
+        let pending_id = loop {
+            let id = format!("{}:{}", self.me.id, now);
+            if !self.outbox.iter().any(|p| p.pending_post_id == id) {
+                break id;
+            }
+            now += 1;
+        };
         let mut post = Post::default();
         post.id = PostId::from(pending_id.as_str());
         post.pending_post_id = pending_id.clone();
+        post.props.insert(CLIENT_NONCE.into(), pending_id.into());
         post.create_at = now;
         post.user_id = self.me.id.clone();
         post.channel_id = kind.channel().clone();
@@ -1175,19 +1226,22 @@ impl Session {
         post.metadata.files = files;
 
         let timeline = self.timeline(kind.clone(), cx);
+        self.outbox.push(post.clone());
+        self.sending.insert(post.id.clone());
         timeline.update(cx, |t, cx| t.insert_pending(post.clone(), cx));
         self.last_typing_sent.remove(&(
             kind.channel().clone(),
             kind.root().cloned().unwrap_or_default(),
         ));
 
-        self.submit_post(post, timeline, cx);
+        self.submit_post(post, cx);
     }
 
     /// Submit an optimistic post with its original deduplication id.
-    fn submit_post(&mut self, post: Post, timeline: Entity<Timeline>, cx: &mut Context<Self>) {
+    fn submit_post(&mut self, post: Post, cx: &mut Context<Self>) {
         let client = self.client.clone();
         let pending = post.id.clone();
+        let author = post.user_id.clone();
         cx.spawn(async move |this, cx| {
             let file_ids: Vec<String> = post.metadata.files.iter().map(|f| f.id.clone()).collect();
             let root = (!post.root_id.is_empty()).then_some(&post.root_id);
@@ -1198,19 +1252,31 @@ impl Session {
                     root,
                     &post.pending_post_id,
                     &file_ids,
+                    &post.props,
                 )
                 .await;
             let _ = this.update(cx, |this, cx| match result {
-                Ok(post) => this.route_post(post, false, cx),
+                Ok(mut post) => {
+                    if post.user_id.is_empty() {
+                        post.user_id = author;
+                    }
+                    // Some servers omit the echo field in the REST response;
+                    // this request still confirms the exact submitted send.
+                    if post.pending_post_id.is_empty() {
+                        post.pending_post_id = pending.to_string();
+                    }
+                    this.route_post(post, false, cx);
+                }
                 Err(err) => {
                     // A late echo can confirm the post before this failure arrives.
-                    let failed = timeline.update(cx, |t, cx| {
-                        if t.position(&pending).is_none() {
-                            return false;
+                    this.sending.remove(&pending);
+                    let failed = this.outbox.iter().any(|p| p.id == pending);
+                    if failed {
+                        for timeline in this.live_timelines() {
+                            timeline
+                                .update(cx, |t, cx| t.set_delivery(&pending, Delivery::Failed, cx));
                         }
-                        t.set_delivery(&pending, Delivery::Failed, cx);
-                        true
-                    });
+                    }
                     if failed {
                         cx.emit(SessionEvent::SendFailed {
                             message: format!("Couldn’t send your message. {err:#}").into(),
@@ -1225,28 +1291,33 @@ impl Session {
 
     /// Send a failed post again.
     pub fn retry_post(&mut self, kind: &TimelineKind, pending: &PostId, cx: &mut Context<Self>) {
-        let Some(timeline) = self.live_timeline(kind) else {
+        let Some(post) = self
+            .outbox
+            .iter()
+            .find(|p| &p.id == pending && kind.accepts(p))
+            .cloned()
+        else {
             return;
         };
-        let failed = timeline.update(cx, |t, cx| {
-            let ix = t.position(pending)?;
-            let entry = &t.entries()[ix];
-            if entry.delivery() != Delivery::Failed {
-                return None;
-            }
-            let post = entry.post().as_ref().clone();
-            t.set_delivery(pending, Delivery::Pending, cx);
-            Some(post)
-        });
-        if let Some(post) = failed {
-            self.submit_post(post, timeline, cx);
+        if !self.sending.insert(pending.clone()) {
+            return;
         }
+        let timeline = self.timeline(kind.clone(), cx);
+        timeline.update(cx, |t, cx| t.set_delivery(pending, Delivery::Pending, cx));
+        self.submit_post(post, cx);
     }
 
     /// Discard a failed post without sending it.
     pub fn discard_post(&mut self, kind: &TimelineKind, pending: &PostId, cx: &mut Context<Self>) {
-        if let Some(timeline) = self.live_timeline(kind) {
-            timeline.update(cx, |t, cx| t.remove(pending, cx));
+        if self.sending.contains(pending) {
+            return;
+        }
+        let before = self.outbox.len();
+        self.outbox.retain(|p| &p.id != pending || !kind.accepts(p));
+        if self.outbox.len() != before {
+            for timeline in self.live_timelines() {
+                timeline.update(cx, |t, cx| t.remove(pending, cx));
+            }
         }
     }
 
@@ -1268,22 +1339,87 @@ impl Session {
     }
 
     pub fn delete_post(&mut self, post: &Post, cx: &mut Context<Self>) {
-        // Removing at once feels instant; the server event is idempotent.
-        for timeline in self.live_timelines() {
-            timeline.update(cx, |t, cx| t.remove(&post.id, cx));
+        if self.deleting.contains_key(&post.id) {
+            return;
         }
+        self.deleting.insert(post.id.clone(), false);
+        // Keep followed threads until confirmation, so a rejection cannot lose
+        // their unread state or list membership.
+        let removed: Vec<WeakEntity<Timeline>> = self
+            .live_timelines()
+            .into_iter()
+            .filter_map(|timeline| {
+                timeline.update(cx, |t, cx| {
+                    t.position(&post.id)?;
+                    t.remove(&post.id, cx);
+                    Some(timeline.downgrade())
+                })
+            })
+            .collect();
         let client = self.client.clone();
         let post = post.clone();
         cx.spawn(async move |this, cx| {
             let result = client.delete_post(&post.id).await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(()) => this.route_deleted(&post, cx),
-                Err(err) => cx.emit(SessionEvent::SendFailed {
-                    message: format!("Couldn’t delete the message. {err:#}").into(),
-                }),
+            let fetched = if let Err(err) = &result {
+                let rejected = matches!(
+                    err.downcast_ref::<ApiError>(),
+                    Some(ApiError::Unauthorized | ApiError::Status(400..=499))
+                );
+                if rejected {
+                    None
+                } else {
+                    Some(client.get_post(&post.id).await)
+                }
+            } else {
+                None
+            };
+            let _ = this.update(cx, |this, cx| {
+                let confirmed = this.deleting.remove(&post.id).unwrap_or(false);
+                match result {
+                    Ok(()) => this.route_deleted(&post, cx),
+                    Err(err) => {
+                        if !confirmed {
+                            match fetched {
+                                Some(Ok(post)) if post.delete_at > 0 => {
+                                    this.route_deleted(&post, cx)
+                                }
+                                Some(Ok(post)) => this.restore_deleted(post, &removed, cx),
+                                Some(Err(fetch_err)) => {
+                                    if matches!(
+                                        fetch_err.downcast_ref::<ApiError>(),
+                                        Some(ApiError::Status(404))
+                                    ) {
+                                        this.route_deleted(&post, cx);
+                                    } else {
+                                        log::warn!("reconciling delete: {fetch_err:#}");
+                                    }
+                                }
+                                None => this.restore_deleted(post, &removed, cx),
+                            }
+                        }
+                        cx.emit(SessionEvent::SendFailed {
+                            message: format!("Couldn’t delete the message. {err:#}").into(),
+                        });
+                    }
+                }
             });
         })
         .detach();
+    }
+
+    fn restore_deleted(
+        &mut self,
+        post: Post,
+        removed: &[WeakEntity<Timeline>],
+        cx: &mut Context<Self>,
+    ) {
+        for timeline in removed.iter().filter_map(WeakEntity::upgrade) {
+            timeline.update(cx, |t, cx| t.upsert(post.clone(), cx));
+        }
+        if !post.is_reply() {
+            self.threads
+                .update(cx, |t, cx| t.note_root_edited(&post, cx));
+        }
     }
 
     /// Add the user's reaction, or remove it if already present.
@@ -1677,9 +1813,9 @@ impl Session {
                     }
                     self.load_favorites(cx);
                     self.threads.update(cx, |t, cx| t.refresh(cx));
-                    for timeline in self.live_timelines() {
-                        timeline.update(cx, |t, cx| t.catch_up(cx));
-                    }
+                }
+                for timeline in self.live_timelines() {
+                    timeline.update(cx, |t, cx| t.catch_up(cx));
                 }
                 self.has_connected = true;
                 cx.notify();
@@ -1907,6 +2043,10 @@ impl Session {
     }
 
     fn route_post(&mut self, post: Post, from_event: bool, cx: &mut Context<Self>) {
+        if post.user_id == self.me.id {
+            let confirmed: Vec<String> = send_ids(&post).map(str::to_owned).collect();
+            self.confirm_sends(&confirmed);
+        }
         if post.is_reply() {
             if from_event
                 && let Some(channel) =
@@ -1958,6 +2098,9 @@ impl Session {
     }
 
     fn route_deleted(&mut self, post: &Post, cx: &mut Context<Self>) {
+        if let Some(confirmed) = self.deleting.get_mut(&post.id) {
+            *confirmed = true;
+        }
         if !post.is_reply() {
             self.threads.update(cx, |t, cx| t.forget(&post.id, cx));
         }
@@ -2427,7 +2570,7 @@ mod slow_network_tests {
     }
 
     #[gpui_kit::test]
-    fn a_rejected_optimistic_delete_is_restored_by_reload(cx: &mut TestAppContext) {
+    fn a_rejected_optimistic_delete_is_restored_immediately(cx: &mut TestAppContext) {
         let server = SlowServer::start(Network::new(Duration::from_millis(20)), |request| {
             if request.method() == "DELETE" && request.path() == "/api/v4/posts/p1" {
                 return Reply::json(json!({ "message": "Forbidden" })).status(403);
@@ -2441,16 +2584,567 @@ mod slow_network_tests {
         wait_until(cx, |cx| {
             timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
         });
+        session
+            .read_with(cx, |s, _| s.threads().clone())
+            .update(cx, |t, cx| {
+                t.apply_update(
+                    serde_json::from_value(json!({
+                        "id": "p1", "reply_count": 2, "last_reply_at": 20,
+                        "unread_replies": 2, "unread_mentions": 1,
+                        "post": {"id": "p1", "channel_id": "town", "create_at": 1}
+                    }))
+                    .unwrap(),
+                    cx,
+                );
+            });
         let post = timeline.read_with(cx, |t, _| t.entries()[0].post().as_ref().clone());
         let failures = failures(&session, cx);
         session.update(cx, |s, cx| s.delete_post(&post, cx));
         timeline.read_with(cx, |t, _| assert!(t.entries().is_empty()));
         wait_until(cx, |_| !failures.borrow().is_empty());
+        timeline.read_with(cx, |t, _| assert!(t.position(&post.id).is_some()));
+        session.read_with(cx, |s, cx| {
+            let thread = s.threads().read(cx).thread(&post.id).unwrap();
+            assert_eq!(thread.unread_replies(), 2);
+            assert_eq!(thread.unread_mentions(), 1);
+        });
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "GET" && r.path() == "/api/v4/posts/p1")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn outbox_survives_eviction_retry_and_discard(cx: &mut TestAppContext) {
+        let succeeds = Arc::new(AtomicBool::new(false));
+        let server = SlowServer::start(Network::new(Duration::from_millis(30)), {
+            let succeeds = succeeds.clone();
+            move |request| {
+                if request.method() == "POST" && request.path() == "/api/v4/posts" {
+                    if !succeeds.load(Ordering::SeqCst) {
+                        return Reply::json(json!({"message": "Forbidden"})).status(403);
+                    }
+                    let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                    return Reply::json(
+                        json!({"id": "sent", "user_id": "me", "channel_id": "town",
+                        "root_id": "root", "pending_post_id": body["pending_post_id"], "create_at": 10}),
+                    );
+                }
+                if request.method() == "GET"
+                    && request.path().starts_with("/api/v4/posts/root/thread")
+                {
+                    return Reply::json(json!({}));
+                }
+                route(request)
+            }
+        });
+        let session = start(&server, cx);
+        let kind = TimelineKind::Thread {
+            channel: "town".into(),
+            root: "root".into(),
+        };
+        let timeline = session.update(cx, |s, cx| s.timeline(kind.clone(), cx));
+        let weak = timeline.downgrade();
+        let pending = session.update(cx, |s, cx| {
+            let mut file = mattermost::FileInfo::default();
+            file.id = "file".into();
+            s.send_post(&kind, "Keep me".into(), vec![file], cx);
+            s.outbox[0].id.clone()
+        });
+        // The in-flight send must not keep the timeline alive either.
+        drop(timeline);
+        session.update(cx, |s, cx| {
+            for ix in 0..super::TIMELINE_CACHE {
+                s.timeline(TimelineKind::Channel(format!("other-{ix}").into()), cx);
+            }
+        });
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none(), "timeline was evicted");
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| !s.sending.contains(&pending))
+        });
+        let timeline = session.update(cx, |s, cx| s.timeline(kind.clone(), cx));
+        timeline.read_with(cx, |t, _| {
+            let entry = &t.entries()[t.position(&pending).unwrap()];
+            assert_eq!(entry.delivery(), crate::Delivery::Failed);
+            assert_eq!(entry.post().message, "Keep me");
+            assert_eq!(entry.post().metadata.files[0].id, "file");
+            assert_eq!(entry.post().root_id.as_str(), "root");
+        });
+        succeeds.store(true, Ordering::SeqCst);
+        session.update(cx, |s, cx| s.retry_post(&kind, &pending, cx));
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.outbox.is_empty()));
+        timeline.read_with(cx, |t, _| {
+            assert!(t.position(&pending).is_none());
+            assert!(t.position(&"sent".into()).is_some());
+        });
+        let bodies: Vec<serde_json::Value> = server
+            .requests()
+            .iter()
+            .filter(|r| r.method() == "POST" && r.path() == "/api/v4/posts")
+            .map(|r| serde_json::from_slice(r.body()).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+
+        succeeds.store(false, Ordering::SeqCst);
+        session.update(cx, |s, cx| {
+            s.send_post(&kind, "Discard me".into(), vec![], cx)
+        });
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.sending.is_empty()));
+        let weak = timeline.downgrade();
+        drop(timeline);
+        session.update(cx, |s, cx| {
+            for ix in 0..super::TIMELINE_CACHE {
+                s.timeline(TimelineKind::Channel(format!("other-{ix}").into()), cx);
+            }
+        });
+        cx.run_until_parked();
+        assert!(
+            weak.upgrade().is_none(),
+            "failed entry's timeline was evicted"
+        );
+        let timeline = session.update(cx, |s, cx| s.timeline(kind.clone(), cx));
+        let pending = session.read_with(cx, |s, _| s.outbox[0].id.clone());
+        session.update(cx, |s, cx| s.discard_post(&kind, &pending, cx));
+        assert!(session.read_with(cx, |s, _| s.outbox.is_empty()));
+        timeline.read_with(cx, |t, _| assert!(t.position(&pending).is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn a_rest_catch_up_confirms_the_session_outbox(cx: &mut TestAppContext) {
+        let committed = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), {
+            let committed = committed.clone();
+            move |request| {
+                if request.method() == "POST" && request.path() == "/api/v4/posts" {
+                    let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                    *committed.lock().unwrap() = Some(json!({
+                        "id": "confirmed", "channel_id": "town", "user_id": "me", "create_at": 2,
+                        "props": body["props"], "message": body["message"]
+                    }));
+                    return Reply::json(json!({"message": "Response lost after commit"}))
+                        .status(500);
+                }
+                if request.method() == "GET"
+                    && request.path().starts_with("/api/v4/channels/town/posts?")
+                    && request.path().contains("since=")
+                {
+                    return Reply::json(
+                        json!({"posts": {"confirmed": committed.lock().unwrap().clone().unwrap()}}),
+                    );
+                }
+                route(request)
+            }
+        });
+        let session = start(&server, cx);
+        let kind = TimelineKind::Channel("town".into());
+        let timeline = session.update(cx, |s, cx| s.timeline(kind.clone(), cx));
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
+        });
+        session.update(cx, |s, cx| {
+            s.send_post(
+                &kind,
+                "Committed despite the lost response".into(),
+                vec![],
+                cx,
+            )
+        });
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.sending.is_empty()));
+        let pending = session.read_with(cx, |s, _| s.outbox[0].id.clone());
+        assert!(
+            committed
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get("pending_post_id")
+                .is_none()
+        );
+        timeline.update(cx, |t, cx| t.catch_up(cx));
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.outbox.is_empty()));
+        timeline.read_with(cx, |t, _| {
+            assert!(t.position(&pending).is_none());
+            assert!(t.position(&"confirmed".into()).is_some());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn deduplicated_retry_removes_its_optimistic_twin(cx: &mut TestAppContext) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server = SlowServer::start(Network::new(Duration::from_millis(30)), {
+            let attempts = attempts.clone();
+            move |request| {
+                if request.method() == "POST" && request.path() == "/api/v4/posts" {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Reply::json(json!({"message": "Lost response"})).status(500);
+                    }
+                    return Reply::json(
+                        json!({"id": "S", "channel_id": "town", "user_id": "me", "create_at": 2}),
+                    );
+                }
+                if request.method() == "GET"
+                    && request.path().split('?').next() == Some("/api/v4/channels/town/posts")
+                    && attempts.load(Ordering::SeqCst) > 0
+                {
+                    return Reply::json(
+                        json!({"posts": {"S": {"id": "S", "channel_id": "town", "user_id": "me", "create_at": 2}}}),
+                    );
+                }
+                route(request)
+            }
+        });
+        let session = start(&server, cx);
+        let kind = TimelineKind::Channel("town".into());
+        let timeline = session.update(cx, |s, cx| s.timeline(kind.clone(), cx));
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
+        });
+        session.update(cx, |s, cx| s.send_post(&kind, "Once".into(), vec![], cx));
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.sending.is_empty()));
+        let pending = session.read_with(cx, |s, _| s.outbox[0].id.clone());
         timeline.update(cx, |t, cx| t.reload(cx));
         wait_until(cx, |cx| {
             timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
         });
-        timeline.read_with(cx, |t, _| assert!(t.position(&post.id).is_some()));
+        timeline.read_with(cx, |t, _| {
+            assert_eq!(t.position(&"S".into()), Some(0));
+            assert_eq!(t.position(&pending), Some(1));
+        });
+        let events = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&timeline, move |_, event: &crate::TimelineEvent, _| {
+                events.borrow_mut().push(event.clone())
+            })
+            .detach();
+        });
+        session.update(cx, |s, cx| s.retry_post(&kind, &pending, cx));
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.outbox.is_empty()));
+        timeline.read_with(cx, |t, _| {
+            assert_eq!(t.entries().len(), 1);
+            assert_eq!(t.entries()[0].id().as_str(), "S");
+        });
+        assert!(events.borrow().contains(&crate::TimelineEvent::Spliced {
+            old: 1..2,
+            new_count: 0
+        }));
+        assert!(!events.borrow().contains(&crate::TimelineEvent::Reset));
+    }
+
+    fn rollback_stays_in_original_timelines(status: u16, cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(40)), move |request| {
+            let path = request.path().split('?').next().unwrap_or_default();
+            match (request.method(), path) {
+                ("GET", "/api/v4/posts/old/thread") => Reply::json(json!({"posts": {"old": {
+                    "id": "old", "channel_id": "town", "create_at": 1, "message": "Old root"
+                }}})),
+                ("GET", "/api/v4/channels/town/posts") if request.path().contains("before=") => {
+                    Reply::json(json!({}))
+                }
+                ("GET", "/api/v4/channels/town/posts") => {
+                    let posts: serde_json::Map<String, serde_json::Value> = (60..120).map(|i| {
+                        (format!("n{i}"), json!({"id": format!("n{i}"), "channel_id": "town", "create_at": i}))
+                    }).collect();
+                    Reply::json(json!({"posts": posts}))
+                }
+                ("DELETE", "/api/v4/posts/old") => {
+                    Reply::json(json!({"message": "Delete failed"})).status(status)
+                }
+                ("GET", "/api/v4/posts/old") => {
+                    Reply::json(json!({"id": "old", "channel_id": "town", "create_at": 1}))
+                }
+                _ => route(request),
+            }
+        });
+        let session = start(&server, cx);
+        let (channel, thread) = session.update(cx, |s, cx| {
+            (
+                s.timeline(TimelineKind::Channel("town".into()), cx),
+                s.timeline(
+                    TimelineKind::Thread {
+                        channel: "town".into(),
+                        root: "old".into(),
+                    },
+                    cx,
+                ),
+            )
+        });
+        wait_until(cx, |cx| {
+            channel.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
+                && thread.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
+        });
+        let post = thread.read_with(cx, |t, _| t.entries()[0].post().as_ref().clone());
+        let failures = failures(&session, cx);
+        session.update(cx, |s, cx| s.delete_post(&post, cx));
+        wait_until(cx, |_| !failures.borrow().is_empty());
+        thread.read_with(cx, |t, _| assert!(t.position(&post.id).is_some()));
+        channel.read_with(cx, |t, _| {
+            assert_eq!(t.entries().len(), 60);
+            assert_eq!(t.entries()[0].id().as_str(), "n60");
+            assert!(t.position(&post.id).is_none());
+        });
+        channel.update(cx, |t, cx| t.load_older(cx));
+        wait_until(cx, |_| {
+            server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "GET" && r.path().contains("before=n60"))
+        });
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "GET" && r.path().contains("before=old"))
+        );
+    }
+
+    #[gpui_kit::test]
+    fn rejected_delete_restores_only_timelines_that_removed_it(cx: &mut TestAppContext) {
+        rollback_stays_in_original_timelines(403, cx);
+    }
+
+    #[gpui_kit::test]
+    fn ambiguous_delete_restores_only_timelines_that_removed_it(cx: &mut TestAppContext) {
+        rollback_stays_in_original_timelines(500, cx);
+    }
+
+    fn first_hello(load_finished: bool, live_during_load: bool, cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(100)), |request| {
+            if request.method() == "GET"
+                && request.path().starts_with("/api/v4/channels/town/posts?")
+                && request.path().contains("since=")
+            {
+                assert!(
+                    request.path().contains("since=0"),
+                    "socket traffic skipped the gap: {}",
+                    request.path()
+                );
+                return Reply::json(json!({"order": ["missed"], "posts": {
+                    "missed": {"id": "missed", "channel_id": "town", "create_at": 2}
+                }}));
+            }
+            route(request)
+        });
+        let session = start(&server, cx);
+        let timeline = session.update(cx, |s, cx| {
+            s.timeline(TimelineKind::Channel("town".into()), cx)
+        });
+        if load_finished {
+            wait_until(cx, |cx| {
+                timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
+            });
+        } else {
+            wait_until(cx, |_| {
+                server.requests().iter().any(|r| {
+                    r.method() == "GET" && r.path().starts_with("/api/v4/channels/town/posts?")
+                })
+            });
+            assert!(timeline.read_with(cx, |t, _| *t.state() == LoadState::Loading));
+        }
+        session.update(cx, |s, cx| {
+            assert!(!s.has_connected);
+            s.handle_event(mattermost::Event::Connected, cx);
+            if live_during_load {
+                let mut post = mattermost::Post::default();
+                post.id = "live".into();
+                post.channel_id = "town".into();
+                post.create_at = 100_000;
+                s.route_post(post, true, cx);
+            }
+        });
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| t.position(&"missed".into()).is_some())
+        });
+        timeline.read_with(cx, |t, _| {
+            assert_eq!(t.entries().len(), if live_during_load { 3 } else { 2 })
+        });
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.method() == "GET"
+                    && r.path().starts_with("/api/v4/channels/town/posts?")
+                    && r.path().contains("since="))
+                .count(),
+            1
+        );
+    }
+
+    #[gpui_kit::test]
+    fn first_hello_catches_up_loaded_timelines(cx: &mut TestAppContext) {
+        first_hello(true, false, cx);
+    }
+
+    #[gpui_kit::test]
+    fn first_hello_waits_for_initial_loads(cx: &mut TestAppContext) {
+        first_hello(false, false, cx);
+    }
+
+    #[gpui_kit::test]
+    fn first_hello_does_not_skip_the_gap_when_live_posts_arrive_during_load(
+        cx: &mut TestAppContext,
+    ) {
+        first_hello(false, true, cx);
+    }
+
+    #[gpui_kit::test]
+    fn first_hello_queues_a_thread_refresh_after_its_initial_load(cx: &mut TestAppContext) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let server = SlowServer::start(Network::new(Duration::from_millis(100)), {
+            let reads = reads.clone();
+            move |request| {
+                if request.method() == "GET"
+                    && request.path().split('?').next() == Some("/api/v4/posts/root/thread")
+                {
+                    let refreshed = reads.fetch_add(1, Ordering::SeqCst) > 0;
+                    let mut posts =
+                        json!({"root": {"id": "root", "channel_id": "town", "create_at": 1}});
+                    if refreshed {
+                        posts["missed"] = json!({"id": "missed", "channel_id": "town", "root_id": "root", "create_at": 2});
+                    }
+                    return Reply::json(json!({"posts": posts}));
+                }
+                route(request)
+            }
+        });
+        let session = start(&server, cx);
+        let timeline = session.update(cx, |s, cx| {
+            s.timeline(
+                TimelineKind::Thread {
+                    channel: "town".into(),
+                    root: "root".into(),
+                },
+                cx,
+            )
+        });
+        wait_until(cx, |_| reads.load(Ordering::SeqCst) == 1);
+        assert!(timeline.read_with(cx, |t, _| *t.state() == LoadState::Loading));
+        session.update(cx, |s, cx| s.handle_event(mattermost::Event::Connected, cx));
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| t.position(&"missed".into()).is_some())
+        });
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[gpui_kit::test]
+    fn successful_rest_send_without_echo_id_clears_the_outbox(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), |request| {
+            if request.method() == "POST" && request.path() == "/api/v4/posts" {
+                return Reply::json(json!({"id": "sent", "channel_id": "town", "create_at": 5}));
+            }
+            route(request)
+        });
+        let session = start(&server, cx);
+        let kind = TimelineKind::Channel("town".into());
+        let timeline = session.update(cx, |s, cx| {
+            s.send_post(&kind, "Hello".into(), vec![], cx);
+            s.timeline(kind, cx)
+        });
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.outbox.is_empty()));
+        timeline.read_with(cx, |t, _| {
+            assert!(t.position(&"sent".into()).is_some());
+            assert!(
+                t.entries()
+                    .iter()
+                    .all(|e| e.delivery() == crate::Delivery::Sent)
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_confirmed_socket_delete_wins_over_a_late_rejection(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(50)), |request| {
+            if request.method() == "DELETE" && request.path() == "/api/v4/posts/p1" {
+                return Reply::json(json!({"message": "Already gone"})).status(403);
+            }
+            route(request)
+        });
+        let session = start(&server, cx);
+        let timeline = session.update(cx, |s, cx| {
+            s.timeline(TimelineKind::Channel("town".into()), cx)
+        });
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
+        });
+        let post = timeline.read_with(cx, |t, _| t.entries()[0].post().as_ref().clone());
+        let failures = failures(&session, cx);
+        session.update(cx, |s, cx| {
+            s.delete_post(&post, cx);
+            s.handle_event(mattermost::Event::PostDeleted(post.clone()), cx);
+            // A second click must not overwrite the socket confirmation.
+            s.delete_post(&post, cx);
+        });
+        wait_until(cx, |_| !failures.borrow().is_empty());
+        timeline.read_with(cx, |t, _| assert!(t.entries().is_empty()));
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.method() == "DELETE" && r.path() == "/api/v4/posts/p1")
+                .count(),
+            1
+        );
+    }
+
+    fn ambiguous_delete(deleted: bool, cx: &mut TestAppContext) {
+        let server =
+            SlowServer::start(
+                Network::new(Duration::from_millis(20)),
+                move |request| match (request.method(), request.path()) {
+                    ("DELETE", "/api/v4/posts/p1") => {
+                        Reply::json(json!({"message": "Lost response"})).status(500)
+                    }
+                    ("GET", "/api/v4/posts/p1") if deleted => Reply::not_found(),
+                    ("GET", "/api/v4/posts/p1") => {
+                        Reply::json(json!({"id": "p1", "channel_id": "town",
+                    "message": "fresh after ambiguous delete", "create_at": 1, "update_at": 2}))
+                    }
+                    _ => route(request),
+                },
+            );
+        let session = start(&server, cx);
+        let timeline = session.update(cx, |s, cx| {
+            s.timeline(TimelineKind::Channel("town".into()), cx)
+        });
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
+        });
+        let post = timeline.read_with(cx, |t, _| t.entries()[0].post().as_ref().clone());
+        let failures = failures(&session, cx);
+        session.update(cx, |s, cx| s.delete_post(&post, cx));
+        wait_until(cx, |_| !failures.borrow().is_empty());
+        timeline.read_with(cx, |t, _| {
+            if deleted {
+                assert!(t.entries().is_empty());
+            } else {
+                assert_eq!(
+                    t.entries()[0].post().message,
+                    "fresh after ambiguous delete"
+                );
+            }
+        });
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.method() == "GET" && r.path() == "/api/v4/posts/p1")
+                .count(),
+            1
+        );
+    }
+
+    #[gpui_kit::test]
+    fn ambiguous_delete_refetches_current_post(cx: &mut TestAppContext) {
+        ambiguous_delete(false, cx);
+    }
+
+    #[gpui_kit::test]
+    fn ambiguous_committed_delete_stays_deleted(cx: &mut TestAppContext) {
+        ambiguous_delete(true, cx);
     }
 
     #[gpui_kit::test]
