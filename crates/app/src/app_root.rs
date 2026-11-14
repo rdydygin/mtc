@@ -195,7 +195,7 @@ impl AppRoot {
 /// signed out or the server ended the session. The account's pictures,
 /// attachment previews, and contacts shouldn't outlast it on this
 /// computer, nor greet whoever signs in next.
-fn end_session() {
+pub(crate) fn end_session() {
     persist::update(|state| state.session = None);
     cache::clear();
 }
