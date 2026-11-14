@@ -892,7 +892,7 @@ mod tests {
             server
                 .requests()
                 .iter()
-                .filter(|r| r.path().ends_with("/posts/search"))
+                .filter(|r| r.method() == "POST" && r.path() == "/api/v4/teams/team/posts/search")
                 .count()
         };
 

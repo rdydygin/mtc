@@ -1124,7 +1124,11 @@ mod tests {
         server
             .requests()
             .iter()
-            .filter(|r| r.path().contains("before="))
+            .filter(|r| {
+                r.method() == "GET"
+                    && r.path().split('?').next() == Some("/api/v4/channels/town/posts")
+                    && r.path().contains("before=")
+            })
             .count()
     }
 
