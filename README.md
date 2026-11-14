@@ -74,6 +74,7 @@ On Linux and Windows, use Ctrl where the table says ⌘, Alt for ⌥, and Shift 
 | --- | --- |
 | ⌘K / ⌘T | Jump to a channel, person, or app command |
 | ⌘F | Search the conversation's messages |
+| ⌘⇧F | Search all channels in the current team |
 | ⌘⇧T | Threads you follow |
 | ⌥↑ / ⌥↓ | Previous / next channel |
 | ⌥⇧↑ / ⌥⇧↓ | Previous / next unread channel |
@@ -99,15 +100,18 @@ they are shown in the file manager instead.
 Message links open web pages (`http` and `https`) and email addresses (`mailto`);
 other link types show a notification and are not sent to system handlers.
 
-Search a conversation's messages with ⌘F. Results appear beside the conversation as you
-type, newest first, with the matching words marked; ↑ and ↓ move through them and Enter
+Search a conversation's messages with ⌘F, or all channels in the current team with ⌘⇧F.
+Switch between **This conversation** and **All channels** in the search pane (Tab reaches
+the scope buttons). Team results name their channel or direct message; opening one
+navigates there. Results appear beside the conversation as you type, newest first, with
+the matching words marked; ↑ and ↓ move through them and Enter
 opens one. A message scrolls into view in the conversation and is marked for a moment
 (older messages load as needed); a reply opens in its thread, with a button back to the
 results. Mattermost's search syntax works, such as `"exact phrase"`, `from:username`,
 and `-word`. The last word you type also matches longer words that start with it.
 
-Right-click a message to reply, react, copy, edit, or delete it. Click a message to open
-its replies in a thread panel beside the channel (collapsed reply threads); the reply
+Right-click a message to reply, react, copy its text or Mattermost link, edit, or delete
+it. Click a message to open its replies in a thread panel beside the channel (collapsed reply threads); the reply
 count sits at the end of the message's reactions line. Click someone's name or avatar, or
 an @mention of them in a message, to see their profile and start a direct message.
 
@@ -194,8 +198,8 @@ Posts send optimistically, with Retry or Discard if a send fails. Drafts are kep
 conversation, and a "New messages" divider marks where you left off. You also get
 typing indicators, presence dots, and mention badges. Native notifications cover
 mentions and DMs when the conversation isn't in view (on macOS the app must run as a `.app`
-bundle for these). The app restores your session, team, last channel, zoom, appearance,
-and sidebar width on launch, and follows the system light/dark setting.
+bundle for these). Do Not Disturb silences message notifications. The app restores your
+session, team, last channel, zoom, appearance, and sidebar width on launch, and follows the system light/dark setting.
 
 ### Extensibility
 
@@ -221,8 +225,7 @@ notifications) is itself registered as the `Core` extension.
   `%APPDATA%\mtc` on Windows). Where there is no keychain (Linux and Windows for now),
   or it refuses, the token stays in that file: owner-only on macOS and Linux, relying on
   your profile folder's permissions on Windows.
-- Not implemented yet: search across all channels, @mention autocomplete, multiple
-  servers.
+- Not implemented yet: @mention autocomplete, multiple servers.
 
 ## Development
 

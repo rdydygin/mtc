@@ -466,6 +466,13 @@ impl TimelineView {
             PostAction::CopyText => {
                 cx.write_to_clipboard(ClipboardItem::new_string(post.message.clone()));
             }
+            PostAction::CopyLink => {
+                let session = self.session.read(cx);
+                if let Some(team) = session.team() {
+                    let link = format!("{}{}/pl/{}", session.client().server(), team.name, post.id);
+                    cx.write_to_clipboard(ClipboardItem::new_string(link));
+                }
+            }
             PostAction::Edit => self.start_editing(&post, window, cx),
             PostAction::Delete => {
                 let session = self.session.clone();
@@ -584,6 +591,7 @@ impl TimelineView {
         });
 
         PostRow::new(entry.clone(), session.me().id.clone(), on_action)
+            .has_permalink(session.team().is_some() && entry.delivery() == session::Delivery::Sent)
             .author(author, avatar)
             .author_status(directory.status(&post.user_id))
             .continuation(continuation)
@@ -1254,6 +1262,26 @@ mod tests {
                 v.timeline.read(cx).entries().len()
             );
         });
+    }
+
+    #[gpui_kit::test]
+    fn copying_a_message_link_uses_the_current_team(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (view, _) = open_channel(&server, cx);
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, cx| v.session.read(cx).team().is_some())
+        });
+        let handle = cx.update(|cx| cx.windows()[0]);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.handle_post_action(&"n119".into(), PostAction::CopyLink, window, cx)
+            });
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                format!("{}/team/pl/n119", server.url())
+            );
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

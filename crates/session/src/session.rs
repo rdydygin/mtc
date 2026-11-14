@@ -124,6 +124,10 @@ pub struct Session {
     teams: Vec<Team>,
     team: Option<TeamId>,
     channels: HashMap<ChannelId, ChannelEntry>,
+    /// Completed lists invalidate older channel hydration.
+    channel_list_generation: u64,
+    /// Channels hydrated since the pending list request started.
+    hydrated_channels: HashSet<ChannelId>,
     channels_loaded: bool,
     teams_loaded: bool,
     /// Favorite channels in every team; the server keeps them as
@@ -207,6 +211,8 @@ impl Session {
             teams: Vec::new(),
             team: preferred_team,
             channels: HashMap::new(),
+            channel_list_generation: 0,
+            hydrated_channels: HashSet::new(),
             channels_loaded: false,
             teams_loaded: false,
             favorites: HashSet::new(),
@@ -385,12 +391,14 @@ impl Session {
         }
         self.team = Some(team);
         self.channels.clear();
+        self.channel_list_generation += 1;
         self.channels_loaded = false;
         self.load_channels(cx);
         cx.notify();
     }
 
     fn load_channels(&mut self, cx: &mut Context<Self>) {
+        self.hydrated_channels.clear();
         let team = self.team.clone();
         self.threads.update(cx, |t, cx| t.set_team(team, cx));
         let Some(team) = self.team.clone() else {
@@ -411,7 +419,7 @@ impl Session {
                         .into_iter()
                         .map(|m| (m.channel_id.clone(), m))
                         .collect();
-                    let channels: HashMap<ChannelId, ChannelEntry> = channels
+                    let mut channels: HashMap<ChannelId, ChannelEntry> = channels
                         .into_iter()
                         .filter(|c| c.delete_at == 0)
                         .map(|channel| {
@@ -419,6 +427,13 @@ impl Session {
                             (channel.id.clone(), ChannelEntry { channel, member })
                         })
                         .collect();
+                    // These channels were loaded after this snapshot began.
+                    for id in this.hydrated_channels.drain() {
+                        if let Some(entry) = this.channels.get(&id) {
+                            channels.insert(id, entry.clone());
+                        }
+                    }
+                    this.channel_list_generation += 1;
                     // A channel left elsewhere, or one the user was removed
                     // from, takes its threads with it.
                     let lost = this.channels.keys().any(|id| !channels.contains_key(id));
@@ -591,6 +606,36 @@ impl Session {
             .values()
             .filter_map(WeakEntity::upgrade)
             .collect()
+    }
+
+    /// Load a channel found outside the startup list before showing it.
+    pub fn ensure_channel(&mut self, id: &ChannelId, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if self.channels.contains_key(id) {
+            return Task::ready(Ok(()));
+        }
+        let client = self.client.clone();
+        let id = id.clone();
+        let team = self.team.clone();
+        let generation = self.channel_list_generation;
+        cx.spawn(async move |this, cx| {
+            let channel = client.channel(&id).await?;
+            let member = Some(client.my_channel_member(&id).await?);
+            this.update(cx, |this, cx| -> Result<()> {
+                if this.team != team || this.channel_list_generation != generation {
+                    return Err(anyhow::anyhow!("The channel list changed."));
+                }
+                let partner = channel.direct_partner(&this.me.id);
+                this.channels
+                    .entry(id.clone())
+                    .or_insert(ChannelEntry { channel, member });
+                this.hydrated_channels.insert(id);
+                this.directory.update(cx, |d, cx| d.ensure(partner, cx));
+                this.load_group_members(cx);
+                cx.notify();
+                Ok(())
+            })??;
+            Ok(())
+        })
     }
 
     /// Show `channel` and mark it read. Returns its timeline.
@@ -1071,6 +1116,9 @@ impl Session {
                 // Anything could have happened while we were away, and a
                 // load that gave up while the network was down can now work.
                 if self.has_connected || std::mem::take(&mut self.load_failed) {
+                    let me = self.me.id.clone();
+                    self.directory
+                        .update(cx, |d, cx| d.refresh_statuses(vec![me], cx));
                     if self.teams.is_empty() {
                         self.load_teams(cx);
                     } else {
@@ -1797,6 +1845,154 @@ mod slow_network_tests {
         });
         assert!(failures.load(Ordering::SeqCst) >= 3);
         session.read_with(cx, |s, _| assert!(s.channel(&"town".into()).is_some()));
+    }
+
+    #[gpui_kit::test]
+    fn channel_hydration_and_list_refresh_keep_completion_order(cx: &mut TestAppContext) {
+        for hydrate_first in [true, false] {
+            let armed = Arc::new(AtomicBool::new(false));
+            let delay = armed.clone();
+            let waiting = Arc::new(AtomicBool::new(false));
+            let blocked = waiting.clone();
+            let (release, receive) = std::sync::mpsc::channel();
+            let receive = std::sync::Mutex::new(receive);
+            let lists = AtomicUsize::new(0);
+            let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+                let path = request.path().split('?').next().unwrap_or_default();
+                let delayed = if hydrate_first {
+                    "/api/v4/users/me/teams/team/channels"
+                } else {
+                    "/api/v4/channels/design/members/me"
+                };
+                if path == delayed && delay.swap(false, Ordering::SeqCst) {
+                    blocked.store(true, Ordering::SeqCst);
+                    receive
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release delayed response");
+                }
+                match path {
+                    "/api/v4/users/me/teams/team/channels" => {
+                        let snapshot = lists.fetch_add(1, Ordering::SeqCst);
+                        Reply::json(json!([{
+                            "id": "town", "team_id": "team", "name": "town-square", "type": "O",
+                            "display_name": format!("Snapshot {snapshot}")
+                        }]))
+                    }
+                    "/api/v4/channels/design" => Reply::json(json!({
+                        "id": "design", "team_id": "team", "name": "design", "type": "P"
+                    })),
+                    "/api/v4/channels/design/members/me" => Reply::json(json!({
+                        "channel_id": "design", "user_id": "me", "last_viewed_at": 10,
+                        "notify_props": { "mark_unread": "mention" }
+                    })),
+                    _ => route(request),
+                }
+            });
+            let session = start(&server, cx);
+            wait_until(cx, |cx| {
+                session.read_with(cx, |s, _| s.is_loaded() && s.team().is_some())
+            });
+            armed.store(true, Ordering::SeqCst);
+            if hydrate_first {
+                session.update(cx, |s, cx| s.load_channels(cx));
+                wait_until(cx, |_| waiting.load(Ordering::SeqCst));
+            }
+            let task = session.update(cx, |s, cx| s.ensure_channel(&"design".into(), cx));
+            let result = Rc::new(RefCell::new(None));
+            let slot = result.clone();
+            cx.spawn(async move |_| *slot.borrow_mut() = Some(task.await))
+                .detach();
+            if hydrate_first {
+                wait_until(cx, |_| result.borrow().is_some());
+                assert!(result.borrow().as_ref().unwrap().is_ok());
+                session.update(cx, |s, cx| {
+                    s.open_channel(&"design".into(), cx);
+                });
+            } else {
+                wait_until(cx, |_| waiting.load(Ordering::SeqCst));
+                session.update(cx, |s, cx| s.load_channels(cx));
+            }
+            let viewed_at = session.read_with(cx, |s, _| {
+                s.channel(&"design".into())
+                    .map(super::ChannelEntry::last_viewed_at)
+            });
+            if hydrate_first {
+                release.send(()).unwrap();
+            }
+            wait_until(cx, |cx| {
+                session.read_with(cx, |s, _| {
+                    s.channel(&"town".into())
+                        .is_some_and(|c| c.channel().display_name == "Snapshot 1")
+                })
+            });
+            if hydrate_first {
+                session.read_with(cx, |s, _| {
+                    let channel = s
+                        .channel(&"design".into())
+                        .expect("keep the freshly hydrated channel");
+                    assert!(channel.is_muted());
+                    assert_eq!(channel.last_viewed_at(), viewed_at.unwrap());
+                    assert_eq!(s.active_channel(), Some(&"design".into()));
+                });
+                // A later authoritative snapshot can still remove the channel.
+                session.update(cx, |s, cx| s.load_channels(cx));
+                wait_until(cx, |cx| {
+                    session.read_with(cx, |s, _| {
+                        s.channel(&"town".into())
+                            .is_some_and(|c| c.channel().display_name == "Snapshot 2")
+                    })
+                });
+            } else {
+                release.send(()).unwrap();
+                wait_until(cx, |_| result.borrow().is_some());
+                assert!(result.borrow().as_ref().unwrap().is_err());
+            }
+            session.read_with(cx, |s, _| assert!(s.channel(&"design".into()).is_none()));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn reconnect_refreshes_our_presence_in_both_directions(cx: &mut TestAppContext) {
+        let dnd = Arc::new(AtomicBool::new(false));
+        let remote = dnd.clone();
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            if request.path() == "/api/v4/users/status/ids" {
+                let status = if remote.load(Ordering::SeqCst) {
+                    "dnd"
+                } else {
+                    "online"
+                };
+                Reply::json(json!([{ "user_id": "me", "status": status }]))
+            } else {
+                route(request)
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, cx| {
+                s.directory.read(cx).status(&s.me.id) == mattermost::Status::Online
+            })
+        });
+        session.update(cx, |s, cx| s.handle_event(mattermost::Event::Connected, cx));
+        for enabled in [true, false] {
+            session.update(cx, |s, cx| {
+                s.handle_event(mattermost::Event::Disconnected, cx)
+            });
+            dnd.store(enabled, Ordering::SeqCst);
+            session.update(cx, |s, cx| s.handle_event(mattermost::Event::Connected, cx));
+            let expected = if enabled {
+                mattermost::Status::DoNotDisturb
+            } else {
+                mattermost::Status::Online
+            };
+            wait_until(cx, |cx| {
+                session.read_with(cx, |s, cx| {
+                    s.directory.read(cx).status(&s.me.id) == expected
+                })
+            });
+        }
     }
 
     /// A team with a private channel besides Town Square. The server

@@ -40,6 +40,9 @@ pub struct Directory {
     /// can tell when it is out of date.
     revision: u64,
     statuses: HashMap<UserId, Status>,
+    /// Only active status reads have tokens; status events invalidate them.
+    status_requests: HashMap<UserId, u64>,
+    next_status_request: u64,
     /// Usernames asked about that aren't known users.
     usernames: HashMap<String, UsernameLookup>,
     queued: HashSet<UserId>,
@@ -61,6 +64,8 @@ impl Directory {
             remembered: HashSet::new(),
             revision: 0,
             statuses: HashMap::new(),
+            status_requests: HashMap::new(),
+            next_status_request: 0,
             usernames: HashMap::new(),
             queued: HashSet::new(),
             in_flight: HashSet::new(),
@@ -149,12 +154,19 @@ impl Directory {
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             let users = client.users_by_usernames(vec![username.clone()]).await;
-            let statuses = match &users {
-                Ok(users) if !users.is_empty() => client
-                    .statuses_by_ids(users.iter().map(|user| user.id.clone()).collect())
-                    .await
-                    .unwrap_or_default(),
-                _ => Vec::new(),
+            let (statuses, tokens) = match &users {
+                Ok(users) if !users.is_empty() => {
+                    let ids = users.iter().map(|user| user.id.clone()).collect::<Vec<_>>();
+                    let Ok(tokens) = this.update(cx, |this, _| this.begin_status_request(&ids))
+                    else {
+                        return;
+                    };
+                    (
+                        client.statuses_by_ids(ids).await.unwrap_or_default(),
+                        tokens,
+                    )
+                }
+                _ => (Vec::new(), HashMap::new()),
             };
             let _ = this.update(cx, |this, cx| match users {
                 Ok(users) if users.is_empty() => {
@@ -163,7 +175,7 @@ impl Directory {
                 }
                 Ok(users) => {
                     this.usernames.remove(&username);
-                    this.statuses.extend(statuses);
+                    this.apply_statuses(statuses, &tokens);
                     this.insert(users, cx);
                 }
                 Err(err) => {
@@ -183,6 +195,7 @@ impl Directory {
             return;
         }
         self.in_flight.extend(ids.iter().cloned());
+        let tokens = self.begin_status_request(&ids);
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             // Independent requests: one round trip, not two.
@@ -207,9 +220,7 @@ impl Directory {
                     }
                     Err(err) => log::warn!("loading users: {err:#}"),
                 }
-                if let Ok(statuses) = statuses {
-                    this.statuses.extend(statuses);
-                }
+                this.apply_statuses(statuses.unwrap_or_default(), &tokens);
                 cx.notify();
             });
         })
@@ -217,23 +228,55 @@ impl Directory {
     }
 
     pub fn set_status(&mut self, id: UserId, status: Status, cx: &mut Context<Self>) {
+        self.status_requests.remove(&id);
         if self.statuses.insert(id, status) != Some(status) {
             cx.notify();
         }
     }
 
-    /// Re-read presence for `ids`, such as the user's own at startup.
+    /// Re-read presence for `ids`, such as our own at startup or reconnect.
     pub fn refresh_statuses(&mut self, ids: Vec<UserId>, cx: &mut Context<Self>) {
+        let tokens = self.begin_status_request(&ids);
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
-            if let Ok(statuses) = client.statuses_by_ids(ids).await {
-                let _ = this.update(cx, |this, cx| {
-                    this.statuses.extend(statuses);
-                    cx.notify();
-                });
-            }
+            let statuses = client.statuses_by_ids(ids).await.unwrap_or_default();
+            let _ = this.update(cx, |this, cx| {
+                this.apply_statuses(statuses, &tokens);
+                cx.notify();
+            });
         })
         .detach();
+    }
+
+    fn begin_status_request(&mut self, ids: &[UserId]) -> HashMap<UserId, u64> {
+        self.next_status_request = self
+            .next_status_request
+            .checked_add(1)
+            .expect("status request counter overflow");
+        ids.iter()
+            .map(|id| {
+                self.status_requests
+                    .insert(id.clone(), self.next_status_request);
+                (id.clone(), self.next_status_request)
+            })
+            .collect()
+    }
+
+    fn apply_statuses(&mut self, statuses: Vec<(UserId, Status)>, tokens: &HashMap<UserId, u64>) {
+        for (id, status) in statuses {
+            if tokens
+                .get(&id)
+                .is_some_and(|token| self.status_requests.get(&id) == Some(token))
+            {
+                self.statuses.insert(id, status);
+            }
+        }
+        // Omitted users and failed requests must release their tokens too.
+        for (id, token) in tokens {
+            if self.status_requests.get(id) == Some(token) {
+                self.status_requests.remove(id);
+            }
+        }
     }
 
     /// Change a known user in place, for optimistic updates.
@@ -364,6 +407,148 @@ mod tests {
             .iter()
             .filter(|r| r.path() == "/api/v4/users/ids")
             .count()
+    }
+
+    #[gpui_kit::test]
+    fn status_tokens_are_removed_without_reusing_them(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let directory = start(&server, cx);
+        directory.update(cx, |d, cx| {
+            let ann = mattermost::UserId::from("ann");
+            let old = d.begin_status_request(&[ann.clone(), "omitted".into()]);
+            d.set_status(ann.clone(), Status::DoNotDisturb, cx);
+            assert!(!d.status_requests.contains_key(&ann));
+            let current = d.begin_status_request(std::slice::from_ref(&ann));
+            assert_ne!(old[&ann], current[&ann]);
+            d.apply_statuses(vec![(ann.clone(), Status::Online)], &old);
+            assert_eq!(d.status(&ann), Status::DoNotDisturb);
+            assert_eq!(d.status_requests.get(&ann), current.get(&ann));
+            assert!(!d.status_requests.contains_key(&"omitted".into()));
+            d.apply_statuses(vec![(ann.clone(), Status::Away)], &current);
+            assert!(d.status_requests.is_empty());
+            let later = d.begin_status_request(std::slice::from_ref(&ann));
+            assert_ne!(later[&ann], current[&ann]);
+            d.apply_statuses(vec![(ann.clone(), Status::Online)], &current);
+            assert_eq!(d.status(&ann), Status::Away);
+            assert_eq!(d.status_requests.get(&ann), later.get(&ann));
+            d.apply_statuses(Vec::new(), &later);
+            d.set_status("unrequested".into(), Status::Online, cx);
+            assert!(d.status_requests.is_empty());
+        });
+    }
+
+    /// Omitted users and failed status reads release tokens on every path.
+    fn check_status_cleanup(
+        cx: &mut TestAppContext,
+        lookup: fn(&mut Directory, &mut gpui_kit::Context<Directory>),
+    ) {
+        for status in [200, 503] {
+            let server =
+                SlowServer::start(Network::new(Duration::from_millis(50)), move |request| {
+                    match request.path() {
+                        "/api/v4/users/ids" | "/api/v4/users/usernames" => Reply::json(json!([
+                            { "id": "ann", "username": "ann" }
+                        ])),
+                        "/api/v4/users/status/ids" => Reply::json(json!([])).status(status),
+                        _ => Reply::not_found(),
+                    }
+                });
+            let directory = start(&server, cx);
+            directory.update(cx, lookup);
+            wait_until(cx, |_| {
+                server
+                    .requests()
+                    .iter()
+                    .any(|r| r.path() == "/api/v4/users/status/ids")
+            });
+            wait_until(cx, |cx| {
+                directory.read_with(cx, |d, _| d.status_requests.is_empty())
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn refresh_releases_status_tokens_on_omissions_and_errors(cx: &mut TestAppContext) {
+        check_status_cleanup(cx, |d, cx| d.refresh_statuses(vec!["me".into()], cx));
+    }
+
+    #[gpui_kit::test]
+    fn batched_lookup_releases_status_tokens_on_omissions_and_errors(cx: &mut TestAppContext) {
+        check_status_cleanup(cx, |d, cx| d.ensure(["ann".into()], cx));
+    }
+
+    #[gpui_kit::test]
+    fn username_lookup_releases_status_tokens_on_omissions_and_errors(cx: &mut TestAppContext) {
+        check_status_cleanup(cx, |d, cx| d.ensure_username("ann", cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_status_change_wins_over_an_older_refresh(cx: &mut TestAppContext) {
+        for (old, new) in [
+            (Status::Online, Status::DoNotDisturb),
+            (Status::DoNotDisturb, Status::Online),
+        ] {
+            let server = SlowServer::start(Network::new(Duration::from_millis(50)), move |_| {
+                Reply::json(json!([
+                    { "user_id": "me", "status": old.as_str() },
+                    { "user_id": "ann", "status": "away" }
+                ]))
+            });
+            let directory = start(&server, cx);
+            directory.update(cx, |d, cx| {
+                d.set_status("me".into(), new, cx);
+                d.refresh_statuses(vec!["me".into(), "ann".into()], cx);
+            });
+            wait_until(cx, |_| !server.requests().is_empty());
+            // Even a repeated status event supersedes the pending REST read.
+            directory.update(cx, |d, cx| d.set_status("me".into(), new, cx));
+            wait_until(cx, |cx| {
+                directory.read_with(cx, |d, _| d.status(&"ann".into()) == Status::Away)
+            });
+            directory.read_with(cx, |d, _| assert_eq!(d.status(&"me".into()), new));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn user_lookups_keep_newer_status_changes(cx: &mut TestAppContext) {
+        for by_username in [false, true] {
+            let server =
+                SlowServer::start(
+                    Network::new(Duration::from_millis(50)),
+                    |request| match request.path() {
+                        "/api/v4/users/ids" | "/api/v4/users/usernames" => Reply::json(json!([
+                            { "id": "ann", "username": "ann" }
+                        ])),
+                        "/api/v4/users/status/ids" => Reply::json(json!([
+                            { "user_id": "ann", "status": "online" }
+                        ])),
+                        _ => Reply::not_found(),
+                    },
+                );
+            let directory = start(&server, cx);
+            directory.update(cx, |d, cx| {
+                if by_username {
+                    d.ensure_username("ann", cx);
+                } else {
+                    d.ensure(["ann".into()], cx);
+                }
+            });
+            wait_until(cx, |_| {
+                server
+                    .requests()
+                    .iter()
+                    .any(|r| r.path() == "/api/v4/users/status/ids")
+            });
+            directory.update(cx, |d, cx| {
+                d.set_status("ann".into(), Status::DoNotDisturb, cx)
+            });
+            wait_until(cx, |cx| {
+                directory.read_with(cx, |d, _| d.user(&"ann".into()).is_some())
+            });
+            directory.read_with(cx, |d, _| {
+                assert_eq!(d.status(&"ann".into()), Status::DoNotDisturb)
+            });
+        }
     }
 
     #[gpui_kit::test]
