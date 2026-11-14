@@ -11,6 +11,11 @@ on:
         description: "Version (MAJOR.MINOR.PATCH); empty = next patch or higher Cargo.toml version"
         required: false
         type: string
+      dry_run:
+        description: "Build and verify artifacts without creating a tag or release"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -41,6 +46,7 @@ jobs:
     permissions:
       contents: read
     outputs:
+      version: ${{ steps.tag.outputs.version }}
       tag: ${{ steps.tag.outputs.tag }}
       zip: ${{ steps.package.outputs.zip }}
       sha: ${{ steps.source.outputs.sha }}
@@ -186,9 +192,84 @@ jobs:
             ${{ steps.package.outputs.zip }}.sha256
             latest.json
 
+  verify:
+    name: Verify release artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    # Both real releases and dry runs verify the downloaded artifact, without
+    # a write token or any repository checkout/code execution.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets
+      - name: Verify archive, checksum, update feed and bundle version
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
+          ZIP: ${{ needs.build.outputs.zip }}
+          BUILT_SHA: ${{ needs.build.outputs.sha }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          python3 - <<'PYVERIFY'
+          import hashlib, json, os, plistlib, re, zipfile
+          from pathlib import Path
+
+          version, tag, zip_name, repo = (os.environ[k] for k in ("VERSION", "TAG", "ZIP", "GITHUB_REPOSITORY"))
+          assert tag == f"v{version}", "tag does not match the picked version"
+          assert zip_name == f"mtc-{tag}-macos-universal.zip", "unexpected archive name"
+          archive_path = Path(zip_name)
+          assert archive_path.is_file() and archive_path.stat().st_size > 0, "archive missing or empty"
+          checksum = Path(zip_name + ".sha256").read_text().split()
+          assert len(checksum) == 2 and checksum[1] == zip_name, "checksum names the wrong archive"
+          assert re.fullmatch(r"[0-9a-f]{64}", checksum[0]), "invalid SHA-256 checksum"
+          digest = hashlib.sha256()
+          with archive_path.open("rb") as archive_file:
+              for chunk in iter(lambda: archive_file.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          sha256 = digest.hexdigest()
+          assert sha256 == checksum[0], "archive SHA-256 mismatch"
+
+          page = f"https://github.com/{repo}/releases/tag/{tag}"
+          url = f"https://github.com/{repo}/releases/download/{tag}/{zip_name}"
+          feed = json.loads(Path("latest.json").read_text())
+          assert feed["version"] == version, "feed version mismatch"
+          assert feed["page"] == page, "feed release page mismatch"
+          assert feed["downloads"]["macos-universal"] == {"url": url, "sha256": sha256}, "feed download URL or checksum mismatch"
+
+          # Inspect directly in the archive; no macOS runner or extraction needed.
+          with zipfile.ZipFile(archive_path) as archive:
+              assert archive.testzip() is None, "corrupt zip member"
+              assert archive.getinfo("mtc.app/Contents/MacOS/mtc").file_size > 0, "bundle executable is empty"
+              plist = plistlib.loads(archive.read("mtc.app/Contents/Info.plist"))
+          assert plist["CFBundleIdentifier"] == "dev.mtc.desktop", "bundle identifier mismatch"
+          assert plist["CFBundleShortVersionString"] == version, "bundle version mismatch"
+          assert plist["CFBundleVersion"] == version, "bundle build version mismatch"
+
+          dry_run = os.environ["DRY_RUN"] == "true"
+          heading = "Release dry run verified" if dry_run else "Release artifacts verified"
+          summary = (
+              f"## {heading}\n\n"
+              f"- Version: `{version}` (`{tag}`)\n"
+              f"- Built commit: `{os.environ['BUILT_SHA']}`\n"
+              f"- Archive: `{zip_name}` ({archive_path.stat().st_size} bytes)\n"
+              f"- SHA-256: `{sha256}`\n"
+              f"- Update feed target: {url}\n"
+              f"- Archive integrity, feed fields and bundle versions verified.\n"
+          )
+          if dry_run:
+              summary += "\nPublication skipped: no tag, release or draft is created by this dry run.\n"
+          print(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write(summary)
+          PYVERIFY
+
   publish:
     name: Publish release
-    needs: build
+    needs: [build, verify]
+    # Only manual runs may opt out; tag pushes always publish after verification.
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
     runs-on: ubuntu-latest
     # This is the only job allowed to mutate tags or releases. It never runs
     # repository code; it receives just the three packaged assets.

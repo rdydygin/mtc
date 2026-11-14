@@ -265,11 +265,17 @@ and choose a branch or tag. Manual branch runs accept an optional `version` such
 workspace version in `Cargo.toml` when higher. A tag run uses that tag's exact version.
 To start a new minor or major series by default, bump `version` in `Cargo.toml`.
 
+Select `dry_run` in **Run workflow** (or use
+`gh workflow run release.yml --ref main -F dry_run=true`) to run full CI, build and
+verify the uploaded archive, checksum, feed and bundle version without creating any
+tag, release or draft. Tag pushes always publish after verification.
+
 The Release workflow reruns the full CI on the exact source commit before building.
 It stamps the selected version into the checkout (nothing is committed back), builds a
 universal (Apple Silicon and Intel) `mtc.app` with `script/bundle-macos --universal`,
-and packages a zip, SHA-256 checksum and update feed. A separate publishing job creates
-a draft release, uploads all assets, verifies that the tag still points to the built
+and packages a zip, SHA-256 checksum and update feed. A read-only job verifies the
+downloaded artifacts before a separate publishing job creates a draft release,
+uploads all assets, verifies that the tag still points to the built
 commit, then publishes. Existing releases, including drafts, are refused; if publication
 fails, inspect and remove the draft before retrying. Only the publishing job can write
 tags or releases. Linux and Windows are checked by CI; release downloads remain macOS-only.
