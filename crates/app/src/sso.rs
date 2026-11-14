@@ -70,6 +70,7 @@ pub struct SsoPanel {
     error: Option<SharedString>,
     paste: Entity<InputState>,
     _lookup_task: Option<Task<()>>,
+    _completion_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -105,6 +106,7 @@ impl SsoPanel {
             error: orphaned.then(|| ORPHANED.into()),
             paste,
             _lookup_task: None,
+            _completion_task: None,
             _subscriptions: vec![subscription],
         }
     }
@@ -116,7 +118,7 @@ impl SsoPanel {
             return;
         }
         self.server = server.clone();
-        self.pending = None;
+        self.cancel_completion();
         self.error = None;
         if server.is_empty() {
             self.lookup = Lookup::Idle;
@@ -125,6 +127,7 @@ impl SsoPanel {
             return;
         }
         self.look_up(LOOKUP_DELAY, cx);
+        cx.notify();
     }
 
     fn look_up(&mut self, delay: Duration, cx: &mut Context<Self>) {
@@ -183,6 +186,7 @@ impl SsoPanel {
                 return;
             }
         }
+        self.cancel_completion();
         self.pending = Some((sso, provider.label().to_string().into()));
         self.error = None;
         cx.notify();
@@ -198,8 +202,15 @@ impl SsoPanel {
         }
     }
 
-    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Dropping the task prevents a late result from signing in after cancellation.
+    fn cancel_completion(&mut self) {
+        self._completion_task = None;
+        self.completing = false;
         self.pending = None;
+    }
+
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_completion();
         self.error = None;
         self.paste.update(cx, |p, cx| p.set_value("", window, cx));
         cx.notify();
@@ -212,11 +223,19 @@ impl SsoPanel {
         if self.completing || callback.trim().is_empty() {
             return;
         }
+        self.finish_sign_in(async move { sso.complete(&callback).await }, cx);
+    }
+
+    fn finish_sign_in(
+        &mut self,
+        completion: impl Future<Output = anyhow::Result<(Client, User)>> + 'static,
+        cx: &mut Context<Self>,
+    ) {
         self.completing = true;
         self.error = None;
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = sso.complete(&callback).await;
+        self._completion_task = Some(cx.spawn(async move |this, cx| {
+            let result = completion.await;
             let _ = this.update(cx, |this, cx| {
                 this.completing = false;
                 match result {
@@ -228,8 +247,7 @@ impl SsoPanel {
                 }
                 cx.notify();
             });
-        })
-        .detach();
+        }));
     }
 
     fn provider_icon(kind: SsoKind) -> IconName {
@@ -429,6 +447,77 @@ mod tests {
     use gpui_kit::{Bounds, TestAppContext, WindowBounds, WindowOptions, point, px, size};
 
     use super::*;
+
+    fn signed_in() -> anyhow::Result<(Client, User)> {
+        Ok((
+            Client::new_unverified("https://chat.example.com", "token")?,
+            User::default(),
+        ))
+    }
+
+    fn begin_completion(
+        panel: &Entity<SsoPanel>,
+        cx: &mut App,
+    ) -> futures::channel::oneshot::Sender<anyhow::Result<(Client, User)>> {
+        let (send, receive) = futures::channel::oneshot::channel();
+        panel.update(cx, |panel, cx| {
+            panel.pending = Some((
+                SsoAttempt::new("chat.example.com", Handoff::Desktop).unwrap(),
+                "SSO".into(),
+            ));
+            panel.finish_sign_in(async move { receive.await.unwrap() }, cx);
+        });
+        send
+    }
+
+    #[gpui_kit::test]
+    fn cancel_and_server_changes_discard_in_flight_sign_in(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let (window, panel) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| SsoPanel::new(window, cx))
+            })
+            .unwrap()
+        });
+        let events = Rc::new(Cell::new(0));
+        let count = events.clone();
+        let _subscription =
+            cx.update(|cx| cx.subscribe(&panel, move |_, _, _| count.set(count.get() + 1)));
+        let cancelled = cx.update(|cx| begin_completion(&panel, cx));
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("cancel-sso", cx);
+        })
+        .unwrap();
+        // Complete before polling the cancelled task again, as a racing server might.
+        let _ = cancelled.send(signed_in());
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(!panel.read(cx).completing);
+            assert!(!panel.read(cx).is_waiting());
+            assert!(panel.read(cx).error.is_none());
+        });
+        assert_eq!(events.get(), 0);
+
+        let stale = cx.update(|cx| begin_completion(&panel, cx));
+        cx.run_until_parked();
+        cx.update(|cx| panel.update(cx, |panel, cx| panel.set_server("other.example.com", cx)));
+        let _ = stale.send(signed_in());
+        cx.run_until_parked();
+        assert_eq!(events.get(), 0);
+        cx.update(|cx| assert!(!panel.read(cx).completing));
+
+        let current = cx.update(|cx| begin_completion(&panel, cx));
+        current.send(signed_in()).ok().unwrap();
+        cx.run_until_parked();
+        assert_eq!(events.get(), 1);
+        cx.update(|cx| {
+            assert!(!panel.read(cx).is_waiting());
+            assert!(!panel.read(cx).completing);
+        });
+    }
 
     /// The panel in a column as narrow as the sign-in card's.
     struct Narrow(Entity<SsoPanel>);

@@ -4548,6 +4548,8 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "gpui-kit",
+ "hmac",
+ "libc",
  "log",
  "mattermost",
  "reqwest",
