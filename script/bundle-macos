@@ -20,7 +20,7 @@ for arg in "$@"; do
 done
 
 cd "$(dirname "$0")/.."
-VERSION=$(cargo metadata --no-deps --format-version 1 \
+VERSION=$(cargo metadata --locked --no-deps --format-version 1 \
   | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="mtc"))')
 
 APP=target/release/bundle/mtc.app
@@ -29,13 +29,13 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 if [[ $UNIVERSAL == 1 ]]; then
   # Needs both targets: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-  cargo build --release -p mtc --target aarch64-apple-darwin
-  cargo build --release -p mtc --target x86_64-apple-darwin
+  cargo build --locked --release -p mtc --target aarch64-apple-darwin
+  cargo build --locked --release -p mtc --target x86_64-apple-darwin
   lipo -create -output "$APP/Contents/MacOS/mtc" \
     target/aarch64-apple-darwin/release/mtc \
     target/x86_64-apple-darwin/release/mtc
 else
-  cargo build --release -p mtc
+  cargo build --locked --release -p mtc
   cp target/release/mtc "$APP/Contents/MacOS/mtc"
 fi
 

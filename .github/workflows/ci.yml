@@ -1,14 +1,18 @@
 name: CI
 
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
+  workflow_call:
 
+# github.workflow is the caller's name in a reusable workflow. Only standalone
+# PR runs share a group; called runs get a unique group, separate from Release.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.workflow == 'CI' && github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -18,30 +22,96 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  fmt:
-    name: Format
+  rustfmt:
+    name: rustfmt
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  check:
-    name: Clippy and tests
-    # mtc is a macOS app, so it is linted and tested on macOS.
+  macos:
+    name: macOS clippy and tests
     runs-on: macos-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
           components: clippy
-      # Only main saves the cache (about 1.2 GB). A cache saved on a PR branch
-      # can only be read by that branch, and each one pushes main's cache
-      # toward eviction under the repository's 10 GB limit. PRs restore main's.
-      - uses: Swatinem/rust-cache@v2
+      # PRs restore main's cache; saving per-branch caches would waste quota.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          key: macos-ci
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  linux:
+    name: Linux build, clippy and tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install GPUI native dependencies
+        # gpui-pre-linux 0.3.11 enables Wayland + X11. xkbcommon and x11rb
+        # link xkbcommon[-x11]/xcb; fontconfig-sys and freetype-sys use pkg-config.
+        # WGPU needs the Vulkan loader. Tests use GPUI's in-process test platform,
+        # so no Xvfb, compositor or software rendering adapter is needed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config cmake \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-xkb-dev \
+            libvulkan1 libfontconfig1-dev libfreetype6-dev
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: linux-ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  windows:
+    name: Windows build, clippy and tests
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: windows-ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked

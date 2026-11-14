@@ -1,73 +1,110 @@
 name: Release
 
-# Every push to main publishes a release. The version is the next patch after
-# the newest v* tag, or the workspace version in Cargo.toml when that is higher,
-# so bump Cargo.toml to start a new minor or major series. Also:
-#   - Actions → Release → Run workflow: releases the chosen branch the same way.
-#   - Push a tag (git tag v0.3.0 && git push origin v0.3.0): releases that commit
-#     as that exact version.
+# Merging to main does not release. Tags use their exact version; manual runs
+# can choose a version or default to the next patch / higher workspace version.
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (MAJOR.MINOR.PATCH); empty = next patch or higher Cargo.toml version"
+        required: false
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
-  macos:
+  ci:
+    name: CI
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  build:
     name: Build mtc.app
+    needs: ci
     runs-on: macos-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      zip: ${{ steps.package.outputs.zip }}
+      sha: ${{ steps.source.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Record the built commit
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
           targets: aarch64-apple-darwin, x86_64-apple-darwin
-      # A cache saved by a run on a pushed tag or another branch is visible only
-      # to that ref, so nothing else could restore it. Save from runs on main.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          key: macos-release
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Pick the release version
         id: tag
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version || '' }}
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
+            if [[ -n "$INPUT_VERSION" && "$INPUT_VERSION" != "$VERSION" ]]; then
+              echo "::error::The version input must match the selected tag."
+              exit 1
+            fi
+          elif [[ -n "$INPUT_VERSION" ]]; then
+            VERSION="$INPUT_VERSION"
           else
-            BASE=$(cargo metadata --no-deps --format-version 1 \
+            BASE=$(cargo metadata --locked --no-deps --format-version 1 \
               | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="mtc"))')
-            # The checkout is shallow and has no tags, so ask the remote.
-            VERSION=$(git ls-remote --tags --refs origin 'v*' | python3 -c '
+            # The checkout is shallow; list tags through the authenticated API.
+            gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
+              --jq '.[].ref' > release-tags.txt
+            VERSION=$(python3 - "$BASE" <<'PYVERSION'
           import re, sys
           def parse(v):
-              m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", v)
+              m = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", v)
               return tuple(map(int, m.groups())) if m else None
           base = parse(sys.argv[1])
-          tags = [parse(line.strip().split("refs/tags/v", 1)[1]) for line in sys.stdin if "refs/tags/v" in line]
-          tags = [t for t in tags if t]
-          latest = max(tags, default=None)
+          assert base is not None, "workspace version must be MAJOR.MINOR.PATCH"
+          tags = [parse(line.strip().removeprefix("refs/tags/v")) for line in open("release-tags.txt")]
+          latest = max((t for t in tags if t), default=None)
           major, minor, patch = base if latest is None or latest < base else (latest[0], latest[1], latest[2] + 1)
           print(f"{major}.{minor}.{patch}")
-          ' "$BASE")
+          PYVERSION
+          )
           fi
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::${VERSION} is not a release version (MAJOR.MINOR.PATCH)"
             exit 1
           fi
           TAG="v${VERSION}"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::Release ${TAG} already exists."
+          # Include drafts and fail on API errors, rather than treating any
+          # failed lookup as proof that a release does not exist.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name' > releases.txt
+          if grep -Fxq "$TAG" releases.txt; then
+            echo "::error::Release ${TAG} already exists (possibly a draft)."
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -79,7 +116,7 @@ jobs:
         env:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
-          MEMBERS=$(cargo metadata --no-deps --format-version 1 \
+          MEMBERS=$(cargo metadata --locked --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(" ".join(p["name"] for p in json.load(sys.stdin)["packages"]))')
           python3 - $MEMBERS <<'PY'
           import os, re, sys
@@ -96,9 +133,6 @@ jobs:
           PY
           cargo metadata --locked --no-deps --format-version 1 >/dev/null
           git diff
-
-      - name: Test
-        run: cargo test --workspace --locked
 
       - name: Bundle
         run: script/bundle-macos --universal
@@ -141,16 +175,68 @@ jobs:
           PY
           cat latest.json
 
-      - name: Publish GitHub release
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.zip }}.sha256
+            latest.json
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # This is the only job allowed to mutate tags or releases. It never runs
+    # repository code; it receives just the three packaged assets.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets
+      - name: Draft, upload, verify tag and publish
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
-          ZIP: ${{ steps.package.outputs.zip }}
+          TAG: ${{ needs.build.outputs.tag }}
+          ZIP: ${{ needs.build.outputs.zip }}
+          BUILT_SHA: ${{ needs.build.outputs.sha }}
         run: |
-          # --target creates the tag at this commit when the run was started by hand;
-          # for a pushed tag it already exists and is used as is.
-          gh release create "$TAG" "$ZIP" "$ZIP.sha256" latest.json \
-            --target "$GITHUB_SHA" \
+          # Draft creation may defer tag creation until publication. Explicitly
+          # create a missing tag for manual branch runs so it can be verified
+          # before the release becomes visible. Never recreate a pushed tag.
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" > tag.json; then
+            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+              echo "::error::The selected tag no longer exists."
+              exit 1
+            fi
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$TAG" -f "sha=$BUILT_SHA" > /dev/null
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --target "$BUILT_SHA" \
             --title "mtc $TAG" \
             --generate-notes \
             --notes "Runs on Apple Silicon and Intel Macs (macOS 12 or later). The app is ad-hoc signed, not notarized. After unzipping, move mtc.app to Applications, then run \`xattr -dr com.apple.quarantine /Applications/mtc.app\` or right-click → Open the first time. Later versions install themselves."
+          gh release upload "$TAG" "$ZIP" "$ZIP.sha256" latest.json --repo "$GITHUB_REPOSITORY"
+
+          # Resolve lightweight AND annotated tags through to the commit, using
+          # a fresh lookup after uploads to catch a moved tag during the build.
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" > tag.json
+          TYPE=$(jq -r '.object.type' tag.json)
+          SHA=$(jq -r '.object.sha' tag.json)
+          while [[ "$TYPE" == "tag" ]]; do
+            gh api "repos/$GITHUB_REPOSITORY/git/tags/$SHA" > tag.json
+            TYPE=$(jq -r '.object.type' tag.json)
+            SHA=$(jq -r '.object.sha' tag.json)
+          done
+          if [[ "$TYPE" != "commit" || "$SHA" != "$BUILT_SHA" ]]; then
+            echo "::error::Tag $TAG resolves to $TYPE $SHA; built $BUILT_SHA. Release left as draft."
+            exit 1
+          fi
+          # Drafts are excluded from releases/latest, so the feed is visible
+          # only once all assets are present and the source commit is verified.
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
