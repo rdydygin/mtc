@@ -226,7 +226,8 @@ impl SlowServer {
         self.requests.lock().unwrap().clone()
     }
 
-    /// Stalled responses whose client connection has closed. Select by method
+    /// Requests for stalled responses closed by the client, even during writes.
+    /// Select by method
     /// and path, just as with [`Self::requests`], to ignore unrelated traffic.
     pub fn closed_stalled_requests(&self) -> Vec<Request> {
         self.closed_stalled_requests.lock().unwrap().clone()
@@ -268,37 +269,22 @@ async fn serve(
             let mut open = gate.0.subscribe();
             open.wait_for(|open| *open).await.expect("gate stays alive");
         }
-        tokio::time::sleep(network.latency + reply.delay).await;
-        let mut head = format!(
-            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n",
-            reply.status,
-            if reply.status < 400 { "OK" } else { "Error" },
-            reply.body.len()
-        );
-        for (name, value) in &reply.headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
-        }
-        head.push_str("\r\n");
-        stream.write_all(head.as_bytes()).await?;
-
-        let body = match reply.stall_after {
-            Some(n) => &reply.body[..n.min(reply.body.len())],
-            None => &reply.body[..],
-        };
-        match network.bytes_per_second {
-            None => stream.write_all(body).await?,
-            Some(rate) => {
-                // Twenty slices a second keeps the trickle smooth.
-                let slice = ((rate / 20) as usize).max(1);
-                for chunk in body.chunks(slice) {
-                    stream.write_all(chunk).await?;
-                    stream.flush().await?;
-                    tokio::time::sleep(Duration::from_secs_f64(chunk.len() as f64 / rate as f64))
-                        .await;
-                }
+        if let Err(error) = write_response(&mut stream, network, &reply).await {
+            if reply.stall_after.is_some()
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::WriteZero
+                )
+            {
+                // Cancellation can close the peer before the stall is reached.
+                closed.lock().unwrap().push(request);
             }
+            return Err(error);
         }
-        stream.flush().await?;
         if reply.stall_after.is_some() {
             // Say nothing more, but notice when cancellation closes the
             // client's connection instead of leaving this task alive forever.
@@ -308,6 +294,45 @@ async fn serve(
             return Ok(());
         }
     }
+}
+
+/// Write the headers and the requested prefix before waiting for closure.
+async fn write_response(
+    stream: &mut TcpStream,
+    network: Network,
+    reply: &Reply,
+) -> std::io::Result<()> {
+    tokio::time::sleep(network.latency + reply.delay).await;
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n",
+        reply.status,
+        if reply.status < 400 { "OK" } else { "Error" },
+        reply.body.len()
+    );
+    for (name, value) in &reply.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await?;
+
+    let body = match reply.stall_after {
+        Some(n) => &reply.body[..n.min(reply.body.len())],
+        None => &reply.body[..],
+    };
+    match network.bytes_per_second {
+        None => stream.write_all(body).await?,
+        Some(rate) => {
+            // Twenty slices a second keeps the trickle smooth.
+            let slice = ((rate / 20) as usize).max(1);
+            for chunk in body.chunks(slice) {
+                stream.write_all(chunk).await?;
+                stream.flush().await?;
+                tokio::time::sleep(Duration::from_secs_f64(chunk.len() as f64 / rate as f64)).await;
+            }
+        }
+    }
+    stream.flush().await?;
+    Ok(())
 }
 
 /// Read one request head. Returns the request, its body length, and how
@@ -348,5 +373,82 @@ async fn read_head(
             return Ok(None);
         }
         buffer.extend_from_slice(&chunk[..n]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_peer_reset_before_a_stalled_response_is_written() {
+        futures::executor::block_on(runtime::run(async {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                let mut client = TcpStream::connect(listener.local_addr()?).await?;
+                let (stream, _) = listener.accept().await?;
+                let stream = stream.into_std()?;
+                // Observe the reset on a duplicate of the server socket before
+                // allowing the response write. No scheduling delay is involved.
+                let mut probe = TcpStream::from_std(stream.try_clone()?)?;
+                let stream = TcpStream::from_std(stream)?;
+                let gate = Gate::default();
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let closed = Arc::new(Mutex::new(Vec::new()));
+                let task = tokio::spawn({
+                    let gate = gate.clone();
+                    let requests = requests.clone();
+                    let closed = closed.clone();
+                    async move {
+                        let route = move |_: &Request| {
+                            Reply::bytes(vec![1, 2])
+                                .stall_after(1)
+                                .wait_for(gate.clone())
+                        };
+                        serve(
+                            stream,
+                            Network::new(Duration::ZERO),
+                            Instant::now(),
+                            &route,
+                            &requests,
+                            &closed,
+                        )
+                        .await
+                    }
+                });
+                client
+                    .write_all(b"GET /early HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await?;
+                while requests.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    closed.lock().unwrap().is_empty(),
+                    "request arrival is not close evidence"
+                );
+                // Zero linger forces an immediate reset, without blocking drop.
+                #[allow(deprecated)]
+                client.set_linger(Some(Duration::ZERO))?;
+                drop(client);
+                let reset = probe.read(&mut [0]).await;
+                assert!(
+                    matches!(reset, Ok(0)) || reset.is_err(),
+                    "the peer must have closed"
+                );
+                assert!(
+                    closed.lock().unwrap().is_empty(),
+                    "the held handler has not observed closure yet"
+                );
+                gate.open();
+                assert!(task.await?.is_err(), "exercise the write-side error path");
+                let closed = closed.lock().unwrap();
+                assert_eq!(closed.len(), 1);
+                assert_eq!(closed[0].method(), "GET");
+                assert_eq!(closed[0].path(), "/early");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?
+        }))
+        .unwrap();
     }
 }
