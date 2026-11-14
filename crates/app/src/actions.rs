@@ -107,6 +107,7 @@ pub fn init(cx: &mut App) {
             Some(WORKSPACE_CONTEXT),
         ),
         KeyBinding::new("escape", Dismiss, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("escape", Dismiss, Some("SsoConfirmation")),
         // The message field binds these itself; in the workspace the channel
         // commands are more useful, so they win inside its inputs.
         KeyBinding::new("escape", Dismiss, Some("Workspace > Input")),

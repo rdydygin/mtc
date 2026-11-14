@@ -240,9 +240,11 @@ impl Render for LoginView {
                     .child(
                         Form::new()
                             .child(
-                                Field::new()
-                                    .label("Server")
-                                    .child(Input::new(&self.server).disabled(submitting)),
+                                Field::new().label("Server").child(
+                                    Input::new(&self.server)
+                                        .id("login-server")
+                                        .disabled(submitting),
+                                ),
                             )
                             .child(
                                 Field::new()
