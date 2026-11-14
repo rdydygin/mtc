@@ -1,6 +1,6 @@
 //! ⌘K: jump to any channel or person, or run an app command, by typing.
 
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, collections::HashSet, rc::Rc};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -97,13 +97,14 @@ pub fn open(
         return;
     }
     let session_ref = session.read(cx);
-    let sections = crate::sidebar::sections(session_ref, cx);
+    let sections = crate::sidebar::conversation_sections(session_ref, cx);
     let active = session_ref.active_channel().cloned();
 
     // The open conversation is left out of Recent but stays findable below.
+    let mut seen = HashSet::new();
     let recent_ids: Vec<&ChannelId> = recent
         .iter()
-        .filter(|id| Some(*id) != active.as_ref())
+        .filter(|id| Some(*id) != active.as_ref() && seen.insert(*id))
         .take(5)
         .collect();
     let recent_items: Vec<_> = recent_ids

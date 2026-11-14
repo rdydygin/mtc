@@ -19,7 +19,10 @@ use gpui_kit::component::{
     },
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{InputEvent, Textarea, TextareaState},
+    input::{
+        Escape, IndentInline, InputEvent, MoveDown, MoveUp, Position, Textarea, TextareaState,
+    },
+    list::ListItem,
     v_flex,
 };
 use gpui_kit::{
@@ -63,7 +66,7 @@ pub enum ComposerEvent {
     Submit { text: String, files: Vec<FileInfo> },
     /// Up was pressed in an empty field.
     EditLast,
-    /// Escape was pressed while editing.
+    /// The user canceled editing.
     CancelEdit,
     /// The text changed; others may be told the user is typing.
     Typing,
@@ -72,6 +75,10 @@ pub enum ComposerEvent {
 pub struct Composer {
     input: Entity<TextareaState>,
     editing: bool,
+    saved_draft: Option<String>,
+    focus_handle: FocusHandle,
+    selected_command: usize,
+    commands_dismissed: bool,
     target: UploadTarget,
     files: Vec<PendingFile>,
     next_file_id: u64,
@@ -105,6 +112,8 @@ impl Composer {
                 |this, input, event, window, cx| match event {
                     InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
                     InputEvent::Change => {
+                        this.selected_command = 0;
+                        this.commands_dismissed = false;
                         if !input.read(cx).value().is_empty() {
                             cx.emit(ComposerEvent::Typing);
                         }
@@ -113,13 +122,20 @@ impl Composer {
                     _ => {}
                 },
             );
+        let focus_handle = cx.focus_handle();
+        let focus_in = cx.on_focus_in(&focus_handle, window, |_, _, cx| cx.notify());
+        let focus_out = cx.on_focus_out(&focus_handle, window, |_, _, _, cx| cx.notify());
         Self {
             input,
             editing: false,
+            saved_draft: None,
+            focus_handle,
+            selected_command: 0,
+            commands_dismissed: false,
             target,
             files: Vec::new(),
             next_file_id: 0,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![subscription, focus_in, focus_out],
         }
     }
 
@@ -132,7 +148,11 @@ impl Composer {
     fn can_submit(&self, cx: &gpui_kit::App) -> bool {
         let has_text = !self.input.read(cx).value().trim().is_empty();
         let has_files = self.files.iter().any(|f| f.uploaded.is_some());
-        !self.is_uploading() && (has_text || (has_files && !self.editing))
+        if self.editing {
+            has_text
+        } else {
+            !self.is_uploading() && (has_text || has_files)
+        }
     }
 
     /// Send the text and every uploaded file. Failed uploads stay behind so
@@ -155,8 +175,11 @@ impl Composer {
             });
             sent
         };
-        self.set_text("", window, cx);
-        self.editing = false;
+        if self.editing {
+            self.set_editing(None, window, cx);
+        } else {
+            self.set_text("", window, cx);
+        }
         cx.emit(ComposerEvent::Submit { text, files });
         cx.notify();
     }
@@ -307,7 +330,7 @@ impl Composer {
     }
 
     fn render_files(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        if self.files.is_empty() {
+        if self.editing || self.files.is_empty() {
             return None;
         }
         let entity = cx.entity().downgrade();
@@ -326,6 +349,8 @@ impl Composer {
     }
 
     pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_command = 0;
+        self.commands_dismissed = false;
         self.input.update(cx, |state, cx| {
             state.set_value(text.to_string(), window, cx)
         });
@@ -334,37 +359,89 @@ impl Composer {
 
     /// Enter edit mode with `text`, or leave it.
     pub fn set_editing(&mut self, text: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
-        self.editing = text.is_some();
-        self.set_text(text.unwrap_or_default(), window, cx);
+        match text {
+            Some(text) => {
+                if !self.editing {
+                    self.saved_draft = Some(self.text(cx));
+                }
+                self.editing = true;
+                self.set_text(text, window, cx);
+            }
+            None => {
+                self.editing = false;
+                if let Some(draft) = self.saved_draft.take() {
+                    self.set_text(&draft, window, cx);
+                }
+            }
+        }
         self.focus_handle(cx).focus(window, cx);
     }
 
-    pub fn is_editing(&self) -> bool {
-        self.editing
+    /// The unsent message, including while an older message is being edited.
+    pub fn draft(&self, cx: &gpui_kit::App) -> String {
+        self.saved_draft.clone().unwrap_or_else(|| self.text(cx))
+    }
+
+    fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_editing(None, window, cx);
+        cx.emit(ComposerEvent::CancelEdit);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        let plain = !keystroke.modifiers.modified();
-        match keystroke.key.as_str() {
-            "up" if plain && self.input.read(cx).value().is_empty() => {
+        if !event.keystroke.modifiers.modified() {
+            self.handle_key(&event.keystroke.key, window, cx);
+        }
+    }
+
+    /// Input actions run before raw key events, so both paths share this handler.
+    fn handle_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let matches = self.command_matches(cx);
+        if !matches.is_empty() {
+            match key {
+                "up" => {
+                    self.selected_command =
+                        (self.selected_command + matches.len() - 1) % matches.len();
+                }
+                "down" => {
+                    self.selected_command = (self.selected_command + 1) % matches.len();
+                }
+                "tab" => {
+                    let completion = &matches[self.selected_command.min(matches.len() - 1)].0;
+                    self.complete_command(completion, window, cx);
+                }
+                "escape" => self.commands_dismissed = true,
+                _ => {
+                    cx.propagate();
+                    return;
+                }
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        match key {
+            "up" if self.input.read(cx).value().is_empty() => {
                 cx.emit(ComposerEvent::EditLast);
                 cx.stop_propagation();
             }
             "escape" if self.editing => {
-                self.editing = false;
-                self.set_text("", window, cx);
-                cx.emit(ComposerEvent::CancelEdit);
+                self.cancel_edit(window, cx);
                 cx.stop_propagation();
             }
-            "tab" if plain => {
-                if let Some(completion) = self.command_matches(cx).first().map(|c| c.0.clone()) {
-                    self.set_text(&format!("/{completion} "), window, cx);
-                    cx.stop_propagation();
-                }
-            }
-            _ => {}
+            _ => cx.propagate(),
         }
+    }
+
+    fn complete_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = format!("/{name} ");
+        self.set_text(&text, window, cx);
+        self.input.update(cx, |state, cx| {
+            state.set_cursor_position(
+                Position::new(0, text.encode_utf16().count() as u32),
+                window,
+                cx,
+            );
+        });
     }
 
     /// Slash commands matching a partially typed `/name`.
@@ -372,6 +449,9 @@ impl Composer {
         &self,
         cx: &gpui_kit::App,
     ) -> Vec<(SharedString, SharedString, SharedString)> {
+        if self.commands_dismissed || self.editing {
+            return Vec::new();
+        }
         let text = self.input.read(cx).value();
         let Some(prefix) = text.strip_prefix('/') else {
             return Vec::new();
@@ -412,29 +492,31 @@ impl Composer {
                 .children(matches.into_iter().enumerate().map(
                     |(ix, (name, hint, description))| {
                         let completion = name.clone();
-                        h_flex()
-                            .id(SharedString::from(format!("command-{name}")))
-                            .gap_2()
-                            .px_3()
-                            .py_1()
+                        ListItem::new(SharedString::from(format!("command-{name}")))
+                            .selected(ix == self.selected_command)
+                            .aria_selected(ix == self.selected_command)
+                            .accessibility_label(format!("/{name} {hint}: {description}"))
                             .text_sm()
-                            .when(ix == 0, |this| this.bg(theme.accent))
-                            .hover(|style| style.bg(theme.accent))
-                            .child(div().font_semibold().child(format!("/{name}")))
-                            .when(!hint.is_empty(), |this| {
-                                this.child(div().text_color(theme.muted_foreground).child(hint))
-                            })
                             .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme.muted_foreground)
-                                    .child(description),
+                                h_flex()
+                                    .gap_2()
+                                    .child(div().font_semibold().child(format!("/{name}")))
+                                    .when(!hint.is_empty(), |this| {
+                                        this.child(
+                                            div().text_color(theme.muted_foreground).child(hint),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_color(theme.muted_foreground)
+                                            .child(description),
+                                    ),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.set_text(&format!("/{completion} "), window, cx);
-                                this.focus_handle(cx).focus(window, cx);
+                                this.complete_command(&completion, window, cx);
                             }))
                     },
                 )),
@@ -455,7 +537,7 @@ impl Render for Composer {
             .map(IntoElement::into_any_element);
         let files = self.render_files(cx).map(IntoElement::into_any_element);
         let can_submit = self.can_submit(cx);
-        let uploading = self.is_uploading();
+        let uploading = !self.editing && self.is_uploading();
         let editing = self.editing;
         let entity = cx.entity().downgrade();
         let theme = cx.theme();
@@ -463,7 +545,35 @@ impl Render for Composer {
         // attach and send actions sit inside it, beside the text.
         div().px_4().pb_4().child(
             v_flex()
+                .id("composer")
+                .track_focus(&self.focus_handle)
+                .border_1()
+                .border_color(theme.secondary)
+                .when(self.focus_handle.contains_focused(window, cx), |this| {
+                    this.border_color(theme.ring)
+                })
                 .capture_key_down(cx.listener(Self::on_key_down))
+                .capture_action(
+                    cx.listener(|this, _: &MoveUp, window, cx| this.handle_key("up", window, cx)),
+                )
+                .capture_action(
+                    cx.listener(|this, _: &MoveDown, window, cx| {
+                        this.handle_key("down", window, cx)
+                    }),
+                )
+                .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                    this.handle_key("tab", window, cx)
+                }))
+                .capture_action(
+                    cx.listener(|this, _: &Escape, window, cx| {
+                        this.handle_key("escape", window, cx)
+                    }),
+                )
+                .capture_action(
+                    cx.listener(|this, _: &crate::actions::Dismiss, window, cx| {
+                        this.handle_key("escape", window, cx)
+                    }),
+                )
                 .rounded(theme.radius_lg)
                 .bg(theme.secondary)
                 .overflow_hidden()
@@ -476,9 +586,17 @@ impl Render for Composer {
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(IconName::Pencil)
-                            .child("Editing message")
-                            .child("·")
-                            .child("Escape to cancel"),
+                            .child(div().flex_1().child("Editing message"))
+                            .child(
+                                Button::new("cancel-edit")
+                                    .xsmall()
+                                    .ghost()
+                                    .label("Cancel")
+                                    .tooltip("Cancel edit (Escape)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cancel_edit(window, cx)
+                                    })),
+                            ),
                     )
                 })
                 .children(command_matches)
@@ -631,5 +749,181 @@ pub fn format_size(bytes: u64) -> String {
         format!("{:.0} KB", b / KB)
     } else {
         format!("{bytes} bytes")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AnyWindowHandle, TestAppContext, WindowOptions};
+
+    use super::*;
+
+    fn open_composer(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Composer>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            extensions::init(cx);
+        });
+        let composer = Rc::new(RefCell::new(None));
+        let (handle, _) = cx.update(|cx| {
+            let composer = composer.clone();
+            gpui_kit::open_window(WindowOptions::default(), cx, move |window, cx| {
+                let view = cx.new(|cx| {
+                    Composer::new(
+                        "Message",
+                        Some("Unsent draft".into()),
+                        UploadTarget {
+                            client: Client::new_unverified("http://localhost:1", "token").unwrap(),
+                            channel: "town".into(),
+                        },
+                        window,
+                        cx,
+                    )
+                });
+                view.focus_handle(cx).focus(window, cx);
+                *composer.borrow_mut() = Some(view.clone());
+                view
+            })
+            .unwrap()
+        });
+        let composer = composer.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+        (handle, composer)
+    }
+
+    #[gpui_kit::test]
+    fn editing_restores_the_draft_and_keeps_its_uploads(cx: &mut TestAppContext) {
+        let (handle, composer) = open_composer(cx);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&composer, move |_, event, _| {
+                if let ComposerEvent::Submit { text, files } = event {
+                    events.borrow_mut().push((text.clone(), files.len()));
+                }
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| {
+                for id in 0..3 {
+                    c.files.push(PendingFile {
+                        local_id: id,
+                        name: format!("draft-{id}.txt").into(),
+                        size: 10,
+                        source: FileSource::Path("draft.txt".into()),
+                        is_image: false,
+                        status: match id {
+                            0 => AttachmentStatus::Uploading,
+                            1 => AttachmentStatus::Failed,
+                            _ => AttachmentStatus::Complete,
+                        },
+                        uploaded: (id == 2).then(FileInfo::default),
+                        error: (id == 1).then(|| "Upload failed".into()),
+                        _upload: None,
+                    });
+                }
+                c.set_editing(Some("Original"), window, cx);
+                c.set_editing(Some("Another message"), window, cx);
+                assert_eq!(c.draft(cx), "Unsent draft");
+            });
+            window.press("escape", cx);
+            assert_eq!(composer.read(cx).text(cx), "Unsent draft");
+            composer.update(cx, |c, cx| c.set_editing(Some("Original"), window, cx));
+            window.click("cancel-edit", cx);
+            assert_eq!(composer.read(cx).text(cx), "Unsent draft");
+            composer.update(cx, |c, cx| c.set_editing(Some("Saved edit"), window, cx));
+            window.click("send", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        composer.read_with(cx, |c, cx| {
+            assert!(!c.editing);
+            assert_eq!(c.text(cx), "Unsent draft");
+            assert_eq!(c.files.len(), 3);
+            assert!(c.files[0].uploaded.is_none());
+            assert!(c.files[1].error.is_some());
+            assert!(c.files[2].uploaded.is_some());
+        });
+        assert_eq!(&*events.borrow(), &[("Saved edit".into(), 0)]);
+    }
+
+    #[gpui_kit::test]
+    fn slash_suggestions_support_selection_completion_and_dismissal(cx: &mut TestAppContext) {
+        let (handle, composer) = open_composer(cx);
+        let edits = Rc::new(RefCell::new(0));
+        let _subscription = cx.update(|cx| {
+            let edits = edits.clone();
+            cx.subscribe(&composer, move |_, event, _| {
+                if matches!(event, ComposerEvent::EditLast) {
+                    *edits.borrow_mut() += 1;
+                }
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("/", window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            let matches = composer.read(cx).command_matches(cx);
+            assert_eq!(matches.len(), 6);
+            assert!(
+                composer.focus_handle(cx).is_focused(window),
+                "composer must be focused"
+            );
+            window.press("up", cx);
+            assert_eq!(composer.read(cx).selected_command, 5);
+            window.press("down", cx);
+            assert_eq!(composer.read(cx).selected_command, 0);
+            window.press("down", cx);
+            assert_eq!(
+                window.find(format!("command-{}", matches[1].0)).selected(),
+                Some(true)
+            );
+            window.press("tab", cx);
+            assert_eq!(composer.read(cx).text(cx), format!("/{} ", matches[1].0));
+            window.input("argument", cx);
+            assert_eq!(
+                composer.read(cx).text(cx),
+                format!("/{} argument", matches[1].0)
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("/", window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("escape", cx);
+            assert!(composer.read(cx).command_matches(cx).is_empty());
+            assert_eq!(composer.read(cx).text(cx), "/");
+            window.press("right", cx);
+            window.input("s", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        composer.read_with(cx, |c, cx| {
+            assert!(
+                !c.command_matches(cx).is_empty(),
+                "text={:?}, dismissed={}",
+                c.text(cx),
+                c.commands_dismissed
+            );
+            assert_eq!(c.selected_command, 0);
+        });
+        assert_eq!(*edits.borrow(), 0);
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("", window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.press("up", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(*edits.borrow(), 1);
     }
 }

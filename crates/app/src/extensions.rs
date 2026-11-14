@@ -142,8 +142,8 @@ struct Extensions {
 
 impl Global for Extensions {}
 
-/// Add an extension. Later registrations take precedence for slash commands
-/// with the same name.
+/// Add an extension, replacing one registered under the same name. Later
+/// registrations take precedence for slash commands with the same name.
 pub fn register(extension: impl Extension, cx: &mut App) {
     let extension: Rc<dyn Extension> = Rc::new(extension);
     let registry = cx.default_global::<Extensions>();
@@ -154,6 +154,7 @@ pub fn register(extension: impl Extension, cx: &mut App) {
     registry.commands.extend(new_commands);
     registry.commands.sort_by(|a, b| a.name.cmp(&b.name));
     log::debug!("registered extension {}", extension.name());
+    registry.extensions.retain(|e| e.name() != extension.name());
     registry.extensions.push(extension);
 }
 

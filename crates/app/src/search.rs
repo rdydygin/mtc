@@ -489,7 +489,7 @@ impl SearchView {
         let text = session::emojify(&post.message, &CustomEmojis::default());
         let (text, ranges) = excerpt(&text, terms);
         let marked = HighlightStyle {
-            background_color: Some(theme.warning.opacity(0.3)),
+            background_color: Some(theme.accent),
             font_weight: Some(FontWeight::SEMIBOLD),
             ..Default::default()
         };
