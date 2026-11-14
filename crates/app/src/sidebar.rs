@@ -1,6 +1,8 @@
 //! Channel navigation: team switcher, the Threads pane, favorites, channels,
 //! direct messages, and the signed-in account.
 
+use std::{collections::HashMap, rc::Rc};
+
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Selectable as _, Sizable as _, StyledExt as _, WindowExt as _,
@@ -14,9 +16,9 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    AnyElement, App, Context, Entity, EventEmitter, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Window, div, prelude::FluentBuilder as _,
+    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Hsla, InteractiveElement as _,
+    IntoElement, ListAlignment, ListOffset, ListState, ParentElement as _, Render, SharedString,
+    Styled as _, Subscription, Window, div, list, prelude::FluentBuilder as _, px,
 };
 use mattermost::{ChannelId, ChannelType, Status, TeamId};
 use session::{ChannelEntry, Connection, Session};
@@ -31,69 +33,100 @@ use crate::{
     time,
 };
 
-/// Direct messages shown when they are neither unread nor recent.
-const DIRECT_MESSAGE_LIMIT: usize = 20;
+gpui_kit::actions!(sidebar, [FocusNext, FocusPrevious]);
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        gpui_kit::KeyBinding::new("tab", FocusNext, Some("Sidebar")),
+        gpui_kit::KeyBinding::new("shift-tab", FocusPrevious, Some("Sidebar")),
+    ]);
+}
 
 pub enum SidebarEvent {
     OpenChannel(ChannelId),
     OpenThreads,
 }
 
-/// The channels in sidebar order, as three sections. A favorite appears
-/// only under favorites, whatever its kind.
-pub struct ChannelSections {
-    pub favorites: Vec<ChannelId>,
-    pub channels: Vec<ChannelId>,
-    pub direct: Vec<ChannelId>,
+/// Retained sidebar order, also used by next/previous navigation.
+pub fn sections(session: &Session, cx: &App) -> std::rc::Rc<session::ChannelSections> {
+    session.sidebar_sections(cx)
 }
 
-impl ChannelSections {
-    /// Every channel in the order shown, for next/previous navigation.
-    pub fn ordered(&self) -> impl Iterator<Item = &ChannelId> {
-        self.favorites
-            .iter()
-            .chain(self.channels.iter())
-            .chain(self.direct.iter())
-    }
+/// All conversations, including older read DMs available in the switcher.
+pub fn conversation_sections(session: &Session, cx: &App) -> std::rc::Rc<session::ChannelSections> {
+    session.conversation_sections(cx)
 }
 
-pub fn sections(session: &Session, cx: &App) -> ChannelSections {
-    let mut sections = conversation_sections(session, cx);
-    let active = session.active_channel();
-    let mut ix = 0;
-    sections.direct.retain(|id| {
-        let recent = ix < DIRECT_MESSAGE_LIMIT;
-        ix += 1;
-        recent
-            || Some(id) == active
-            || session
-                .channel(id)
-                .is_some_and(|e| e.is_unread() || e.mention_count() > 0)
-    });
-    sections
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SidebarRow {
+    Threads,
+    Failure(SharedString),
+    Empty,
+    Header(Section),
+    Channel(ChannelId),
+    Skeleton(usize),
 }
 
-/// Every conversation, grouped for navigation before the sidebar's limit.
-pub fn conversation_sections(session: &Session, cx: &App) -> ChannelSections {
-    let mut favorites: Vec<(&ChannelEntry, String)> = Vec::new();
-    let mut channels: Vec<(&ChannelEntry, String)> = Vec::new();
-    let mut direct: Vec<&ChannelEntry> = Vec::new();
-    for entry in session.channels() {
-        if session.is_favorite(entry.id()) {
-            favorites.push((entry, session.channel_label(entry, cx).to_lowercase()));
-        } else if entry.kind().is_direct_or_group() {
-            direct.push(entry);
-        } else {
-            channels.push((entry, session.channel_label(entry, cx).to_lowercase()));
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Section {
+    Favorites,
+    Channels,
+    Direct,
+}
+
+struct SidebarRows {
+    sections: Rc<session::ChannelSections>,
+    collapsed: [bool; 3],
+    state: session::LoadState,
+    empty: bool,
+    rows: Vec<SidebarRow>,
+}
+
+impl SidebarRows {
+    fn new(
+        sections: Rc<session::ChannelSections>,
+        collapsed: [bool; 3],
+        state: session::LoadState,
+        empty: bool,
+    ) -> Self {
+        let mut rows = vec![SidebarRow::Threads];
+        if let session::LoadState::Failed(message) = &state {
+            rows.push(SidebarRow::Failure(message.clone()));
         }
-    }
-    favorites.sort_by(|a, b| a.1.cmp(&b.1));
-    channels.sort_by(|a, b| a.1.cmp(&b.1));
-    direct.sort_by_key(|e| std::cmp::Reverse(e.last_activity()));
-    ChannelSections {
-        favorites: favorites.into_iter().map(|(e, _)| e.id().clone()).collect(),
-        channels: channels.into_iter().map(|(e, _)| e.id().clone()).collect(),
-        direct: direct.into_iter().map(|e| e.id().clone()).collect(),
+        if empty {
+            rows.push(SidebarRow::Empty);
+        }
+        let loading = matches!(
+            state,
+            session::LoadState::NotLoaded | session::LoadState::Loading
+        );
+        for (ix, (section, ids)) in [
+            (Section::Favorites, sections.favorites()),
+            (Section::Channels, sections.channels()),
+            (Section::Direct, sections.direct()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if ix == 0 && ids.is_empty() {
+                continue;
+            }
+            rows.push(SidebarRow::Header(section));
+            if collapsed[ix] {
+                continue;
+            }
+            rows.extend(ids.iter().cloned().map(SidebarRow::Channel));
+            if loading && ix > 0 {
+                rows.extend((if ix == 1 { 0..6 } else { 6..10 }).map(SidebarRow::Skeleton));
+            }
+        }
+        Self {
+            sections,
+            collapsed,
+            state,
+            empty,
+            rows,
+        }
     }
 }
 
@@ -105,16 +138,31 @@ pub struct SidebarView {
     channels_collapsed: bool,
     direct_collapsed: bool,
     account_open: bool,
+    list: ListState,
+    rows: Option<SidebarRows>,
+    row_focus: HashMap<SidebarRow, FocusHandle>,
+    list_start: FocusHandle,
+    list_end: FocusHandle,
+    #[cfg(test)]
+    channel_rows_built: std::cell::Cell<usize>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<SidebarEvent> for SidebarView {}
 
 impl SidebarView {
-    pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
+    pub fn new(session: Entity<Session>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let directory = session.read(cx).directory().clone();
         let threads = session.read(cx).threads().clone();
+        let list_start = cx.focus_handle().tab_stop(true);
+        let list_end = cx.focus_handle().tab_stop(true);
         let subscriptions = vec![
+            cx.on_focus(&list_start, window, |this, window, cx| {
+                this.enter_list(false, window, cx)
+            }),
+            cx.on_focus(&list_end, window, |this, window, cx| {
+                this.enter_list(true, window, cx)
+            }),
             cx.observe(&session, |_, _, cx| cx.notify()),
             cx.observe(&directory, |_, _, cx| cx.notify()),
             cx.observe(&threads, |_, _, cx| cx.notify()),
@@ -126,6 +174,13 @@ impl SidebarView {
             channels_collapsed: false,
             direct_collapsed: false,
             account_open: false,
+            list: ListState::new(0, ListAlignment::Top, px(200.)),
+            rows: None,
+            row_focus: HashMap::new(),
+            list_start,
+            list_end,
+            #[cfg(test)]
+            channel_rows_built: std::cell::Cell::new(0),
             _subscriptions: subscriptions,
         }
     }
@@ -142,6 +197,9 @@ impl SidebarView {
     }
 
     fn channel_item(&self, id: &ChannelId, cx: &mut Context<Self>) -> Option<AnyElement> {
+        #[cfg(test)]
+        self.channel_rows_built
+            .set(self.channel_rows_built.get() + 1);
         let session = self.session.read(cx);
         let entry = session.channel(id)?;
         let label = session.channel_label(entry, cx);
@@ -221,6 +279,7 @@ impl SidebarView {
         let channel = id.clone();
         Some(
             Button::new(SharedString::from(format!("channel-{id}")))
+                .track_focus(&self.row_focus[&SidebarRow::Channel(id.clone())])
                 .ghost()
                 .w_full()
                 .h_9()
@@ -343,6 +402,7 @@ impl SidebarView {
         let active = self.threads_selected;
         let theme = cx.theme();
         Button::new("threads")
+            .track_focus(&self.row_focus[&SidebarRow::Threads])
             .ghost()
             .w_full()
             .h_9()
@@ -927,33 +987,278 @@ impl SidebarView {
     }
 }
 
+impl SidebarView {
+    fn sync_rows(&mut self, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        let sections = sections(session, cx);
+        let state = session.channels_state().clone();
+        let empty = state == session::LoadState::Loaded && session.channels().next().is_none();
+        let collapsed = [
+            self.favorites_collapsed,
+            self.channels_collapsed,
+            self.direct_collapsed,
+        ];
+        if self.rows.as_ref().is_some_and(|rows| {
+            Rc::ptr_eq(&rows.sections, &sections)
+                && rows.collapsed == collapsed
+                && rows.state == state
+                && rows.empty == empty
+        }) {
+            return;
+        }
+        let next = SidebarRows::new(sections, collapsed, state, empty);
+        // Preserve the first visible domain object and its offset across reorders.
+        let top = self.list.logical_scroll_top();
+        let anchor = self.rows.as_ref().and_then(|old| {
+            let positions: HashMap<_, _> = next
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(ix, row)| (row, ix))
+                .collect();
+            old.rows
+                .iter()
+                .enumerate()
+                .filter_map(|(old_ix, row)| positions.get(row).map(|&new_ix| (old_ix, new_ix)))
+                // Prefer the successor on a tie, so removing the top row leaves
+                // the following conversation at the same position in the viewport.
+                .min_by_key(|(old_ix, _)| (old_ix.abs_diff(top.item_ix), *old_ix < top.item_ix))
+                .map(|(old_ix, item_ix)| {
+                    let height = self
+                        .list
+                        .bounds_for_item(old_ix)
+                        .map(|bounds| bounds.size.height)
+                        .unwrap_or(px(0.));
+                    ListOffset {
+                        item_ix,
+                        offset_in_item: top
+                            .offset_in_item
+                            .max(px(0.))
+                            .min((height - px(1.)).max(px(0.))),
+                    }
+                })
+        });
+        let old_focus = std::mem::take(&mut self.row_focus);
+        self.row_focus = next
+            .rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row,
+                    SidebarRow::Threads
+                        | SidebarRow::Channel(_)
+                        | SidebarRow::Header(_)
+                        | SidebarRow::Failure(_)
+                )
+            })
+            .map(|row| {
+                (
+                    row.clone(),
+                    old_focus
+                        .get(row)
+                        .cloned()
+                        .unwrap_or_else(|| cx.focus_handle()),
+                )
+            })
+            .collect();
+        self.list.splice_focusable(
+            0..self.list.item_count(),
+            next.rows.iter().map(|row| self.row_focus.get(row).cloned()),
+        );
+        if let Some(anchor) = anchor {
+            self.list.scroll_to(anchor);
+        }
+        self.rows = Some(next);
+    }
+
+    fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let row = &self
+            .rows
+            .as_ref()
+            .expect("rows synchronized before layout")
+            .rows[ix];
+        let content = match row {
+            SidebarRow::Threads => self.threads_item(cx).into_any_element(),
+            SidebarRow::Channel(id) => self
+                .channel_item(id, cx)
+                .unwrap_or_else(|| div().into_any_element()),
+            SidebarRow::Header(section) => {
+                let (id, label, accessibility_label, collapsed) = match section {
+                    Section::Favorites => (
+                        "favorites-section",
+                        "FAVORITES",
+                        "Toggle favorites",
+                        self.favorites_collapsed,
+                    ),
+                    Section::Channels => (
+                        "channels-section",
+                        "CHANNELS",
+                        "Toggle channels",
+                        self.channels_collapsed,
+                    ),
+                    Section::Direct => (
+                        "direct-section",
+                        "DIRECT MESSAGES",
+                        "Toggle direct messages",
+                        self.direct_collapsed,
+                    ),
+                };
+                let section = *section;
+                Self::section_header(id, label, accessibility_label, collapsed, cx)
+                    .track_focus(&self.row_focus[row])
+                    .mt_4()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let collapsed = match section {
+                            Section::Favorites => &mut this.favorites_collapsed,
+                            Section::Channels => &mut this.channels_collapsed,
+                            Section::Direct => &mut this.direct_collapsed,
+                        };
+                        *collapsed = !*collapsed;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
+            SidebarRow::Failure(message) => crate::recovery::inline_failure(
+                message.clone(),
+                Button::new("retry-conversations")
+                    .track_focus(&self.row_focus[row])
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.session.update(cx, |s, cx| s.retry_channels(cx));
+                    })),
+                cx,
+            )
+            .into_any_element(),
+            SidebarRow::Empty => div()
+                .p_3()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("No conversations yet. Join a channel in Mattermost to get started.")
+                .into_any_element(),
+            SidebarRow::Skeleton(offset) => {
+                crate::skeleton::conversation_rows(1, *offset, cx).into_any_element()
+            }
+        };
+        div()
+            .w_full()
+            .px_2()
+            .when(ix > 0, |this| this.pt_0p5())
+            .child(content)
+            .into_any_element()
+    }
+
+    fn enter_list(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let boundary = if backwards {
+            &self.list_end
+        } else {
+            &self.list_start
+        };
+        // Exiting passes through a boundary within one update. Ignore its
+        // delayed focus event once the next external control already has focus.
+        if !boundary.is_focused(window) {
+            return;
+        }
+        let rows = &self.rows.as_ref().unwrap().rows;
+        let target = if backwards {
+            rows.iter()
+                .rposition(|row| self.row_focus.contains_key(row))
+        } else {
+            rows.iter().position(|row| self.row_focus.contains_key(row))
+        };
+        if let Some(ix) = target {
+            self.row_focus[&rows[ix]].focus(window, cx);
+            // Entry must also work before the intervening rows have heights.
+            self.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        }
+    }
+
+    fn focus_adjacent(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = &self.rows.as_ref().unwrap().rows;
+        let Some(ix) = rows.iter().position(|row| {
+            self.row_focus
+                .get(row)
+                .is_some_and(|focus| focus.is_focused(window))
+        }) else {
+            cx.propagate();
+            return;
+        };
+        let next = if backwards {
+            rows[..ix]
+                .iter()
+                .rposition(|row| self.row_focus.contains_key(row))
+        } else {
+            rows.iter()
+                .enumerate()
+                .skip(ix + 1)
+                .find(|(_, row)| self.row_focus.contains_key(row))
+                .map(|(ix, _)| ix)
+        };
+        if let Some(next) = next {
+            self.row_focus[&rows[next]].focus(window, cx);
+            if self.list.bounds_for_item(next).is_some() {
+                self.list.scroll_to_reveal_item(next);
+            } else {
+                self.list.scroll_to(ListOffset {
+                    item_ix: next,
+                    offset_in_item: px(0.),
+                });
+            }
+            cx.notify();
+        } else if backwards {
+            self.list_start.focus(window, cx);
+            window.focus_prev(cx);
+        } else {
+            self.list_end.focus(window, cx);
+            window.focus_next(cx);
+        }
+    }
+
+    fn render_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_rows(cx);
+        let view = cx.entity().downgrade();
+        div()
+            .id("conversation-list")
+            .v_flex()
+            .key_context("Sidebar")
+            .flex_1()
+            .min_h_0()
+            .on_action(
+                cx.listener(|this, _: &FocusNext, window, cx| {
+                    this.focus_adjacent(false, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &FocusPrevious, window, cx| {
+                this.focus_adjacent(true, window, cx)
+            }))
+            .child(
+                div()
+                    .id("conversation-list-start")
+                    .h_0()
+                    .track_focus(&self.list_start),
+            )
+            .child(
+                list(self.list.clone(), move |ix, _, cx| {
+                    view.update(cx, |this, cx| this.render_row(ix, cx))
+                        .unwrap_or_else(|_| div().into_any_element())
+                })
+                .size_full()
+                .flex_1()
+                .min_h_0(),
+            )
+            .child(
+                div()
+                    .id("conversation-list-end")
+                    .h_0()
+                    .track_focus(&self.list_end),
+            )
+    }
+}
+
 impl Render for SidebarView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sections = sections(self.session.read(cx), cx);
-        let favorites: Vec<_> = sections
-            .favorites
-            .iter()
-            .filter_map(|id| self.channel_item(id, cx))
-            .collect();
-        let channels: Vec<_> = sections
-            .channels
-            .iter()
-            .filter_map(|id| self.channel_item(id, cx))
-            .collect();
-        let direct: Vec<_> = sections
-            .direct
-            .iter()
-            .filter_map(|id| self.channel_item(id, cx))
-            .collect();
-        // Until the channel list arrives, each section shows rows in the
-        // shape of the conversations about to fill it.
-        let state = self.session.read(cx).channels_state().clone();
-        let loading = matches!(
-            state,
-            session::LoadState::NotLoaded | session::LoadState::Loading
-        );
-        let empty = state == session::LoadState::Loaded
-            && self.session.read(cx).channels().next().is_none();
         let theme = cx.theme().clone();
         // The workspace paints the backdrop; the sidebar is one of its
         // inset panels.
@@ -995,84 +1300,7 @@ impl Render for SidebarView {
                             )
                         },
                     )
-                    .child(
-                        v_flex()
-                            .id("conversation-list")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .px_2()
-                            .gap_0p5()
-                            .child(self.threads_item(cx))
-                            .when_some(match state { session::LoadState::Failed(message) => Some(message), _ => None }, |this, message| {
-                                this.child(crate::recovery::inline_failure(message,
-                                    Button::new("retry-conversations").on_click(cx.listener(|this, _, _, cx| {
-                                        this.session.update(cx, |s, cx| s.retry_channels(cx));
-                                    })), cx))
-                            })
-                            .when(empty, |this| this.child(div().p_3().text_sm().text_color(theme.muted_foreground).child("No conversations yet. Join a channel in Mattermost to get started.")))
-                            .when(!favorites.is_empty(), |this| {
-                                this.child(
-                                    Self::section_header(
-                                        "favorites-section",
-                                        "FAVORITES",
-                                        "Toggle favorites",
-                                        self.favorites_collapsed,
-                                        cx,
-                                    )
-                                    .mt_4()
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.favorites_collapsed = !this.favorites_collapsed;
-                                            cx.notify();
-                                        },
-                                    )),
-                                )
-                                .when(!self.favorites_collapsed, |this| this.children(favorites))
-                            })
-                            .child(
-                                Self::section_header(
-                                    "channels-section",
-                                    "CHANNELS",
-                                    "Toggle channels",
-                                    self.channels_collapsed,
-                                    cx,
-                                )
-                                .mt_4()
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.channels_collapsed = !this.channels_collapsed;
-                                        cx.notify();
-                                    },
-                                )),
-                            )
-                            .when(!self.channels_collapsed, |this| {
-                                this.children(channels).when(loading, |this| {
-                                    this.child(crate::skeleton::conversation_rows(6, 0, cx))
-                                })
-                            })
-                            .child(
-                                Self::section_header(
-                                    "direct-section",
-                                    "DIRECT MESSAGES",
-                                    "Toggle direct messages",
-                                    self.direct_collapsed,
-                                    cx,
-                                )
-                                .mt_4()
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.direct_collapsed = !this.direct_collapsed;
-                                        cx.notify();
-                                    },
-                                )),
-                            )
-                            .when(!self.direct_collapsed, |this| {
-                                this.children(direct).when(loading, |this| {
-                                    this.child(crate::skeleton::conversation_rows(4, 6, cx))
-                                })
-                            }),
-                    )
+                    .child(self.render_list(cx))
                     .pb_2(),
             )
     }
@@ -1129,4 +1357,440 @@ pub fn confirm_leave(
                 true
             })
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AppContext as _, Bounds, TestAppContext, WindowBounds, WindowOptions, size};
+    use mattermost::{
+        Client, User,
+        testing::{Network, Reply, SlowServer},
+    };
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    struct BoundaryHost {
+        sidebar: Entity<SidebarView>,
+        after: FocusHandle,
+    }
+
+    impl Render for BoundaryHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            v_flex()
+                .size_full()
+                .child(div().flex_1().min_h_0().child(self.sidebar.clone()))
+                .child(
+                    Button::new("after-sidebar")
+                        .label("After sidebar")
+                        .track_focus(&self.after),
+                )
+        }
+    }
+
+    struct Fixture {
+        _server: SlowServer,
+        handle: gpui_kit::AnyWindowHandle,
+        view: Entity<SidebarView>,
+        session: Entity<Session>,
+        after: FocusHandle,
+        read_dm: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn open_sidebar(cx: &mut TestAppContext) -> Fixture {
+        let read_dm = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let remote = read_dm.clone();
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            match (request.method(), request.path().split('?').next().unwrap_or_default()) {
+                ("GET", "/api/v4/users/me/teams") => Reply::json(json!([{"id":"team", "name":"team"}])),
+                ("GET", "/api/v4/users/me/teams/team/channels") => Reply::json(json!(
+                    (0..5000).map(|ix| json!({"id":format!("c-{ix}"), "name":format!("channel-{ix:04}"), "type":"O"})).chain((0..70).map(|ix| json!({"id":format!("dm-{ix}"), "name":format!("me__person-{ix}"), "type":"D", "last_post_at":ix+1}))).collect::<Vec<_>>()
+                )),
+                ("GET", "/api/v4/users/me/preferences/favorite_channel") => Reply::json(json!([{
+                    "user_id":"me", "category":"favorite_channel", "name":"c-0", "value":"true"
+                }])),
+                ("GET", "/api/v4/users/me/teams/team/channels/members") => Reply::json(json!(
+                    (0..70).map(|ix| json!({"channel_id":format!("dm-{ix}"), "user_id":"me", "last_viewed_at":
+                        if ix < 20 && !(ix == 19 && remote.load(std::sync::atomic::Ordering::SeqCst)) {0} else {1000}
+                    })).collect::<Vec<_>>()
+                )),
+                ("DELETE", path) if path.starts_with("/api/v4/channels/") => Reply::json(json!({})),
+                ("GET", "/api/v4/emoji") => Reply::json(json!([])),
+                ("POST", "/api/v4/users/status/ids") => Reply::json(json!([])),
+                _ => Reply::not_found(),
+            }
+        });
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let me: User = serde_json::from_value(json!({"id":"me"})).unwrap();
+        let session = cx.new(|cx| Session::new(client, me, Some("team".into()), cx));
+        let slot = Rc::new(std::cell::RefCell::new(None));
+        let after = cx.update(|cx| cx.focus_handle().tab_stop(true));
+        let (handle, _) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(320.), px(700.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let view = cx.new(|cx| SidebarView::new(session.clone(), window, cx));
+                    *slot.borrow_mut() = Some(view.clone());
+                    cx.new(|_| BoundaryHost {
+                        sidebar: view,
+                        after: after.clone(),
+                    })
+                },
+            )
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, _| window.activate_window())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if session.read_with(cx, |s, _| s.is_loaded() && s.is_favorite(&"c-0".into())) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            cx.executor().advance_clock(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let view = slot.borrow_mut().take().unwrap();
+        Fixture {
+            _server: server,
+            handle,
+            view,
+            session,
+            after,
+            read_dm,
+        }
+    }
+
+    #[gpui_kit::test]
+    fn large_sidebar_virtualizes_and_collapsed_sections_build_no_channels(cx: &mut TestAppContext) {
+        let fixture = open_sidebar(cx);
+        let Fixture {
+            handle,
+            ref view,
+            ref session,
+            ..
+        } = fixture;
+        let frame_work = |cx: &mut TestAppContext| {
+            view.read_with(cx, |v, _| v.channel_rows_built.set(0));
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |_, cx| cx.notify());
+                window.render_frame(cx);
+            })
+            .unwrap();
+            view.read_with(cx, |v, _| v.channel_rows_built.get())
+        };
+        let work = frame_work(cx);
+        assert!(
+            work > 0 && work < 150,
+            "only viewport/overdraw rows: {work}"
+        );
+        let snapshot = view.read_with(cx, |v, _| v.rows.as_ref().unwrap().sections.clone());
+        for _ in 0..3 {
+            assert!(frame_work(cx) < 150);
+        }
+        view.read_with(cx, |v, _| {
+            assert!(Rc::ptr_eq(&snapshot, &v.rows.as_ref().unwrap().sections))
+        });
+        // Native disclosure activation removes every channel from the list model.
+        cx.update_window(handle, |_, window, cx| {
+            window.click("favorites-section", cx);
+            window.click("channels-section", cx);
+            window.click("direct-section", cx);
+        })
+        .unwrap();
+        assert_eq!(frame_work(cx), 0);
+        view.read_with(cx, |v, _| {
+            assert!(
+                !v.rows
+                    .as_ref()
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .any(|r| matches!(r, SidebarRow::Channel(_)))
+            )
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.click("favorites-section", cx);
+            window.click("channels-section", cx);
+        })
+        .unwrap();
+        assert!(frame_work(cx) < 150);
+        // Tab crosses a virtual viewport boundary and preserves domain focus.
+        cx.update_window(handle, |_, window, cx| {
+            view.read(cx).row_focus[&SidebarRow::Channel("c-4998".into())]
+                .clone()
+                .focus(window, cx);
+            window.render_frame(cx);
+            window.press("tab", cx);
+            window.render_frame(cx);
+            assert!(
+                view.read(cx).row_focus[&SidebarRow::Channel("c-4999".into())].is_focused(window)
+            );
+            window.press("shift-tab", cx);
+            assert!(
+                view.read(cx).row_focus[&SidebarRow::Channel("c-4998".into())].is_focused(window)
+            );
+            window.press("tab", cx);
+        })
+        .unwrap();
+        assert!(frame_work(cx) < 150);
+        // The same focused channel survives a favorite reorder.
+        session.update(cx, |s, cx| s.set_favorite(&"c-4999".into(), true, cx));
+        assert!(frame_work(cx) < 150);
+        cx.update_window(handle, |_, window, cx| {
+            assert!(
+                view.read(cx).row_focus[&SidebarRow::Channel("c-4999".into())].is_focused(window)
+            );
+        })
+        .unwrap();
+    }
+
+    fn press(fixture: &Fixture, key: &str, cx: &mut TestAppContext) {
+        cx.update_window(fixture.handle, |_, window, cx| window.press(key, cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(fixture.handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    fn scroll_to_row(
+        view: &Entity<SidebarView>,
+        row: &SidebarRow,
+        offset: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let sidebar = view.read(cx);
+        let item_ix = sidebar
+            .rows
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|candidate| candidate == row)
+            .unwrap();
+        sidebar.list.scroll_to(ListOffset {
+            item_ix,
+            offset_in_item: px(offset),
+        });
+        window.render_frame(cx);
+    }
+
+    #[gpui_kit::test]
+    fn tab_enters_and_exits_model_boundaries_when_scrolled(cx: &mut TestAppContext) {
+        let fixture = open_sidebar(cx);
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            fixture.view.read(cx).row_focus[&SidebarRow::Threads]
+                .clone()
+                .focus(window, cx);
+            scroll_to_row(
+                &fixture.view,
+                &SidebarRow::Channel("c-2500".into()),
+                0.,
+                window,
+                cx,
+            );
+            assert_eq!(
+                fixture.view.read(cx).list.item_is_above_viewport(0),
+                Some(true)
+            );
+        })
+        .unwrap();
+        press(&fixture, "shift-tab", cx);
+        cx.update_window(fixture.handle, |_, window, _| {
+            assert_eq!(
+                window.find("jump-to").focused(),
+                Some(true),
+                "backwards exit must reach the header, not a painted channel"
+            );
+        })
+        .unwrap();
+        press(&fixture, "tab", cx);
+        cx.update_window(fixture.handle, |_, window, cx| {
+            let sidebar = fixture.view.read(cx);
+            assert!(sidebar.row_focus[&SidebarRow::Threads].is_focused(window));
+            assert_eq!(
+                sidebar.list.item_is_above_viewport(0),
+                Some(false),
+                "forward entry reveals Threads"
+            );
+        })
+        .unwrap();
+
+        let last = fixture.view.read_with(cx, |sidebar, _| {
+            sidebar
+                .rows
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .rev()
+                .find(|row| sidebar.row_focus.contains_key(*row))
+                .unwrap()
+                .clone()
+        });
+        cx.update_window(fixture.handle, |_, window, cx| {
+            fixture.view.read(cx).row_focus[&last]
+                .clone()
+                .focus(window, cx);
+            scroll_to_row(
+                &fixture.view,
+                &SidebarRow::Channel("c-2500".into()),
+                0.,
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+        press(&fixture, "tab", cx);
+        cx.update_window(fixture.handle, |_, window, _| {
+            assert!(
+                fixture.after.is_focused(window),
+                "forward exit must leave the virtual list"
+            );
+        })
+        .unwrap();
+        press(&fixture, "shift-tab", cx);
+        cx.update_window(fixture.handle, |_, window, cx| {
+            let sidebar = fixture.view.read(cx);
+            let ix = sidebar
+                .rows
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .position(|row| row == &last)
+                .unwrap();
+            assert!(sidebar.row_focus[&last].is_focused(window));
+            assert_eq!(
+                sidebar.list.item_is_below_viewport(ix),
+                Some(false),
+                "backwards entry reveals the last model row"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn removing_the_top_channel_preserves_its_neighbor_and_offset(cx: &mut TestAppContext) {
+        let fixture = open_sidebar(cx);
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            scroll_to_row(
+                &fixture.view,
+                &SidebarRow::Channel("c-2500".into()),
+                12.,
+                window,
+                cx,
+            );
+            fixture
+                .session
+                .update(cx, |s, cx| s.leave_channel(&"c-2500".into(), cx));
+            window.render_frame(cx);
+            let sidebar = fixture.view.read(cx);
+            let top = sidebar.list.logical_scroll_top();
+            assert_eq!(
+                sidebar.rows.as_ref().unwrap().rows[top.item_ix],
+                SidebarRow::Channel("c-2501".into())
+            );
+            assert_eq!(top.offset_in_item, px(12.));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn reading_an_older_dm_preserves_the_neighbor_in_the_viewport(cx: &mut TestAppContext) {
+        let fixture = open_sidebar(cx);
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            scroll_to_row(
+                &fixture.view,
+                &SidebarRow::Channel("dm-19".into()),
+                12.,
+                window,
+                cx,
+            );
+            let sidebar = fixture.view.read(cx);
+            assert_eq!(
+                sidebar.rows.as_ref().unwrap().rows[sidebar.list.logical_scroll_top().item_ix],
+                SidebarRow::Channel("dm-19".into())
+            );
+        })
+        .unwrap();
+        // An authoritative reload observes a read made by another client.
+        fixture
+            .read_dm
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fixture.session.update(cx, |s, cx| s.retry_channels(cx));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if fixture.session.read_with(cx, |s, _| {
+                s.is_loaded() && !s.channel(&"dm-19".into()).unwrap().is_unread()
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            cx.executor().advance_clock(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            let sidebar = fixture.view.read(cx);
+            let top = sidebar.list.logical_scroll_top();
+            assert_eq!(
+                sidebar.rows.as_ref().unwrap().rows[top.item_ix],
+                SidebarRow::Channel("dm-18".into())
+            );
+            assert_eq!(top.offset_in_item, px(12.));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn collapsing_the_anchor_section_falls_back_to_its_header(cx: &mut TestAppContext) {
+        let fixture = open_sidebar(cx);
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            scroll_to_row(
+                &fixture.view,
+                &SidebarRow::Channel("c-1".into()),
+                30.,
+                window,
+                cx,
+            );
+            fixture.view.update(cx, |sidebar, cx| {
+                sidebar.channels_collapsed = true;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let sidebar = fixture.view.read(cx);
+            let top = sidebar.list.logical_scroll_top();
+            assert_eq!(
+                sidebar.rows.as_ref().unwrap().rows[top.item_ix],
+                SidebarRow::Header(Section::Channels)
+            );
+            assert_eq!(
+                top.offset_in_item,
+                px(0.),
+                "an unmeasured replacement starts at a safe clamped offset"
+            );
+        })
+        .unwrap();
+    }
 }

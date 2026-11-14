@@ -93,6 +93,7 @@ pub const WORKSPACE_CONTEXT: &str = "Workspace";
 
 pub fn init(cx: &mut App) {
     crate::threads_view::init(cx);
+    crate::sidebar::init(cx);
     cx.bind_keys([KeyBinding::new(
         "escape",
         crate::switcher::Dismiss,

@@ -125,19 +125,19 @@ pub fn open(
         .collect();
     let in_recent = |id: &ChannelId| recent_ids.contains(&id);
     let favorite_items: Vec<_> = sections
-        .favorites
+        .favorites()
         .iter()
         .filter(|id| !in_recent(id))
         .filter_map(|id| channel_item(session_ref, id, cx))
         .collect();
     let channel_items: Vec<_> = sections
-        .channels
+        .channels()
         .iter()
         .filter(|id| !in_recent(id))
         .filter_map(|id| channel_item(session_ref, id, cx))
         .collect();
     let direct_items: Vec<_> = sections
-        .direct
+        .direct()
         .iter()
         .filter(|id| !in_recent(id))
         .filter_map(|id| channel_item(session_ref, id, cx))
