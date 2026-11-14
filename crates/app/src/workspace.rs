@@ -19,14 +19,14 @@ use gpui_kit::{
     Styled as _, Subscription, Task, Window, div, px,
 };
 use mattermost::{ChannelId, Client, Post, PostId, TeamId, User};
-use session::{Session, SessionEvent, TimelineKind};
+use session::{SearchScope, Session, SessionEvent, TimelineKind};
 
 use crate::{
     actions::{
         CloseConversation, Dismiss, FocusComposer, LeaveChannel, NextChannel, NextUnreadChannel,
         PreviousChannel, PreviousUnreadChannel, QuickSwitch, RESET_ZOOM_KEY, SearchConversation,
-        ShowSettings, ShowShortcuts, ShowThreads, ToggleFavorite, WORKSPACE_CONTEXT, ZOOM_IN_KEY,
-        ZOOM_OUT_KEY, shortcut_label,
+        SearchTeam, ShowSettings, ShowShortcuts, ShowThreads, ToggleFavorite, WORKSPACE_CONTEXT,
+        ZOOM_IN_KEY, ZOOM_OUT_KEY, shortcut_label,
     },
     cache,
     dither::DitherView,
@@ -101,7 +101,7 @@ pub struct Workspace {
     views: Vec<(ChannelId, Entity<TimelineView>, Subscription)>,
     active: Option<ChannelId>,
     thread: Option<(Entity<TimelineView>, Subscription)>,
-    /// The open channel's search, kept while hidden so its results are
+    /// The message search, kept while hidden so its results are
     /// still there when it comes back.
     search: Option<(Entity<SearchView>, Subscription)>,
     /// Whether the search shows. A thread opened over it covers it until
@@ -246,6 +246,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let session_ref = session.read(cx);
+        if self.search.as_ref().is_some_and(|(search, _)| {
+            search.read(cx).team() != session_ref.team().map(|team| &team.id)
+        }) {
+            self.search = None;
+            self.search_open = false;
+        }
         if !session_ref.is_loaded() {
             return;
         }
@@ -334,14 +340,17 @@ impl Workspace {
         self.recent.truncate(RECENT_LIMIT);
         persist::update(|state| state.last_channel = Some(id.to_string()));
 
-        // A thread belongs to its channel, and so does a search.
+        // A conversation search follows its channel; a team search stays open.
         if self
             .search
             .as_ref()
-            .is_some_and(|(search, _)| search.read(cx).channel() != id)
+            .is_some_and(|(search, _)| matches!(search.read(cx).scope(), SearchScope::Conversation(channel) if channel != id))
         {
             self.search = None;
             self.search_open = false;
+        }
+        if let Some((search, _)) = &self.search {
+            search.update(cx, |search, _| search.set_conversation(id.clone()));
         }
         if let Some((thread, _)) = &self.thread
             && thread.read(cx).kind().channel() != id
@@ -513,11 +522,25 @@ impl Workspace {
         let Some(active) = self.active.clone() else {
             return;
         };
+        self.open_search(SearchScope::Conversation(active), window, cx);
+    }
+
+    fn search_team(&mut self, _: &SearchTeam, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.read(cx).team().is_some() {
+            self.open_search(SearchScope::Team, window, cx);
+        }
+    }
+
+    fn open_search(&mut self, scope: SearchScope, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_threads(cx);
         let search = match &self.search {
-            Some((search, _)) if search.read(cx).channel() == &active => search.clone(),
-            _ => {
+            Some((search, _)) => {
+                search.update(cx, |search, cx| search.set_scope(scope, window, cx));
+                search.clone()
+            }
+            None => {
                 let session = self.session.clone();
-                let search = cx.new(|cx| SearchView::new(session, active, window, cx));
+                let search = cx.new(|cx| SearchView::new(session, scope, window, cx));
                 let subscription = cx.subscribe_in(&search, window, Self::on_search_event);
                 self.search = Some((search.clone(), subscription));
                 search
@@ -553,6 +576,9 @@ impl Workspace {
     /// over the results, and any other post in the channel beside them.
     fn show_result(&mut self, post: &Post, window: &mut Window, cx: &mut Context<Self>) {
         let channel = post.channel_id.clone();
+        if self.session.read(cx).channel(&channel).is_none() {
+            return;
+        }
         if self.active.as_ref() != Some(&channel) {
             self.open_channel(&channel, window, cx);
         }
@@ -666,12 +692,13 @@ impl Workspace {
 
     fn show_shortcuts(&mut self, _: &ShowShortcuts, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, |dialog, window, cx| {
-            let rows: [(&str, Box<dyn Action>); 11] = [
+            let rows: [(&str, Box<dyn Action>); 12] = [
                 ("Jump to a channel or person", Box::new(QuickSwitch)),
                 (
                     "Search messages in the conversation",
                     Box::new(SearchConversation),
                 ),
+                ("Search all channels in this team", Box::new(SearchTeam)),
                 ("Threads", Box::new(ShowThreads)),
                 ("Next channel", Box::new(NextChannel)),
                 ("Previous channel", Box::new(PreviousChannel)),
@@ -1012,6 +1039,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::close_conversation))
             .on_action(cx.listener(Self::toggle_favorite))
             .on_action(cx.listener(Self::search_conversation))
+            .on_action(cx.listener(Self::search_team))
             .on_action(cx.listener(Self::leave_channel))
             .on_action(
                 cx.listener(|this, _: &FocusComposer, window, cx| this.focus_active(window, cx)),
@@ -1146,6 +1174,199 @@ mod tests {
             cx.executor().advance_clock(Duration::from_millis(50));
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[gpui_kit::test]
+    fn team_search_shortcut_opens_other_channels_and_their_threads(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match request.path().split('?').next().unwrap_or_default() {
+                "/api/v4/users/me/teams" => Reply::json(json!([
+                    { "id": "team", "name": "team" }, { "id": "next", "name": "next" }
+                ])),
+                "/api/v4/users/me/teams/next/channels"
+                | "/api/v4/users/me/teams/next/channels/members" => Reply::json(json!([])),
+                "/api/v4/teams/team/posts/search" => Reply::json(json!({
+                    "has_next": true, "order": ["remote", "reply"], "posts": {
+                        "remote": { "id": "remote", "channel_id": "other", "user_id": "ann",
+                                    "message": "hello", "create_at": 40 },
+                        "reply": { "id": "reply", "channel_id": "other", "user_id": "ann",
+                                   "root_id": "root", "message": "hello reply", "create_at": 30 }
+                    }
+                })),
+                "/api/v4/channels/other" => Reply::json(json!({
+                    "id": "other", "team_id": "team", "type": "O", "name": "other", "display_name": "Other"
+                })),
+                "/api/v4/channels/other/members/me" => Reply::json(json!({
+                    "channel_id": "other", "user_id": "me"
+                })),
+                "/api/v4/channels/other/posts" => Reply::json(json!({
+                    "order": ["remote"], "posts": {"remote": {
+                        "id": "remote", "channel_id": "other", "user_id": "ann",
+                        "message": "hello", "create_at": 40
+                    }}
+                })),
+                _ => route(request),
+            }
+        });
+        let (handle, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| w.session.read(cx).team().is_some())
+        });
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_channel(&"town".into(), window, cx));
+            window.render_frame(cx);
+            window.press(
+                if cfg!(target_os = "macos") {
+                    "cmd-shift-f"
+                } else {
+                    "ctrl-shift-f"
+                },
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let search = workspace.read_with(cx, |w, _| w.search.as_ref().unwrap().0.clone());
+        search.read_with(cx, |s, _| assert_eq!(s.scope(), &SearchScope::Team));
+        cx.update_window(handle, |_, window, cx| window.input("hello", cx))
+            .unwrap();
+        wait_until(cx, |_| {
+            server
+                .requests()
+                .iter()
+                .any(|r| r.path() == "/api/v4/channels/other")
+        });
+        // Wait for the result rows to arrive, then use the keyboard to open one.
+        wait_until(cx, |cx| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find("more-results").is_some()
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, _| w.active == Some("other".into()))
+        });
+        workspace.read_with(cx, |w, cx| {
+            assert!(w.search_open);
+            assert_eq!(w.search.as_ref().unwrap().0, search);
+            assert_eq!(
+                w.session
+                    .read(cx)
+                    .channel(&"other".into())
+                    .unwrap()
+                    .channel()
+                    .display_name,
+                "Other"
+            );
+        });
+        cx.update_window(handle, |_, window, cx| {
+            search.update(cx, |s, cx| s.focus(window, cx));
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| workspace.read_with(cx, |w, _| w.thread.is_some()));
+        workspace.read_with(cx, |w, cx| {
+            let thread = &w.thread.as_ref().unwrap().0;
+            assert_eq!(thread.read(cx).kind().channel(), &ChannelId::from("other"));
+            assert!(w.search_open);
+        });
+        let session = workspace.read_with(cx, |w, _| w.session.clone());
+        session.update(cx, |s, cx| s.select_team("next".into(), cx));
+        wait_until(cx, |cx| workspace.read_with(cx, |w, _| w.search.is_none()));
+        workspace.read_with(cx, |w, _| assert!(!w.search_open));
+    }
+
+    #[gpui_kit::test]
+    fn an_unavailable_search_result_does_not_change_the_conversation(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (handle, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| w.session.read(cx).is_loaded())
+        });
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| {
+                w.open_channel(&"town".into(), window, cx);
+                for root in ["", "root"] {
+                    let mut post = Post::default();
+                    post.id = "unavailable".into();
+                    post.channel_id = "gone".into();
+                    post.root_id = root.into();
+                    w.show_result(&post, window, cx);
+                    assert_eq!(w.active, Some("town".into()));
+                    assert!(w.thread.is_none());
+                }
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn do_not_disturb_silences_mentions_and_direct_messages(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            if request.path() == "/api/v4/users/me/teams/team/channels" {
+                Reply::json(json!([
+                    { "id": "town", "team_id": "team", "type": "O", "name": "town-square" },
+                    { "id": "dm", "type": "D", "name": "me__ann" }
+                ]))
+            } else {
+                route(request)
+            }
+        });
+        let (handle, workspace) = open_workspace(&server, cx);
+        let session = workspace.read_with(cx, |w, _| w.session.clone());
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.channel(&"dm".into()).is_some())
+        });
+        cx.update(|cx| {
+            extensions::init(cx);
+            cx.set_app_identity("com.mtc.test", "mtc");
+        });
+        cx.update_window(handle, |_, window, cx| {
+            session.update(cx, |s, cx| s.close_channel(cx));
+            let directory = session.read(cx).directory().clone();
+            directory.update(cx, |d, cx| {
+                d.set_status("me".into(), mattermost::Status::DoNotDisturb, cx);
+                d.set_status("ann".into(), mattermost::Status::Online, cx);
+            });
+            for status in [mattermost::Status::DoNotDisturb, mattermost::Status::Online] {
+                directory.update(cx, |d, cx| {
+                    d.set_status("me".into(), status, cx);
+                    d.set_status("ann".into(), mattermost::Status::DoNotDisturb, cx);
+                });
+                let before = window.notifications(cx).len();
+                for (channel, mentions_me) in [("town", true), ("dm", false)] {
+                    let mut post = Post::default();
+                    post.id = format!("{channel}-{}", status.as_str()).into();
+                    post.channel_id = channel.into();
+                    post.user_id = "ann".into();
+                    post.message = "hello".into();
+                    extensions::dispatch_session_event(
+                        &SessionEvent::Posted {
+                            post: std::sync::Arc::new(post),
+                            mentions_me,
+                        },
+                        &session,
+                        window,
+                        cx,
+                    );
+                }
+                let added = if status == mattermost::Status::DoNotDisturb {
+                    0
+                } else {
+                    2
+                };
+                assert_eq!(window.notifications(cx).len(), before + added);
+            }
+        })
+        .unwrap();
+        assert_eq!(cx.shown_system_notifications().len(), 2);
     }
 
     #[gpui_kit::test]

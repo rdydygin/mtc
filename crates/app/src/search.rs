@@ -1,4 +1,4 @@
-//! ⌘F: find messages in the open conversation.
+//! Find messages in a conversation or the current team.
 //!
 //! The panel sits beside the conversation, where a thread opens. Results
 //! follow the typing. Choosing one scrolls the conversation to it, or opens
@@ -8,7 +8,7 @@ use std::{collections::HashMap, ops::Range, sync::Arc, time::Duration};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, Sizable as _, StyledExt as _,
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _,
     avatar::Avatar,
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -22,8 +22,8 @@ use gpui_kit::{
     ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _,
     Styled as _, StyledText, Subscription, Task, Window, div, prelude::FluentBuilder as _,
 };
-use mattermost::{ChannelId, Post, PostId, PostSearch};
-use session::{CustomEmojis, Session};
+use mattermost::{ChannelId, Post, PostId, PostSearch, TeamId};
+use session::{CustomEmojis, SearchScope, Session};
 
 use crate::{http::avatar_url, time};
 
@@ -49,7 +49,12 @@ enum Status {
 
 pub struct SearchView {
     session: Entity<Session>,
-    channel: ChannelId,
+    team: Option<TeamId>,
+    channel: Option<ChannelId>,
+    scope: SearchScope,
+    results_scope: Option<SearchScope>,
+    /// Changes whenever input or scope invalidates an outstanding request.
+    revision: u64,
     input: Entity<InputState>,
     /// The query the results answer.
     query: String,
@@ -74,13 +79,16 @@ impl EventEmitter<SearchEvent> for SearchView {}
 impl SearchView {
     pub fn new(
         session: Entity<Session>,
-        channel: ChannelId,
+        scope: SearchScope,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let placeholder = scope_label(&session, &channel, cx)
-            .map(|scope| format!("Search {scope}"))
-            .unwrap_or_else(|| "Search messages".into());
+        let channel = match &scope {
+            SearchScope::Conversation(channel) => Some(channel.clone()),
+            SearchScope::Team => session.read(cx).active_channel().cloned(),
+        };
+        let team = session.read(cx).team().map(|team| team.id.clone());
+        let placeholder = search_placeholder(&session, &scope, cx);
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let directory = session.read(cx).directory().clone();
         let subscriptions = vec![
@@ -99,7 +107,11 @@ impl SearchView {
         ];
         Self {
             session,
+            team,
             channel,
+            scope,
+            results_scope: None,
+            revision: 0,
             input,
             query: String::new(),
             results: Vec::new(),
@@ -115,14 +127,44 @@ impl SearchView {
         }
     }
 
-    /// The conversation searched.
-    pub fn channel(&self) -> &ChannelId {
-        &self.channel
+    /// The team this search was opened in.
+    pub fn team(&self) -> Option<&TeamId> {
+        self.team.as_ref()
+    }
+
+    /// Where the messages are searched.
+    pub fn scope(&self) -> &SearchScope {
+        &self.scope
+    }
+
+    /// Keep the conversation choice pointed at the channel now on screen.
+    pub fn set_conversation(&mut self, channel: ChannelId) {
+        self.channel = Some(channel);
+    }
+
+    pub fn set_scope(&mut self, scope: SearchScope, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        let placeholder = search_placeholder(&self.session, &self.scope, cx);
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder(placeholder, window, cx)
+        });
+        self.results_scope = None;
+        self.results.clear();
+        self.matches.clear();
+        self.selected = None;
+        self.next_page = None;
+        self._more = None;
+        self.loading_more = false;
+        self.search(None, cx);
     }
 
     /// Whether the results answer what's typed now.
     fn answers_input(&self, cx: &App) -> bool {
         self.input.read(cx).value().trim() == self.query
+            && self.results_scope.as_ref() == Some(&self.scope)
     }
 
     /// Put the cursor in the search field with its text selected, so typing
@@ -136,11 +178,15 @@ impl SearchView {
     /// Search for what's typed, after `delay` so a burst of typing makes
     /// one request. A newer search replaces one still waiting or running.
     fn search(&mut self, delay: Option<Duration>, cx: &mut Context<Self>) {
+        self.revision += 1;
+        self._more = None;
+        self.loading_more = false;
+        let revision = self.revision;
         let query = self.input.read(cx).value().trim().to_string();
         let failed = matches!(self.status, Status::Failed(_));
-        if !query.is_empty() && query == self.query && !failed && delay.is_some() {
+        if !query.is_empty() && self.answers_input(cx) && !failed && delay.is_some() {
             // Typed back to what the results answer: drop the search for
-            // what was typed in between, but not a page still loading.
+            // what was typed in between.
             self._search = None;
             self.status = Status::Done;
             cx.notify();
@@ -159,7 +205,7 @@ impl SearchView {
             cx.notify();
             return;
         }
-        let channel = self.channel.clone();
+        let scope = self.scope.clone();
         self._search = Some(cx.spawn(async move |this, cx| {
             if let Some(delay) = delay {
                 cx.background_executor().timer(delay).await;
@@ -170,12 +216,14 @@ impl SearchView {
                 this.loading_more = false;
                 cx.notify();
                 this.session
-                    .update(cx, |s, cx| s.search_channel(&channel, &query, 0, cx))
+                    .update(cx, |s, cx| s.search_messages(&scope, &query, 0, cx))
             }) else {
                 return;
             };
             let result = task.await;
-            let _ = this.update(cx, |this, cx| this.finish(query, 0, result, cx));
+            let _ = this.update(cx, |this, cx| {
+                this.finish(revision, scope, query, 0, result, cx)
+            });
         }));
     }
 
@@ -183,34 +231,41 @@ impl SearchView {
         let Some(page) = self.next_page else {
             return;
         };
-        if self.loading_more {
+        if self.loading_more || !self.answers_input(cx) {
             return;
         }
         self.loading_more = true;
         cx.notify();
         let query = self.query.clone();
-        let task = self.session.update(cx, |s, cx| {
-            s.search_channel(&self.channel, &query, page, cx)
-        });
+        let scope = self.scope.clone();
+        let revision = self.revision;
+        let task = self
+            .session
+            .update(cx, |s, cx| s.search_messages(&scope, &query, page, cx));
         self._more = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| this.finish(query, page, result, cx));
+            let _ = this.update(cx, |this, cx| {
+                this.finish(revision, scope, query, page, result, cx)
+            });
         }));
     }
 
     fn finish(
         &mut self,
+        revision: u64,
+        scope: SearchScope,
         query: String,
         page: usize,
         result: anyhow::Result<PostSearch>,
         cx: &mut Context<Self>,
     ) {
         // A page of older words, answered after newer ones were searched.
-        if page > 0 && query != self.query {
+        if revision != self.revision || scope != self.scope {
             return;
         }
         self.loading_more = false;
         self.query = query;
+        self.results_scope = Some(scope);
         match result {
             Ok(found) => {
                 if page == 0 {
@@ -340,7 +395,7 @@ impl SearchView {
                         .on_click(cx.listener(|this, _, _, cx| this.search(None, cx))),
                 )
                 .into_any_element(),
-            _ if self.results.is_empty() => {
+            _ if self.results.is_empty() && self.next_page.is_none() => {
                 message(format!("No messages match “{}”.", self.query).into()).into_any_element()
             }
             _ => self.render_results(cx),
@@ -488,6 +543,16 @@ impl SearchView {
                         )
                     }),
             )
+            .when(self.results_scope == Some(SearchScope::Team), |this| {
+                let label = scope_label(&self.session, &post.channel_id, cx)
+                    .unwrap_or_else(|| format!("Channel {}", post.channel_id));
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(label),
+                )
+            })
             .when(!text.is_empty(), |this| {
                 this.child(
                     div().text_sm().line_clamp(4).child(
@@ -508,6 +573,15 @@ impl SearchView {
                 )
             })
             .into_any_element()
+    }
+}
+
+fn search_placeholder(session: &Entity<Session>, scope: &SearchScope, cx: &App) -> String {
+    match scope {
+        SearchScope::Team => "Search all channels in this team".into(),
+        SearchScope::Conversation(channel) => scope_label(session, channel, cx)
+            .map(|label| format!("Search {label}"))
+            .unwrap_or_else(|| "Search messages".into()),
     }
 }
 
@@ -631,6 +705,37 @@ impl Render for SearchView {
             .min_w_0()
             .capture_key_down(cx.listener(Self::on_key_down))
             .child(self.render_header(cx))
+            .child(
+                h_flex()
+                    .px_4()
+                    .py_2()
+                    .gap_2()
+                    .child(
+                        Button::new("search-conversation")
+                            .small()
+                            .ghost()
+                            .label("This conversation")
+                            .selected(matches!(self.scope, SearchScope::Conversation(_)))
+                            .disabled(self.channel.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(channel) = this.channel.clone() {
+                                    this.set_scope(SearchScope::Conversation(channel), window, cx);
+                                    this.input.focus_handle(cx).focus(window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("search-team")
+                            .small()
+                            .ghost()
+                            .label("All channels")
+                            .selected(self.scope == SearchScope::Team)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.set_scope(SearchScope::Team, window, cx);
+                                this.input.focus_handle(cx).focus(window, cx);
+                            })),
+                    ),
+            )
             .child(self.render_body(cx))
     }
 }
@@ -730,7 +835,14 @@ mod tests {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| SearchView::new(session, "town".into(), window, cx))
+                cx.new(|cx| {
+                    SearchView::new(
+                        session,
+                        SearchScope::Conversation("town".into()),
+                        window,
+                        cx,
+                    )
+                })
             })
             .unwrap()
         });
@@ -860,6 +972,87 @@ mod tests {
         view.update(cx, |v, cx| v.load_more(cx));
         wait_until(cx, |cx| view.read_with(cx, |v, _| v.query == "hello!"));
         view.read_with(cx, |v, _| assert!(matches!(v.status, Status::Done)));
+    }
+
+    #[gpui_kit::test]
+    fn an_unavailable_page_still_allows_loading_more_results(cx: &mut TestAppContext) {
+        let searches = std::sync::atomic::AtomicUsize::new(0);
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            if request.path() == "/api/v4/teams/team/posts/search"
+                && searches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+            {
+                Reply::json(json!({
+                    "has_next": true, "order": ["gone"], "posts": {
+                        "gone": { "id": "gone", "channel_id": "unavailable", "message": "hello" }
+                    }
+                }))
+            } else {
+                route(request)
+            }
+        });
+        let (window, view) = open_search(&server, cx);
+        cx.update_window(window, |_, window, cx| {
+            window.click("search-team", cx);
+            window.input("hello", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.next_page.is_some()));
+        view.read_with(cx, |v, _| assert!(v.results.is_empty()));
+        cx.update_window(window, |_, window, cx| window.click("more-results", cx))
+            .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 2));
+    }
+
+    #[gpui_kit::test]
+    fn scope_buttons_work_from_the_keyboard_and_discard_old_answers(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (window, view) = open_search(&server, cx);
+        cx.update_window(window, |_, window, cx| window.input("hello", cx))
+            .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 2));
+        let revision = view.read_with(cx, |v, _| v.revision);
+        cx.update_window(window, |_, window, cx| {
+            // Tab leaves the input for Close, then the two scope buttons.
+            window.press("tab", cx);
+            window.press("tab", cx);
+            window.press("tab", cx);
+            assert_eq!(window.find("search-team").focused(), Some(true));
+            window.press("space", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, _| v.results_scope == Some(SearchScope::Team))
+        });
+        view.update(cx, |v, cx| {
+            v.finish(
+                revision,
+                SearchScope::Conversation("town".into()),
+                "hello".into(),
+                0,
+                Ok(PostSearch::default()),
+                cx,
+            );
+            assert_eq!(v.results.len(), 2);
+            assert_eq!(v.results_scope, Some(SearchScope::Team));
+            v.finish(
+                revision,
+                SearchScope::Team,
+                "old query".into(),
+                1,
+                Ok(PostSearch::default()),
+                cx,
+            );
+            assert_eq!(v.query, "hello");
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.click("search-conversation", cx)
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, _| {
+                v.results_scope == Some(SearchScope::Conversation("town".into()))
+            })
+        });
     }
 
     fn words(terms: &[&str]) -> Vec<String> {

@@ -20,6 +20,8 @@ actions!(
         QuickSwitch,
         /// Search the messages of the open conversation.
         SearchConversation,
+        /// Search messages across the current team.
+        SearchTeam,
         /// Show the threads you follow.
         ShowThreads,
         CloseConversation,
@@ -94,6 +96,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(QUICK_SWITCH_KEY, QuickSwitch, None),
         KeyBinding::new(primary!("t"), QuickSwitch, None),
         KeyBinding::new(primary!("f"), SearchConversation, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new(primary!("shift-f"), SearchTeam, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new(primary!("shift-t"), ShowThreads, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("alt-down", NextChannel, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("alt-up", PreviousChannel, Some(WORKSPACE_CONTEXT)),
@@ -118,6 +121,7 @@ pub fn init(cx: &mut App) {
             Some("Workspace > Input"),
         ),
         KeyBinding::new(primary!("f"), SearchConversation, Some("Workspace > Input")),
+        KeyBinding::new(primary!("shift-f"), SearchTeam, Some("Workspace > Input")),
         KeyBinding::new(primary!("w"), CloseConversation, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new(primary!("l"), FocusComposer, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new(ZOOM_IN_KEY, ZoomIn, None),
@@ -174,7 +178,8 @@ pub fn set_menus(cx: &mut App) {
         ]),
         Menu::new("Go").items([
             MenuItem::action("Jump To…", QuickSwitch),
-            MenuItem::action("Search Messages…", SearchConversation),
+            MenuItem::action("Search Conversation…", SearchConversation),
+            MenuItem::action("Search All Channels…", SearchTeam),
             MenuItem::action("Threads", ShowThreads),
             MenuItem::action("Close Conversation", CloseConversation),
             MenuItem::separator(),

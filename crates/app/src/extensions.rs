@@ -295,7 +295,12 @@ impl Extension for Core {
                 let is_direct = channel.kind() == mattermost::ChannelType::Direct;
                 let is_visible =
                     window.is_window_active() && session.active_channel() == Some(&post.channel_id);
-                if (!*mentions_me && !is_direct) || is_visible || channel.is_muted() {
+                let status = session.directory().read(cx).status(&session.me().id);
+                if status == mattermost::Status::DoNotDisturb
+                    || (!*mentions_me && !is_direct)
+                    || is_visible
+                    || channel.is_muted()
+                {
                     return;
                 }
                 let author = session.directory().read(cx).display_name(&post.user_id);

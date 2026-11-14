@@ -61,6 +61,7 @@ pub enum PostAction {
     OpenThread,
     ToggleReaction(String),
     CopyText,
+    CopyLink,
     Edit,
     Delete,
     Retry,
@@ -90,6 +91,7 @@ pub struct PostRow {
     client: Option<Client>,
     directory: Option<Entity<Directory>>,
     custom_emoji: CustomEmojis,
+    has_permalink: bool,
     on_action: PostActionHandler,
 }
 
@@ -110,8 +112,14 @@ impl PostRow {
             client: None,
             directory: None,
             custom_emoji: CustomEmojis::default(),
+            has_permalink: false,
             on_action,
         }
+    }
+
+    pub fn has_permalink(mut self, available: bool) -> Self {
+        self.has_permalink = available;
+        self
     }
 
     pub fn author(mut self, author: Option<Arc<User>>, avatar_url: Option<SharedString>) -> Self {
@@ -938,6 +946,7 @@ impl RenderOnce for PostRow {
             is_system,
             self.shown_files(),
             self.link_preview_url(),
+            self.has_permalink,
         )
         .into();
         let row = h_flex()
@@ -1312,6 +1321,7 @@ fn post_menu_entries(
     is_system: bool,
     files: &[FileInfo],
     link: Option<SharedString>,
+    has_permalink: bool,
 ) -> Vec<PostMenuEntry> {
     let item = |label: String, action: PostAction| {
         PostMenuEntry::Command(label.into(), PostCommand::Post(action))
@@ -1328,6 +1338,9 @@ fn post_menu_entries(
     }
     entries.push(PostMenuEntry::Separator);
     entries.push(item("Copy text".into(), PostAction::CopyText));
+    if has_permalink {
+        entries.push(item("Copy link".into(), PostAction::CopyLink));
+    }
     if !files.is_empty() || link.is_some() {
         entries.push(PostMenuEntry::Separator);
         entries.extend(files.iter().map(|file| {
@@ -1670,7 +1683,13 @@ mod tests {
     fn menu_reaches_files_and_link_preview() {
         let mut file = FileInfo::default();
         file.name = "report.pdf".into();
-        let entries = post_menu_entries(false, false, &[file], Some("https://example.com".into()));
+        let entries = post_menu_entries(
+            false,
+            false,
+            &[file],
+            Some("https://example.com".into()),
+            false,
+        );
         let labels = labels(&entries);
         assert!(labels.contains(&"Open report.pdf"));
         assert!(labels.contains(&"Open link"));
@@ -1682,8 +1701,16 @@ mod tests {
     }
 
     #[test]
+    fn copy_link_is_available_only_with_a_permalink() {
+        let entries = post_menu_entries(false, false, &[], None, true);
+        assert!(labels(&entries).contains(&"Copy link"));
+        let entries = post_menu_entries(false, false, &[], None, false);
+        assert!(!labels(&entries).contains(&"Copy link"));
+    }
+
+    #[test]
     fn menu_without_attachments_has_no_open_section() {
-        let entries = post_menu_entries(true, false, &[], None);
+        let entries = post_menu_entries(true, false, &[], None, false);
         let labels = labels(&entries);
         assert!(!labels.iter().any(|label| label.starts_with("Open")));
         assert_eq!(labels.last(), Some(&"Delete…"));

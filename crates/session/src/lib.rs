@@ -26,7 +26,7 @@ pub use prepare::{
     PreparedMessage, custom_emoji_names, emoji_for, emoji_name, emojify, mention_username,
     needs_rich_text,
 };
-pub use search::{SEARCH_PAGE_SIZE, search_terms};
+pub use search::{SEARCH_PAGE_SIZE, SearchScope, search_terms};
 pub use session::{ChannelEntry, Connection, Session, SessionEvent};
 pub use threads::{FollowedThread, FollowedThreads, ThreadFilter, ThreadsEvent};
 pub use timeline::{Delivery, Entry, LoadState, PAGE_SIZE, Timeline, TimelineEvent, TimelineKind};
