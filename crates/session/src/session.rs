@@ -169,8 +169,10 @@ pub struct Session {
     channel_list_generation: u64,
     /// Monotonic team selection revision, including round trips to the same team.
     team_revision: u64,
-    /// Channels hydrated since the pending list request started.
+    /// Channels learned since the pending list request started.
     hydrated_channels: HashSet<ChannelId>,
+    /// Member changes to overlay only when the channel is still listed.
+    touched_members: HashSet<ChannelId>,
     channels_state: LoadState,
     teams_state: LoadState,
     teams_loaded: bool,
@@ -263,6 +265,7 @@ impl Session {
             channel_list_generation: 0,
             team_revision: 0,
             hydrated_channels: HashSet::new(),
+            touched_members: HashSet::new(),
             channels_state: LoadState::NotLoaded,
             teams_state: LoadState::NotLoaded,
             teams_loaded: false,
@@ -498,6 +501,7 @@ impl Session {
         self.channels_state = LoadState::Loading;
         cx.notify();
         self.hydrated_channels.clear();
+        self.touched_members.clear();
         let team = self.team.clone();
         self.threads.update(cx, |t, cx| t.set_team(team, cx));
         let Some(team) = self.team.clone() else {
@@ -530,6 +534,14 @@ impl Session {
                     for id in this.hydrated_channels.drain() {
                         if let Some(entry) = this.channels.get(&id) {
                             channels.insert(id, entry.clone());
+                        }
+                    }
+                    // Fresh member state cannot establish channel membership.
+                    for id in this.touched_members.drain() {
+                        if let Some(entry) = channels.get_mut(&id)
+                            && let Some(current) = this.channels.get(&id)
+                        {
+                            entry.member = current.member.clone();
                         }
                     }
                     this.channel_list_generation += 1;
@@ -816,7 +828,7 @@ impl Session {
             member.msg_count = entry.channel.total_msg_count;
             member.msg_count_root = entry.channel.total_msg_count_root;
         }
-        self.hydrated_channels.insert(channel.clone());
+        self.touched_members.insert(channel.clone());
         cx.notify();
         let sync = self.channel_sync.entry(channel.clone()).or_default();
         if explicit
@@ -1019,7 +1031,7 @@ impl Session {
                 });
             }
         }
-        self.hydrated_channels.insert(channel);
+        self.touched_members.insert(channel);
         cx.notify();
     }
 
@@ -1046,7 +1058,7 @@ impl Session {
             if muted { "mention" } else { "all" }.into(),
         );
         self.mute_pending.insert(channel.clone());
-        self.hydrated_channels.insert(channel.clone());
+        self.touched_members.insert(channel.clone());
         cx.notify();
         let client = self.client.clone();
         let user = self.me.id.clone();
@@ -1095,7 +1107,7 @@ impl Session {
                 .get_mut(&member.channel_id)
                 .and_then(|e| e.member.as_mut())
         {
-            self.hydrated_channels.insert(member.channel_id);
+            self.touched_members.insert(member.channel_id);
             current.notify_props = member.notify_props;
             cx.notify();
         }
@@ -3293,17 +3305,249 @@ mod slow_network_tests {
     }
 
     #[gpui_kit::test]
+    fn superseded_channel_list_cannot_consume_new_hydration(cx: &mut TestAppContext) {
+        for old_first in [true, false] {
+            let old = Gate::default();
+            let latest = Gate::default();
+            let server = SlowServer::start(Network::new(Duration::ZERO), {
+                let old = old.clone();
+                let latest = latest.clone();
+                let lists = AtomicUsize::new(0);
+                let members = AtomicUsize::new(0);
+                move |request| {
+                    let (reply, snapshot) = match (request.method(), request.path()) {
+                        ("GET", "/api/v4/users/me/teams/team/channels") => {
+                            let snapshot = lists.fetch_add(1, Ordering::SeqCst);
+                            (
+                                Reply::json(json!([{
+                                    "id": "town", "team_id": "team", "type": "O", "name": "town-square",
+                                    "display_name": format!("List {snapshot}")
+                                }])),
+                                snapshot,
+                            )
+                        }
+                        ("GET", "/api/v4/users/me/teams/team/channels/members") => {
+                            (route(request), members.fetch_add(1, Ordering::SeqCst))
+                        }
+                        ("GET", "/api/v4/channels/design") => {
+                            return Reply::json(json!({
+                                "id": "design", "team_id": "team", "type": "P", "name": "design"
+                            }));
+                        }
+                        ("GET", "/api/v4/channels/design/members/me") => {
+                            return Reply::json(json!({
+                                "channel_id": "design", "user_id": "me"
+                            }));
+                        }
+                        _ => return route(request),
+                    };
+                    match snapshot {
+                        1 => reply.wait_for(old.clone()),
+                        2 => reply.wait_for(latest.clone()),
+                        _ => reply,
+                    }
+                }
+            });
+            let session = start(&server, cx);
+            wait_until(cx, |cx| {
+                session.read_with(cx, |s, _| s.is_loaded() && s.team().is_some())
+            });
+            let generation = session.read_with(cx, |s, _| s.channel_list_generation);
+            for count in [2, 3] {
+                session.update(cx, |s, cx| s.load_channels(cx));
+                wait_until(cx, |_| {
+                    let requests = server.requests();
+                    [
+                        "/api/v4/users/me/teams/team/channels",
+                        "/api/v4/users/me/teams/team/channels/members",
+                    ]
+                    .iter()
+                    .all(|path| {
+                        requests
+                            .iter()
+                            .filter(|r| r.method() == "GET" && r.path() == *path)
+                            .count()
+                            == count
+                    })
+                });
+            }
+            let task = session.update(cx, |s, cx| s.ensure_channel(&"design".into(), cx));
+            finish(task, cx).unwrap();
+            if old_first {
+                old.open();
+            }
+            latest.open();
+            wait_until(cx, |cx| {
+                session.read_with(cx, |s, _| {
+                    s.channel(&"town".into()).unwrap().channel().display_name == "List 2"
+                })
+            });
+            session.read_with(cx, |s, _| {
+                assert!(s.channel(&"design".into()).is_some());
+                assert_eq!(s.channel_list_generation, generation + 1);
+            });
+            old.open();
+            session.update(cx, |s, cx| s.load_channels(cx));
+            wait_until(cx, |cx| {
+                session.read_with(cx, |s, _| {
+                    s.channel(&"town".into()).unwrap().channel().display_name == "List 3"
+                })
+            });
+            session.read_with(cx, |s, _| {
+                assert!(s.channel(&"design".into()).is_none());
+                assert_eq!(s.channel_list_generation, generation + 2);
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn member_changes_during_channel_list_refresh_do_not_restore_membership(
+        cx: &mut TestAppContext,
+    ) {
+        for listed in [true, false] {
+            for change in ["read", "member", "mute", "notify"] {
+                let refreshing = Arc::new(AtomicBool::new(false));
+                let list = Gate::default();
+                let writes = Gate::default();
+                let server = SlowServer::start(Network::new(Duration::ZERO), {
+                    let refreshing = refreshing.clone();
+                    let list = list.clone();
+                    let writes = writes.clone();
+                    move |request| {
+                        let refresh = refreshing.load(Ordering::SeqCst);
+                        let reply = match (request.method(), request.path()) {
+                            ("GET", "/api/v4/users/me/teams/team/channels") => {
+                                let channels = if !refresh || listed {
+                                    json!([{
+                                        "id": "town", "team_id": "team", "name": "town-square", "type": "O",
+                                        "display_name": if refresh { "Fresh" } else { "Old" }, "last_post_at": 100
+                                    }])
+                                } else {
+                                    json!([])
+                                };
+                                Reply::json(channels)
+                            }
+                            ("GET", "/api/v4/users/me/teams/team/channels/members") => {
+                                Reply::json(json!([{
+                                    "channel_id": "town", "user_id": "me", "last_viewed_at": 10,
+                                    "notify_props": { "mark_unread": "all" }
+                                }]))
+                            }
+                            ("POST", "/api/v4/channels/members/me/view") => {
+                                return Reply::json(json!({})).wait_for(writes.clone());
+                            }
+                            ("PUT", "/api/v4/channels/town/members/me/notify_props") => {
+                                return Reply::json(
+                                    json!({ "channel_id": "town", "user_id": "me" }),
+                                )
+                                .wait_for(writes.clone());
+                            }
+                            ("GET", "/api/v4/channels/town/members/me") => Reply::json(json!({
+                                "channel_id": "town", "user_id": "me", "last_viewed_at": 50,
+                                "notify_props": { "mark_unread": "mention" }
+                            })),
+                            _ => return route(request),
+                        };
+                        if refresh
+                            && request.method() == "GET"
+                            && matches!(
+                                request.path(),
+                                "/api/v4/users/me/teams/team/channels"
+                                    | "/api/v4/users/me/teams/team/channels/members"
+                            )
+                        {
+                            reply.wait_for(list.clone())
+                        } else {
+                            reply
+                        }
+                    }
+                });
+                let session = start(&server, cx);
+                wait_until(cx, |cx| {
+                    session.read_with(cx, |s, _| s.is_loaded() && s.team().is_some())
+                });
+                refreshing.store(true, Ordering::SeqCst);
+                session.update(cx, |s, cx| s.load_channels(cx));
+                wait_until(cx, |_| {
+                    let requests = server.requests();
+                    [
+                        "/api/v4/users/me/teams/team/channels",
+                        "/api/v4/users/me/teams/team/channels/members",
+                    ]
+                    .iter()
+                    .all(|path| {
+                        requests
+                            .iter()
+                            .filter(|r| r.method() == "GET" && r.path() == *path)
+                            .count()
+                            == 2
+                    })
+                });
+                let expected = session.update(cx, |s, cx| {
+                    let id = "town".into();
+                    let mut member = s.channel(&id).unwrap().member.clone().unwrap();
+                    member.last_viewed_at = 50;
+                    member
+                        .notify_props
+                        .insert("mark_unread".into(), "mention".into());
+                    match change {
+                        "read" => s.mark_viewed(&id, cx),
+                        "member" => s.apply_channel_member(member, None, cx),
+                        "mute" => s.set_channel_muted(&id, true, cx),
+                        "notify" => s.apply_notify_props(member, cx),
+                        _ => unreachable!(),
+                    }
+                    serde_json::to_value(s.channel(&id).unwrap().member.as_ref().unwrap()).unwrap()
+                });
+                list.open();
+                wait_until(cx, |cx| {
+                    session.read_with(cx, |s, _| s.channels_state == LoadState::Loaded)
+                });
+                session.read_with(cx, |s, _| {
+                    let entry = s.channel(&"town".into());
+                    if listed {
+                        let entry = entry.unwrap();
+                        assert_eq!(entry.channel().display_name, "Fresh", "{change}");
+                        assert_eq!(
+                            serde_json::to_value(entry.member.as_ref().unwrap()).unwrap(),
+                            expected,
+                            "{change}"
+                        );
+                    } else {
+                        assert!(entry.is_none(), "{change} must not restore membership");
+                    }
+                });
+                writes.open();
+                finish_sync(&session, cx);
+                if !listed {
+                    session.read_with(cx, |s, _| assert!(s.channel(&"town".into()).is_none()));
+                }
+            }
+        }
+    }
+
+    #[gpui_kit::test]
     fn channel_hydration_and_list_refresh_keep_completion_order(cx: &mut TestAppContext) {
         for hydrate_first in [true, false] {
             let refreshing = Arc::new(AtomicBool::new(false));
             let list = Gate::default();
+            let list_members = Gate::default();
             let channel = Gate::default();
             let member = Gate::default();
+            let next_list = Gate::default();
+            let view = Gate::default();
+            let confirmation = Gate::default();
             let server = SlowServer::start(Network::new(Duration::ZERO), {
                 let refreshing = refreshing.clone();
                 let list = list.clone();
+                let list_members = list_members.clone();
                 let channel = channel.clone();
                 let member = member.clone();
+                let next_list = next_list.clone();
+                let view = view.clone();
+                let confirmation = confirmation.clone();
+                let memberships = AtomicUsize::new(0);
+                let list_memberships = AtomicUsize::new(0);
                 let lists = AtomicUsize::new(0);
                 move |request| match (
                     request.method(),
@@ -3315,26 +3559,43 @@ mod slow_network_tests {
                             "id": "town", "team_id": "team", "name": "town-square", "type": "O",
                             "display_name": format!("Snapshot {snapshot}")
                         }]));
-                        if refreshing.load(Ordering::SeqCst) {
+                        if snapshot == 2 {
+                            reply.wait_for(next_list.clone())
+                        } else if refreshing.load(Ordering::SeqCst) {
                             reply.wait_for(list.clone())
                         } else {
                             reply
                         }
                     }
-                    ("GET", "/api/v4/users/me/teams/team/channels/members")
-                        if refreshing.load(Ordering::SeqCst) =>
-                    {
-                        route(request).wait_for(list.clone())
+                    ("GET", "/api/v4/users/me/teams/team/channels/members") => {
+                        let snapshot = list_memberships.fetch_add(1, Ordering::SeqCst);
+                        let reply = route(request);
+                        if snapshot == 2 {
+                            reply.wait_for(next_list.clone())
+                        } else if refreshing.load(Ordering::SeqCst) {
+                            reply.wait_for(list_members.clone())
+                        } else {
+                            reply
+                        }
                     }
                     ("GET", "/api/v4/channels/design") => Reply::json(json!({
                         "id": "design", "team_id": "team", "name": "design", "type": "P"
                     }))
                     .wait_for(channel.clone()),
-                    ("GET", "/api/v4/channels/design/members/me") => Reply::json(json!({
-                        "channel_id": "design", "user_id": "me", "last_viewed_at": 10,
-                        "notify_props": { "mark_unread": "mention" }
-                    }))
-                    .wait_for(member.clone()),
+                    ("GET", "/api/v4/channels/design/members/me") => {
+                        let reply = Reply::json(json!({
+                            "channel_id": "design", "user_id": "me", "last_viewed_at": 10,
+                            "notify_props": { "mark_unread": "mention" }
+                        }));
+                        if memberships.fetch_add(1, Ordering::SeqCst) == 0 {
+                            reply.wait_for(member.clone())
+                        } else {
+                            reply.wait_for(confirmation.clone())
+                        }
+                    }
+                    ("POST", "/api/v4/channels/members/me/view") => {
+                        Reply::json(json!({})).wait_for(view.clone())
+                    }
                     _ => route(request),
                 }
             });
@@ -3375,6 +3636,8 @@ mod slow_network_tests {
             });
             let mut viewed_at = None;
             if hydrate_first {
+                // The list's channel response may arrive, but its members wait.
+                list.open();
                 channel.open();
                 wait_until(cx, |_| {
                     requested(&server, "GET", "/api/v4/channels/design/members/me")
@@ -3389,6 +3652,7 @@ mod slow_network_tests {
                 }));
             }
             list.open();
+            list_members.open();
             wait_until(cx, |cx| {
                 session.read_with(cx, |s, _| {
                     s.channel(&"town".into())
@@ -3404,8 +3668,41 @@ mod slow_network_tests {
                     assert_eq!(channel.last_viewed_at(), viewed_at.unwrap());
                     assert_eq!(s.active_channel(), Some(&"design".into()));
                 });
-                // A later authoritative snapshot can still remove the channel.
+                // Opening the channel also starts a read-state confirmation.
+                wait_until(cx, |_| {
+                    requested(&server, "POST", "/api/v4/channels/members/me/view")
+                });
+                view.open();
+                wait_until(cx, |_| {
+                    server
+                        .requests()
+                        .iter()
+                        .filter(|r| {
+                            r.method() == "GET" && r.path() == "/api/v4/channels/design/members/me"
+                        })
+                        .count()
+                        == 2
+                });
+                // Make that confirmation land after the later snapshot starts.
                 session.update(cx, |s, cx| s.load_channels(cx));
+                wait_until(cx, |_| {
+                    let requests = server.requests();
+                    [
+                        "/api/v4/users/me/teams/team/channels",
+                        "/api/v4/users/me/teams/team/channels/members",
+                    ]
+                    .iter()
+                    .all(|path| {
+                        requests
+                            .iter()
+                            .filter(|r| r.method() == "GET" && r.path() == *path)
+                            .count()
+                            == 3
+                    })
+                });
+                confirmation.open();
+                finish_sync(&session, cx);
+                next_list.open();
                 wait_until(cx, |cx| {
                     session.read_with(cx, |s, _| {
                         s.channel(&"town".into())
