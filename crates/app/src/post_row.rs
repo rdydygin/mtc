@@ -62,6 +62,7 @@ pub enum PostAction {
     OpenLink(String),
     ToggleReaction(String),
     MarkUnread,
+    AddReaction,
     CopyText,
     CopyLink,
     Edit,
@@ -93,6 +94,8 @@ pub struct PostRow {
     client: Option<Client>,
     directory: Option<Entity<Directory>>,
     custom_emoji: CustomEmojis,
+    emoji_store: Option<Entity<session::EmojiStore>>,
+    reaction_focus_fallback: Option<FocusHandle>,
     has_permalink: bool,
     on_action: PostActionHandler,
 }
@@ -114,6 +117,8 @@ impl PostRow {
             client: None,
             directory: None,
             custom_emoji: CustomEmojis::default(),
+            emoji_store: None,
+            reaction_focus_fallback: None,
             has_permalink: false,
             on_action,
         }
@@ -182,6 +187,17 @@ impl PostRow {
     /// The server's custom emoji, for reactions and the author's status.
     pub fn custom_emoji(mut self, custom_emoji: CustomEmojis) -> Self {
         self.custom_emoji = custom_emoji;
+        self
+    }
+
+    pub fn emoji_store(mut self, store: Entity<session::EmojiStore>) -> Self {
+        self.emoji_store = Some(store);
+        self
+    }
+
+    /// A surviving focus target owned by the timeline when this row leaves the list.
+    pub fn reaction_focus_fallback(mut self, focus: FocusHandle) -> Self {
+        self.reaction_focus_fallback = Some(focus);
         self
     }
 
@@ -661,13 +677,16 @@ impl PostRow {
 
     /// Reactions. A continuation has no header line for the reply count,
     /// so it follows the reactions here instead.
-    fn render_footer(&self) -> Option<AnyElement> {
+    fn render_footer(
+        &self,
+        picker: Option<Entity<crate::emoji_picker::ReactionPicker>>,
+    ) -> Option<AnyElement> {
         let reactions = self.render_reactions();
         let thread = self
             .continuation
             .then(|| self.render_thread_summary())
             .flatten();
-        if reactions.is_none() && thread.is_none() {
+        if reactions.is_none() && thread.is_none() && picker.is_none() {
             return None;
         }
         Some(
@@ -676,6 +695,7 @@ impl PostRow {
                 .items_center()
                 .gap_1()
                 .children(reactions)
+                .children(picker)
                 .children(thread)
                 .into_any_element(),
         )
@@ -813,8 +833,44 @@ struct PostActions {
 }
 
 impl RenderOnce for PostRow {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(mut self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let post = self.entry.post().clone();
+        let picker = self
+            .client
+            .clone()
+            .zip(self.emoji_store.clone())
+            .filter(|_| self.entry.delivery() == Delivery::Sent)
+            .map(|(client, store)| {
+                let on_action = self.on_action.clone();
+                window.use_keyed_state(
+                    SharedString::from(format!("post-emoji-{}", post.id)),
+                    cx,
+                    |window, cx| {
+                        crate::emoji_picker::ReactionPicker::new(
+                            client,
+                            store,
+                            on_action,
+                            self.reaction_focus_fallback.clone(),
+                            window,
+                            cx,
+                        )
+                    },
+                )
+            });
+        if let Some(picker) = picker.clone() {
+            let on_action = self.on_action.clone();
+            self.on_action = Rc::new(move |action, window, cx| {
+                if matches!(action, PostAction::AddReaction) {
+                    // Let the menu finish dismissing before the popover takes focus.
+                    let picker = picker.clone();
+                    window.defer(cx, move |window, cx| {
+                        picker.update(cx, |p, cx| p.open(window, cx))
+                    });
+                } else {
+                    on_action(action, window, cx);
+                }
+            });
+        }
         // Retained per post, so focus and the open menu survive re-renders.
         let actions_focus = window
             .use_keyed_state(
@@ -1068,7 +1124,7 @@ impl RenderOnce for PostRow {
                     .children(self.render_files())
                     .children(self.render_link_preview(cx))
                     .children(self.render_delivery(cx))
-                    .children(self.render_footer()),
+                    .children(self.render_footer(picker)),
             )
             .when(sent, |this| {
                 this.child(self.render_hover_actions(
@@ -1360,6 +1416,7 @@ fn post_menu_entries(
     if !is_system {
         entries.push(item("Reply".into(), PostAction::OpenThread));
     }
+    entries.push(item("Add reaction…".into(), PostAction::AddReaction));
     for (name, emoji) in QUICK_REACTIONS {
         entries.push(item(
             format!("React {emoji}"),
@@ -1437,6 +1494,8 @@ mod tests {
         rich_text: Entity<TextViewState>,
         directory: Entity<Directory>,
         actions: Rc<RefCell<Vec<PostAction>>>,
+        client: Client,
+        emoji: Entity<EmojiStore>,
     }
 
     impl Render for OneRow {
@@ -1450,6 +1509,8 @@ mod tests {
                 )
                 .rich_text(Some(self.rich_text.clone()))
                 .directory(self.directory.clone())
+                .client(self.client.clone())
+                .emoji_store(self.emoji.clone())
                 .thread_entry(true),
             )
         }
@@ -1481,9 +1542,9 @@ mod tests {
         let timeline = cx.new(|_| {
             Timeline::new(
                 TimelineKind::Channel("c".into()),
-                client,
+                client.clone(),
                 directory.clone(),
-                emoji,
+                emoji.clone(),
                 CustomEmojis::default(),
             )
         });
@@ -1523,6 +1584,8 @@ mod tests {
                         rich_text,
                         directory,
                         actions,
+                        client,
+                        emoji,
                     })
                 },
             )
@@ -1531,6 +1594,33 @@ mod tests {
         });
         cx.run_until_parked();
         (window, actions)
+    }
+
+    #[gpui_kit::test]
+    fn message_menu_opens_the_same_searchable_emoji_picker(cx: &mut TestAppContext) {
+        let (handle, actions) = open_row(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("more-actions", cx);
+            window.press("down", cx); // Reply
+            window.press("down", cx); // Add reaction…
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("emoji-search").focused(), Some(true));
+            window.input("heart", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        assert!(
+            actions.borrow().iter().any(
+                |action| matches!(action, PostAction::ToggleReaction(name) if name == "heart")
+            )
+        );
+        assert_eq!(opened_thread(&actions), 0);
     }
 
     fn opened_thread(actions: &RefCell<Vec<PostAction>>) -> usize {
