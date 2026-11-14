@@ -333,7 +333,7 @@ impl Extension for Core {
                 } else {
                     format!("{author} in {}", session.channel_label(channel, cx))
                 };
-                let preview: String = post.message.chars().take(160).collect();
+                let preview = notification_preview(post);
                 window.push_notification(
                     Notification::new()
                         .title(title)
@@ -496,10 +496,37 @@ fn should_notify(
     }
 }
 
+fn notification_preview(post: &mattermost::Post) -> String {
+    session::emojify(&session::post_text(post), &session::CustomEmojis::default())
+        .chars()
+        .take(160)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mattermost::Status;
+
+    #[test]
+    fn attachment_notification_has_bounded_readable_text() {
+        let mut post = mattermost::Post::default();
+        post.props.insert(
+            "attachments".into(),
+            serde_json::json!([{"fallback":"Build :rocket:"}]),
+        );
+        assert_eq!(notification_preview(&post), "Build 🚀");
+        post.props.insert(
+            "attachments".into(),
+            serde_json::json!([{"fields":[{"title":"Build","value":"Passed"}]}]),
+        );
+        assert_eq!(notification_preview(&post), "Build: Passed");
+        post.props.insert(
+            "attachments".into(),
+            serde_json::json!([{"text":"🦀".repeat(500)}]),
+        );
+        assert_eq!(notification_preview(&post).chars().count(), 160);
+    }
 
     #[test]
     fn desktop_preferences_inherit_and_override_account_defaults() {

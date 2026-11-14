@@ -6,6 +6,11 @@
 //! first row after them, so rows map one-to-one onto timeline entries and
 //! the virtual list never has to translate indices.
 
+mod attachment_cards;
+#[cfg(test)]
+mod image_policy_tests;
+pub(crate) use attachment_cards::AttachmentCards;
+
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
 use gpui_kit::assets::IconName;
@@ -67,6 +72,7 @@ pub enum PostAction {
     AddReaction,
     CopyText,
     CopyLink,
+    OpenInBrowser,
     Edit,
     Delete,
     Retry,
@@ -92,6 +98,7 @@ pub struct PostRow {
     unread_divider: bool,
     highlighted: bool,
     rich_text: Option<Entity<TextViewState>>,
+    attachment_cards: Option<Rc<AttachmentCards>>,
     thread_entry: bool,
     client: Option<Client>,
     directory: Option<Entity<Directory>>,
@@ -116,6 +123,7 @@ impl PostRow {
             unread_divider: false,
             highlighted: false,
             rich_text: None,
+            attachment_cards: None,
             thread_entry: false,
             client: None,
             directory: None,
@@ -126,6 +134,11 @@ impl PostRow {
             has_permalink: false,
             on_action,
         }
+    }
+
+    pub(crate) fn attachment_cards(mut self, cards: Option<Rc<AttachmentCards>>) -> Self {
+        self.attachment_cards = cards;
+        self
     }
 
     pub fn saved(mut self, saved: bool) -> Self {
@@ -236,10 +249,30 @@ impl PostRow {
         if let Some(body) = extensions::render_post_body(&self.entry, cx) {
             return body;
         }
-        let message = self.entry.message();
-        match &self.rich_text {
+        self.render_prepared(
+            self.entry.message(),
+            self.rich_text.as_ref(),
+            mention,
+            on_action,
+            cx,
+        )
+    }
+
+    fn render_prepared(
+        &self,
+        message: &session::PreparedMessage,
+        state: Option<&Entity<TextViewState>>,
+        mention: Option<&Entity<MentionCard>>,
+        on_action: &Entity<PostActionHandler>,
+        _cx: &App,
+    ) -> AnyElement {
+        match state {
             Some(state) if message.is_rich() => TextView::new(state)
                 .w_full()
+                .image_source({
+                    let message = message.clone();
+                    move |url| prepared_image_source(&message, url)
+                })
                 .on_link_click({
                     let mention = mention.cloned();
                     let directory = self.directory.clone();
@@ -904,7 +937,7 @@ impl RenderOnce for PostRow {
         link_action.update(cx, |handler, _| *handler = self.on_action.clone());
         let actions_revealed = *actions_open.read(cx) || actions_focus.is_focused(window);
         // Only Markdown text carries mention links.
-        let mention = self.rich_text.is_some().then(|| {
+        let mention = (self.rich_text.is_some() || self.attachment_cards.is_some()).then(|| {
             window.use_keyed_state(
                 SharedString::from(format!("post-mention-{}", post.id)),
                 cx,
@@ -927,7 +960,9 @@ impl RenderOnce for PostRow {
         let is_system = post.is_system();
         let sent = self.entry.delivery() == Delivery::Sent;
         let edited = post.edit_at > 0;
-        let has_text = !post.message.trim().is_empty() || post.metadata.files.is_empty();
+        let has_text = !post.message.trim().is_empty()
+            || post.metadata.files.is_empty()
+            || self.attachment_cards.is_some();
         let time_label = time::clock(post.create_at);
         let full_time: SharedString = time::full(post.create_at).into();
 
@@ -1103,6 +1138,14 @@ impl RenderOnce for PostRow {
                                 .text_sm()
                                 .when(!sent, |this| this.opacity(0.6))
                                 .child(self.render_body(mention.as_ref(), &link_action, cx))
+                                .when_some(self.attachment_cards.as_ref(), |this, cards| {
+                                    this.child(cards.render(
+                                        &self,
+                                        mention.as_ref(),
+                                        &link_action,
+                                        cx,
+                                    ))
+                                })
                                 .when(edited, |this| {
                                     this.child(
                                         div()
@@ -1363,6 +1406,23 @@ impl Selectable for MentionAnchor {
     }
 }
 
+/// The resolver is authoritative for both GPUI image measurement and drawing.
+/// Rejected sources never reach its URI loader or embedded-data decoder.
+fn prepared_image_source(
+    message: &session::PreparedMessage,
+    url: &gpui_kit::SharedUri,
+) -> gpui_kit::ImageSource {
+    if message.allows_image(url.as_ref()) {
+        url.clone().into()
+    } else {
+        gpui_kit::ImageSource::Custom(Arc::new(|_, _| {
+            Some(Err(gpui_kit::ImageCacheError::Asset(
+                "Image was not admitted by the message policy".into(),
+            )))
+        }))
+    }
+}
+
 /// Open web and email links without dispatching other protocols to the system.
 pub(crate) fn open_external_link(url: &str, window: &mut Window, cx: &mut App) {
     match url::Url::parse(url) {
@@ -1546,6 +1606,7 @@ mod tests {
     struct OneRow {
         entry: Entry,
         rich_text: Entity<TextViewState>,
+        cards: Rc<AttachmentCards>,
         directory: Entity<Directory>,
         actions: Rc<RefCell<Vec<PostAction>>>,
         client: Client,
@@ -1555,13 +1616,20 @@ mod tests {
     impl Render for OneRow {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let actions = self.actions.clone();
-            div().w(px(600.)).child(
+            let route_external = !self.entry.attachments().is_empty();
+            div().w_full().max_w(px(600.)).child(
                 PostRow::new(
                     self.entry.clone(),
                     "me".into(),
-                    Rc::new(move |action, _, _| actions.borrow_mut().push(action)),
+                    Rc::new(move |action, window, cx| {
+                        if route_external && let PostAction::OpenLink(url) = &action {
+                            open_external_link(url, window, cx);
+                        }
+                        actions.borrow_mut().push(action);
+                    }),
                 )
                 .rich_text(Some(self.rich_text.clone()))
+                .attachment_cards(Some(self.cards.clone()))
                 .directory(self.directory.clone())
                 .client(self.client.clone())
                 .emoji_store(self.emoji.clone())
@@ -1581,6 +1649,14 @@ mod tests {
     fn open_row_with(
         cx: &mut TestAppContext,
         message: &str,
+    ) -> (gpui_kit::AnyWindowHandle, Rc<RefCell<Vec<PostAction>>>) {
+        open_row_with_props(cx, message, serde_json::json!([]))
+    }
+
+    fn open_row_with_props(
+        cx: &mut TestAppContext,
+        message: &str,
+        attachments: serde_json::Value,
     ) -> (gpui_kit::AnyWindowHandle, Rc<RefCell<Vec<PostAction>>>) {
         cx.update(gpui_kit::init);
         let client = Client::new_unverified("http://localhost:1", "token").unwrap();
@@ -1608,6 +1684,7 @@ mod tests {
         post.user_id = "them".into();
         post.create_at = 1;
         post.message = message.into();
+        post.props.insert("attachments".into(), attachments);
         post.reply_count = 1;
         let mut reaction = Reaction::default();
         reaction.user_id = "them".into();
@@ -1616,7 +1693,7 @@ mod tests {
         post.metadata.reactions.push(reaction);
         timeline.update(cx, |t, cx| t.upsert(post, cx));
         let entry = timeline.read_with(cx, |t, _| t.entries()[0].clone());
-        assert!(entry.message().is_rich());
+
         let actions = Rc::new(RefCell::new(Vec::new()));
         let window = cx.update(|cx| {
             let text = entry.message().text().clone();
@@ -1633,7 +1710,9 @@ mod tests {
                 move |_, cx| {
                     let rich_text =
                         cx.new(|cx| TextViewState::markdown(&text, cx).selectable(true));
+                    let cards = Rc::new(AttachmentCards::new(entry.attachments().clone(), cx));
                     cx.new(|_| OneRow {
+                        cards,
                         entry,
                         rich_text,
                         directory,
@@ -1648,6 +1727,161 @@ mod tests {
         });
         cx.run_until_parked();
         (window, actions)
+    }
+
+    #[gpui_kit::test]
+    fn attachments_render_route_links_expand_and_stack(cx: &mut TestAppContext) {
+        let (handle, actions) = open_row_with_props(
+            cx,
+            "",
+            serde_json::json!([{
+                "title":"Build report", "title_link":"https://example.com/build", "color":"good",
+                "text":"Line of build output. ".repeat(60),
+                "fields":[{"title":"Branch","value":"main","short":true},{"title":"Status","value":"Passed","short":true}],
+                "actions":[{"name":"Retry"}]
+            }]),
+        );
+        cx.simulate_window_resize(handle, size(px(800.), px(1400.)));
+        let initial_height = cx
+            .update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.find("attachment-card").visible());
+                assert_eq!(
+                    window.find("attachment-title").label(),
+                    Some("Build report")
+                );
+                let first = window.find_all("attachment-field")[0].bounds();
+                let second = window.find_all("attachment-field")[1].bounds();
+                assert_eq!(first.top(), second.top());
+                assert!(second.left() >= first.right());
+                assert_eq!(
+                    window.find_all("attachment-field")[0].label(),
+                    Some("Branch: main")
+                );
+                let height = window.find("attachment-card").bounds().size.height;
+                window.click("attachment-title", cx);
+                window.press("enter", cx);
+                window.click("attachment-disclosure", cx);
+                assert_eq!(
+                    window.find("attachment-disclosure").label(),
+                    Some("Show less")
+                );
+                assert!(window.find("attachment-card").bounds().size.height > height);
+                window.click("attachment-disclosure", cx);
+                assert_eq!(
+                    window.find("attachment-disclosure").label(),
+                    Some("Show more")
+                );
+                window.click("attachment-open-browser", cx);
+                height
+            })
+            .unwrap();
+        assert!(initial_height > px(0.));
+        assert_eq!(
+            actions
+                .borrow()
+                .iter()
+                .filter(|a| matches!(a, PostAction::OpenLink(_)))
+                .count(),
+            2,
+            "pointer and Enter both activate the link"
+        );
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://example.com/build")
+        );
+        assert!(
+            actions
+                .borrow()
+                .iter()
+                .any(|a| matches!(a, PostAction::OpenInBrowser))
+        );
+        assert!(
+            !actions
+                .borrow()
+                .iter()
+                .any(|a| matches!(a, PostAction::OpenThread))
+        );
+        cx.simulate_window_resize(handle, size(px(320.), px(1400.)));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let first = window.find_all("attachment-field")[0].bounds();
+            let second = window.find_all("attachment-field")[1].bounds();
+            assert_eq!(first.left(), second.left());
+            assert!(second.top() >= first.bottom());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn attachment_excess_images_render_as_routed_links(cx: &mut TestAppContext) {
+        let message = (0..8)
+            .map(|i| format!("![:emoji:](http://localhost:1/{i}) "))
+            .collect::<String>();
+        let (handle, _) = open_row_with_props(
+            cx,
+            &message,
+            serde_json::json!([{"image_url":"https://example.com/excess"}]),
+        );
+        cx.simulate_window_resize(handle, size(px(800.), px(1400.)));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("attachment-image").is_none());
+            assert_eq!(
+                window.find("attachment-image-link").label(),
+                Some("Attachment image")
+            );
+            window.click("attachment-image-link", cx);
+        })
+        .unwrap();
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://example.com/excess")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn attachment_picture_uses_the_shared_viewer(cx: &mut TestAppContext) {
+        let (handle, _) = open_row_with_props(
+            cx,
+            "",
+            serde_json::json!([{"title":"Build screenshot","image_url":"http://localhost:1/image.png"}]),
+        );
+        cx.simulate_window_resize(handle, size(px(800.), px(800.)));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("attachment-image", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.has_active_dialog(cx));
+            assert!(window.find("picture-").visible());
+            assert!(window.try_find("download-image").is_none());
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert!(!window.has_active_dialog(cx))
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn attachment_links_reject_system_protocols(cx: &mut TestAppContext) {
+        let (handle, _) = open_row_with_props(
+            cx,
+            "",
+            serde_json::json!([{"title":"Unsafe target","title_link":"file:///tmp/secret"}]),
+        );
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("attachment-title", cx);
+        })
+        .unwrap();
+        assert!(cx.opened_url().is_none());
     }
 
     #[gpui_kit::test]

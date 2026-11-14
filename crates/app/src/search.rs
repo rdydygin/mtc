@@ -68,6 +68,7 @@ pub struct SearchView {
     /// The query the results answer.
     query: String,
     results: Vec<Arc<Post>>,
+    result_text: HashMap<PostId, String>,
     /// The words that matched in each result, as the server reports them.
     matches: HashMap<PostId, Vec<String>>,
     status: Status,
@@ -134,6 +135,7 @@ impl SearchView {
             input,
             query: String::new(),
             results: Vec::new(),
+            result_text: HashMap::new(),
             matches: HashMap::new(),
             status: Status::Idle,
             next_page: None,
@@ -173,6 +175,7 @@ impl SearchView {
         });
         self.results_scope = None;
         self.results.clear();
+        self.result_text.clear();
         self.matches.clear();
         self.selected = None;
         self.next_page = None;
@@ -225,6 +228,7 @@ impl SearchView {
             self._more = None;
             self.query.clear();
             self.results.clear();
+            self.result_text.clear();
             self.matches.clear();
             self.next_page = None;
             self.loading_more = false;
@@ -309,12 +313,17 @@ impl SearchView {
             Ok(found) => {
                 if page == 0 {
                     self.results.clear();
+                    self.result_text.clear();
                     self.matches.clear();
                     self.selected = None;
                     self.scroll.scroll_to_item(0);
                 }
                 for post in found.posts {
                     if !self.results.iter().any(|r| r.id == post.id) {
+                        self.result_text.insert(
+                            post.id.clone(),
+                            session::emojify(&session::post_text(&post), &CustomEmojis::default()),
+                        );
                         self.results.push(Arc::new(post));
                     }
                 }
@@ -549,8 +558,12 @@ impl SearchView {
             time::day_label(post.create_at),
             time::clock(post.create_at)
         );
-        let text = session::emojify(&post.message, &CustomEmojis::default());
-        let (text, ranges) = excerpt(&text, terms);
+        let text = self
+            .result_text
+            .get(&post.id)
+            .map(String::as_str)
+            .unwrap_or(&post.message);
+        let (text, ranges) = excerpt(text, terms);
         let marked = HighlightStyle {
             background_color: Some(theme.accent),
             font_weight: Some(FontWeight::SEMIBOLD),
@@ -568,7 +581,14 @@ impl SearchView {
         v_flex()
             .id(id)
             .role(gpui_kit::Role::ListItem)
-            .aria_label(format!("{}: {}", name, post.message))
+            .aria_label(format!(
+                "{}: {}",
+                name,
+                self.result_text
+                    .get(&post.id)
+                    .map(String::as_str)
+                    .unwrap_or(&post.message)
+            ))
             .test_support()
             .when(self.collection.is_some(), |this| {
                 this.h_40().overflow_hidden()
@@ -854,6 +874,30 @@ mod tests {
             view.read_with(cx, |v, _| matches!(v.status, Status::Done))
         });
         (window, view)
+    }
+
+    #[gpui_kit::test]
+    fn attachment_search_results_prepare_text_on_arrival(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (request.method(), request.path()) {
+                ("POST", "/api/v4/teams/team/posts/search") => Reply::json(
+                    json!({"order":["bot"],"posts":{"bot":{"id":"bot","channel_id":"town","props":{"attachments":[{"fields":[{"title":"Build","value":":rocket:"}]}]}}}}),
+                ),
+                _ => route(request),
+            }
+        });
+        let (handle, view) = open_search(&server, cx);
+        cx.update_window(handle, |_, window, cx| window.input("Build", cx))
+            .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 1));
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.result_text[&PostId::from("bot")], "Build: 🚀")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("bot").label().unwrap().contains("Build: 🚀"));
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
