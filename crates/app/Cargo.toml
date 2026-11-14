@@ -32,7 +32,7 @@ security-framework = "3"
 tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-registry = "0.6"
+windows-registry = "0.100"
 
 [dev-dependencies]
 gpui-kit = { workspace = true, default-features = true, features = ["test-support"] }
