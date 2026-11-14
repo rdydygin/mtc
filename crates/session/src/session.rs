@@ -714,31 +714,50 @@ impl Session {
         post.channel_id = kind.channel().clone();
         post.root_id = kind.root().cloned().unwrap_or_default();
         post.message = message.clone();
-        let file_ids: Vec<String> = files.iter().map(|f| f.id.clone()).collect();
         post.metadata.files = files;
 
         let timeline = self.timeline(kind.clone(), cx);
-        timeline.update(cx, |t, cx| t.insert_pending(post, cx));
+        timeline.update(cx, |t, cx| t.insert_pending(post.clone(), cx));
         self.last_typing_sent.remove(&(
             kind.channel().clone(),
             kind.root().cloned().unwrap_or_default(),
         ));
 
+        self.submit_post(post, timeline, cx);
+    }
+
+    /// Submit an optimistic post with its original deduplication id.
+    fn submit_post(&mut self, post: Post, timeline: Entity<Timeline>, cx: &mut Context<Self>) {
         let client = self.client.clone();
-        let channel = kind.channel().clone();
-        let root = kind.root().cloned();
-        let pending = PostId::from(pending_id.as_str());
+        let pending = post.id.clone();
         cx.spawn(async move |this, cx| {
+            let file_ids: Vec<String> = post.metadata.files.iter().map(|f| f.id.clone()).collect();
+            let root = (!post.root_id.is_empty()).then_some(&post.root_id);
             let result = client
-                .create_post(&channel, &message, root.as_ref(), &pending_id, &file_ids)
+                .create_post(
+                    &post.channel_id,
+                    &post.message,
+                    root,
+                    &post.pending_post_id,
+                    &file_ids,
+                )
                 .await;
             let _ = this.update(cx, |this, cx| match result {
                 Ok(post) => this.route_post(post, false, cx),
                 Err(err) => {
-                    timeline.update(cx, |t, cx| t.set_delivery(&pending, Delivery::Failed, cx));
-                    cx.emit(SessionEvent::SendFailed {
-                        message: format!("Couldn’t send your message. {err:#}").into(),
+                    // A late echo can confirm the post before this failure arrives.
+                    let failed = timeline.update(cx, |t, cx| {
+                        if t.position(&pending).is_none() {
+                            return false;
+                        }
+                        t.set_delivery(&pending, Delivery::Failed, cx);
+                        true
                     });
+                    if failed {
+                        cx.emit(SessionEvent::SendFailed {
+                            message: format!("Couldn’t send your message. {err:#}").into(),
+                        });
+                    }
                     this.handle_error(err, cx);
                 }
             });
@@ -752,15 +771,17 @@ impl Session {
             return;
         };
         let failed = timeline.update(cx, |t, cx| {
-            let failed = t.position(pending).map(|ix| {
-                let post = t.entries()[ix].post();
-                (post.message.clone(), post.metadata.files.clone())
-            });
-            t.remove(pending, cx);
-            failed
+            let ix = t.position(pending)?;
+            let entry = &t.entries()[ix];
+            if entry.delivery() != Delivery::Failed {
+                return None;
+            }
+            let post = entry.post().as_ref().clone();
+            t.set_delivery(pending, Delivery::Pending, cx);
+            Some(post)
         });
-        if let Some((message, files)) = failed {
-            self.send_post(kind, message, files, cx);
+        if let Some(post) = failed {
+            self.submit_post(post, timeline, cx);
         }
     }
 
@@ -790,17 +811,19 @@ impl Session {
 
     pub fn delete_post(&mut self, post: &Post, cx: &mut Context<Self>) {
         // Removing at once feels instant; the server event is idempotent.
-        self.route_deleted(post, cx);
+        for timeline in self.live_timelines() {
+            timeline.update(cx, |t, cx| t.remove(&post.id, cx));
+        }
         let client = self.client.clone();
-        let id = post.id.clone();
+        let post = post.clone();
         cx.spawn(async move |this, cx| {
-            if let Err(err) = client.delete_post(&id).await {
-                let _ = this.update(cx, |_, cx| {
-                    cx.emit(SessionEvent::SendFailed {
-                        message: format!("Couldn’t delete the message. {err:#}").into(),
-                    })
-                });
-            }
+            let result = client.delete_post(&post.id).await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => this.route_deleted(&post, cx),
+                Err(err) => cx.emit(SessionEvent::SendFailed {
+                    message: format!("Couldn’t delete the message. {err:#}").into(),
+                }),
+            });
         })
         .detach();
     }
@@ -1100,7 +1123,9 @@ impl Session {
                 self.schedule_typing_expiry(cx);
                 cx.notify();
             }
-            Event::ChannelViewed(channel) => self.note_viewed_elsewhere(&[channel], cx),
+            Event::ChannelViewed(channel) => {
+                self.note_viewed_elsewhere(&[(channel, now_millis())], cx)
+            }
             Event::ChannelsViewed(channels) => self.note_viewed_elsewhere(&channels, cx),
             Event::StatusChanged { user_id, status } => {
                 self.directory
@@ -1186,18 +1211,18 @@ impl Session {
     }
 
     /// Clear unread state for channels read on this or another device.
-    fn note_viewed_elsewhere(&mut self, channels: &[ChannelId], cx: &mut Context<Self>) {
-        let now = now_millis();
+    fn note_viewed_elsewhere(&mut self, channels: &[(ChannelId, Millis)], cx: &mut Context<Self>) {
         let mut changed = false;
-        for channel in channels {
-            if let Some(member) = self
-                .channels
-                .get_mut(channel)
-                .and_then(|e| e.member.as_mut())
+        for (channel, at) in channels {
+            if let Some(entry) = self.channels.get_mut(channel)
+                && let Some(member) = entry.member.as_mut()
+                && *at > member.last_viewed_at
             {
-                changed |= member.mention_count != 0 || member.last_viewed_at < now;
-                member.last_viewed_at = now;
-                member.mention_count = 0;
+                changed = true;
+                member.last_viewed_at = *at;
+                if *at >= entry.channel.last_post_at {
+                    member.mention_count = 0;
+                }
             }
         }
         if changed {
@@ -1288,7 +1313,7 @@ impl Session {
             self.threads.update(cx, |t, cx| t.forget(&post.id, cx));
         }
         for timeline in self.live_timelines() {
-            timeline.update(cx, |t, cx| t.remove(&post.id, cx));
+            timeline.update(cx, |t, cx| t.delete(post, cx));
         }
     }
 
@@ -1412,6 +1437,260 @@ mod slow_network_tests {
             .find(|r| r.path().split('?').next() == Some(path))
             .unwrap_or_else(|| panic!("{path} was never requested"))
             .at()
+    }
+
+    #[gpui_kit::test]
+    fn reconnect_merges_missed_posts_without_undoing_live_changes(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(100)), |request| {
+            if request.path().starts_with("/api/v4/channels/town/posts") {
+                let catching_up = request.path().contains("since=");
+                let mut posts = json!({
+                    "a": { "id": "a", "channel_id": "town", "create_at": 1000,
+                           "update_at": if catching_up { 3000 } else { 1000 }, "message": "snapshot" },
+                    "d": { "id": "d", "channel_id": "town", "create_at": 1500 },
+                    "p": { "id": "p", "channel_id": "town", "create_at": 2000,
+                           "update_at": if catching_up { 4000 } else { 2000 } },
+                });
+                let mut order = vec!["a", "d", "p"];
+                if catching_up {
+                    posts["missed"] =
+                        json!({ "id": "missed", "channel_id": "town", "create_at": 2500 });
+                    order.push("missed");
+                }
+                return Reply::json(json!({ "order": order, "posts": posts }));
+            }
+            route(request)
+        });
+        let session = start(&server, cx);
+        let timeline = session.update(cx, |s, cx| {
+            s.timeline(TimelineKind::Channel("town".into()), cx)
+        });
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
+        });
+        timeline.update(cx, |t, cx| {
+            let mut pending = mattermost::Post::default();
+            pending.id = "pending".into();
+            pending.channel_id = "town".into();
+            pending.create_at = 9_000_000;
+            t.insert_pending(pending, cx);
+            t.set_delivery(&"pending".into(), crate::Delivery::Failed, cx);
+            t.catch_up(cx);
+        });
+        wait_until(cx, |_| {
+            server
+                .requests()
+                .iter()
+                .any(|r| r.path().contains("since="))
+        });
+        assert!(
+            server
+                .requests()
+                .iter()
+                .any(|r| r.path().contains("since=1000"))
+        );
+        timeline.update(cx, |t, cx| {
+            let mut edited = mattermost::Post::default();
+            edited.id = "a".into();
+            edited.channel_id = "town".into();
+            edited.create_at = 1000;
+            edited.edit_at = 5000;
+            edited.message = "live edit".into();
+            t.upsert(edited, cx);
+            let mut deleted = mattermost::Post::default();
+            deleted.id = "d".into();
+            deleted.channel_id = "town".into();
+            t.delete(&deleted, cx);
+        });
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| t.position(&"missed".into()).is_some())
+        });
+        timeline.read_with(cx, |t, _| {
+            assert_eq!(
+                t.entries()
+                    .iter()
+                    .map(|e| e.id().as_str())
+                    .collect::<Vec<_>>(),
+                ["a", "p", "missed", "pending"]
+            );
+            assert_eq!(t.entries()[0].post().message, "live edit");
+            assert_eq!(t.entries()[3].delivery(), crate::Delivery::Failed);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn retry_reuses_the_pending_id_and_reconciles_a_late_echo(cx: &mut TestAppContext) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server = SlowServer::start(Network::new(Duration::from_millis(100)), {
+            let attempts = attempts.clone();
+            move |request| {
+                if request.path() == "/api/v4/posts" && request.method() == "POST" {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // The write committed, but its response was lost.
+                        return Reply::json(json!({ "message": "Lost response" })).status(500);
+                    }
+                    let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                    return Reply::json(json!({
+                        "id": "committed", "channel_id": "town", "root_id": "root",
+                        "user_id": "me", "create_at": 10, "update_at": 11, "message": body["message"],
+                        "pending_post_id": body["pending_post_id"],
+                    }));
+                }
+                if request.path().starts_with("/api/v4/posts/root/thread") {
+                    return Reply::json(json!({ "order": [], "posts": {} }));
+                }
+                route(request)
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        let kind = TimelineKind::Thread {
+            channel: "town".into(),
+            root: "root".into(),
+        };
+        let timeline = session.update(cx, |s, cx| s.timeline(kind.clone(), cx));
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
+        });
+        session.update(cx, |s, cx| {
+            let mut file = mattermost::FileInfo::default();
+            file.id = "file".into();
+            s.send_post(&kind, "Retry me".into(), vec![file], cx);
+        });
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| {
+                t.entries()
+                    .iter()
+                    .any(|e| e.delivery() == crate::Delivery::Failed)
+            })
+        });
+        let pending = timeline.read_with(cx, |t, _| t.entries()[0].id().clone());
+        session.update(cx, |s, cx| {
+            s.retry_post(&kind, &pending, cx);
+            // A second click must not submit the pending retry again.
+            s.retry_post(&kind, &pending, cx);
+        });
+        timeline.read_with(cx, |t, _| {
+            assert_eq!(t.entries()[0].id(), &pending);
+            assert_eq!(t.entries()[0].delivery(), crate::Delivery::Pending);
+        });
+        wait_until(cx, |_| attempts.load(Ordering::SeqCst) == 2);
+        session.update(cx, |s, cx| {
+            let mut echo = mattermost::Post::default();
+            echo.id = "committed".into();
+            echo.channel_id = "town".into();
+            echo.root_id = "root".into();
+            echo.user_id = "me".into();
+            echo.create_at = 10;
+            echo.message = "Retry me".into();
+            echo.pending_post_id = pending.to_string();
+            s.route_post(echo, true, cx);
+        });
+        // Wait for the retry's REST response too; both confirmations are idempotent.
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| t.entries()[0].post().update_at == 11)
+        });
+        timeline.read_with(cx, |t, _| {
+            assert_eq!(t.entries().len(), 1);
+            assert_eq!(t.entries()[0].id().as_str(), "committed");
+            assert_eq!(t.entries()[0].delivery(), crate::Delivery::Sent);
+        });
+        let requests = server.requests();
+        let bodies: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|r| r.path() == "/api/v4/posts" && r.method() == "POST")
+            .map(|r| serde_json::from_slice(r.body()).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[1]["pending_post_id"], pending.as_str());
+        assert_eq!(bodies[1]["root_id"], "root");
+        assert_eq!(bodies[1]["file_ids"], json!(["file"]));
+    }
+
+    #[gpui_kit::test]
+    fn a_rejected_optimistic_delete_is_restored_by_reload(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), |request| {
+            if request.method() == "DELETE" && request.path() == "/api/v4/posts/p1" {
+                return Reply::json(json!({ "message": "Forbidden" })).status(403);
+            }
+            route(request)
+        });
+        let session = start(&server, cx);
+        let timeline = session.update(cx, |s, cx| {
+            s.timeline(TimelineKind::Channel("town".into()), cx)
+        });
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
+        });
+        let post = timeline.read_with(cx, |t, _| t.entries()[0].post().as_ref().clone());
+        let failures = failures(&session, cx);
+        session.update(cx, |s, cx| s.delete_post(&post, cx));
+        timeline.read_with(cx, |t, _| assert!(t.entries().is_empty()));
+        wait_until(cx, |_| !failures.borrow().is_empty());
+        timeline.update(cx, |t, cx| t.reload(cx));
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
+        });
+        timeline.read_with(cx, |t, _| assert!(t.position(&post.id).is_some()));
+    }
+
+    #[gpui_kit::test]
+    fn delayed_read_events_use_server_time_and_never_move_backwards(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        session.update(cx, |s, cx| {
+            s.window_active = false;
+            s.handle_event(
+                mattermost::Event::ChannelsViewed(vec![("town".into(), 100)]),
+                cx,
+            );
+            let mut post = mattermost::Post::default();
+            post.id = "queued".into();
+            post.channel_id = "town".into();
+            post.user_id = "someone-else".into();
+            post.create_at = 110;
+            s.handle_event(
+                mattermost::Event::Posted {
+                    post,
+                    mentions: vec!["me".into()],
+                    team_id: "team".into(),
+                },
+                cx,
+            );
+            let channel = s.channel(&"town".into()).unwrap();
+            assert_eq!(channel.last_viewed_at(), 100);
+            assert!(channel.is_unread());
+            assert_eq!(channel.mention_count(), 1);
+            for at in [90, 100] {
+                s.handle_event(
+                    mattermost::Event::ChannelsViewed(vec![("town".into(), at)]),
+                    cx,
+                );
+                let channel = s.channel(&"town".into()).unwrap();
+                assert_eq!(channel.last_viewed_at(), 100);
+                assert_eq!(channel.mention_count(), 1);
+            }
+            s.handle_event(
+                mattermost::Event::ChannelsViewed(vec![("town".into(), 105)]),
+                cx,
+            );
+            let channel = s.channel(&"town".into()).unwrap();
+            assert_eq!(channel.last_viewed_at(), 105);
+            assert!(channel.is_unread());
+            assert_eq!(channel.mention_count(), 1);
+            s.handle_event(
+                mattermost::Event::ChannelsViewed(vec![("town".into(), 120)]),
+                cx,
+            );
+            let channel = s.channel(&"town".into()).unwrap();
+            assert!(!channel.is_unread());
+            assert_eq!(channel.mention_count(), 0);
+            // Older servers send channel_viewed without a timestamp.
+            s.handle_event(mattermost::Event::ChannelViewed("town".into()), cx);
+            assert!(s.channel(&"town".into()).unwrap().last_viewed_at() > 120);
+        });
     }
 
     // These tests check when the server saw each request, not how long the

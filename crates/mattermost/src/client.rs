@@ -448,7 +448,7 @@ impl Client {
     pub async fn view_channel(&self, channel: &ChannelId) -> Result<()> {
         self.post::<serde_json::Value, _>(
             "channels/members/me/view".into(),
-            json!({ "channel_id": channel }),
+            json!({ "channel_id": channel, "collapsed_threads_supported": true }),
         )
         .await
         .map(|_| ())
@@ -937,6 +937,27 @@ mod tests {
     }
 
     #[test]
+    fn viewing_a_channel_declares_collapsed_thread_support() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |_| {
+            Reply::json(json!({ "status": "OK" }))
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        block_on(client.view_channel(&ChannelId::from("channel"))).unwrap();
+        let requests = server.requests();
+        let request = requests
+            .iter()
+            .find(|r| r.method() == "POST" && r.path() == "/api/v4/channels/members/me/view")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "channel_id": "channel", "collapsed_threads_supported": true,
+            })
+        );
+    }
+
+    #[test]
     fn asks_for_and_decodes_compressed_responses() {
         let body = many_channels().to_string();
         let compressed = gzip(body.as_bytes());
@@ -957,7 +978,13 @@ mod tests {
         let client = Client::new_unverified(&server.url(), "token").unwrap();
         let channels = block_on(client.my_channels(&TeamId::from("team"))).unwrap();
         assert_eq!(channels.len(), 400);
-        let accept = server.requests()[0]
+        let requests = server.requests();
+        let accept = requests
+            .iter()
+            .find(|r| {
+                r.method() == "GET" && r.path().starts_with("/api/v4/users/me/teams/team/channels")
+            })
+            .unwrap()
             .header("accept-encoding")
             .unwrap_or_default()
             .to_string();
