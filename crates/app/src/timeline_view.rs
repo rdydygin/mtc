@@ -184,7 +184,7 @@ impl TimelineView {
         self.composer.focus_handle(cx).focus(window, cx);
     }
 
-    /// Offer "Back to search results" in place of closing the thread.
+    /// Offer "Back to messages" in place of closing the thread.
     pub fn set_back_to_results(&mut self, back: bool, cx: &mut Context<Self>) {
         if self.back_to_results != back {
             self.back_to_results = back;
@@ -551,6 +551,12 @@ impl TimelineView {
                     self.focus_composer(window, cx);
                 }
             }
+            PostAction::SetSaved(saved) => self
+                .session
+                .update(cx, |s, cx| s.set_saved(&post.id, saved, cx)),
+            PostAction::SetPinned(pinned) => self
+                .session
+                .update(cx, |s, cx| s.set_pinned(&post.id, pinned, cx)),
             PostAction::AddReaction => {} // Handled by the row’s retained picker.
             PostAction::ToggleReaction(name) => {
                 self.session
@@ -688,6 +694,7 @@ impl TimelineView {
         });
 
         PostRow::new(entry.clone(), session.me().id.clone(), on_action)
+            .saved(session.is_saved(&post.id))
             .has_permalink(session.team().is_some() && entry.delivery() == session::Delivery::Sent)
             .author(author, avatar)
             .author_status(directory.status(&post.user_id))
@@ -879,9 +886,22 @@ impl TimelineView {
                         })),
                 )
             })
+            .when(!is_thread, |this| {
+                this.child(
+                    Button::new("pinned-messages")
+                        .small()
+                        .ghost()
+                        .icon(IconName::Pin)
+                        .accessibility_label("Pinned messages")
+                        .tooltip("Pinned messages")
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(crate::actions::ShowPinned), cx)
+                        }),
+                )
+            })
             .when(is_thread, |this| {
                 let (icon, label) = if self.back_to_results {
-                    (IconName::ArrowLeft, "Back to search results")
+                    (IconName::ArrowLeft, "Back to messages")
                 } else {
                     (IconName::X, "Close thread")
                 };

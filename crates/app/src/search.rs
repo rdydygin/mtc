@@ -20,7 +20,8 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement, KeyDownEvent,
     ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Styled as _, StyledText, Subscription, Task, Window, div, prelude::FluentBuilder as _,
+    Styled as _, StyledText, Subscription, Task, TestSupportExt as _, Window, div,
+    prelude::FluentBuilder as _,
 };
 use mattermost::{ChannelId, Post, PostId, PostSearch, TeamId};
 use session::{CustomEmojis, SearchScope, Session};
@@ -32,6 +33,9 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 /// A match further into a message than this many bytes is shown from a
 /// little before it, so it isn't cut off below the visible lines.
 const EXCERPT_AFTER: usize = 120;
+
+mod collections;
+pub use collections::Collection;
 
 pub enum SearchEvent {
     /// Show this post where it was written.
@@ -48,6 +52,11 @@ enum Status {
 }
 
 pub struct SearchView {
+    collection: Option<Collection>,
+    collection_pages: usize,
+    collection_unavailable: bool,
+    collection_focus: FocusHandle,
+    collection_scroll: gpui_kit::ListState,
     session: Entity<Session>,
     team: Option<TeamId>,
     channel: Option<ChannelId>,
@@ -107,6 +116,15 @@ impl SearchView {
             cx.observe(&directory, |_, _, cx| cx.notify()),
         ];
         Self {
+            collection: None,
+            collection_pages: 0,
+            collection_unavailable: false,
+            collection_focus: cx.focus_handle().tab_stop(true),
+            collection_scroll: gpui_kit::ListState::new(
+                0,
+                gpui_kit::ListAlignment::Top,
+                gpui_kit::Pixels::ZERO,
+            ),
             session,
             team,
             channel,
@@ -172,6 +190,10 @@ impl SearchView {
     /// Put the cursor in the search field with its text selected, so typing
     /// starts a new search.
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.collection.is_some() {
+            self.collection_focus.focus(window, cx);
+            return;
+        }
         self.input.focus_handle(cx).focus(window, cx);
         self.input
             .update(cx, |input, cx| input.select_all(window, cx));
@@ -180,6 +202,10 @@ impl SearchView {
     /// Search for what's typed, after `delay` so a burst of typing makes
     /// one request. A newer search replaces one still waiting or running.
     fn search(&mut self, delay: Option<Duration>, cx: &mut Context<Self>) {
+        if self.collection.is_some() {
+            self.load_collection(0, cx);
+            return;
+        }
         self.revision += 1;
         self._more = None;
         self.loading_more = false;
@@ -231,6 +257,15 @@ impl SearchView {
     }
 
     fn load_more(&mut self, cx: &mut Context<Self>) {
+        if self.collection.is_some() {
+            if !self.loading_more
+                && !matches!(self.status, Status::Searching)
+                && let Some(page) = self.next_page
+            {
+                self.load_collection(page, cx);
+            }
+            return;
+        }
         let Some(page) = self.next_page else {
             return;
         };
@@ -321,16 +356,29 @@ impl SearchView {
         } as usize;
         self.selected = Some(ix);
         self.scroll.scroll_to_item(ix);
+        if self.collection.is_some() {
+            self.collection_scroll.scroll_to_reveal_item(ix);
+        }
         cx.notify();
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.collection.is_some() && !self.collection_focus.is_focused(window) {
+            return;
+        }
         if event.keystroke.modifiers.modified() {
             return;
         }
         match event.keystroke.key.as_str() {
             "down" => self.select(1, cx),
             "up" => self.select(-1, cx),
+            "home" if self.collection.is_some() => self.select(-(self.results.len() as isize), cx),
+            "end" if self.collection.is_some() => self.select(self.results.len() as isize, cx),
+            "enter" if self.collection.is_some() => {
+                if let Some(ix) = self.selected {
+                    self.open(ix, cx);
+                }
+            }
             _ => return,
         }
         cx.stop_propagation();
@@ -519,6 +567,12 @@ impl SearchView {
         let id: ElementId = post.id.as_arc().clone().into();
         v_flex()
             .id(id)
+            .role(gpui_kit::Role::ListItem)
+            .aria_label(format!("{}: {}", name, post.message))
+            .test_support()
+            .when(self.collection.is_some(), |this| {
+                this.h_40().overflow_hidden()
+            })
             .flex_none()
             .gap_1()
             .px_4()
@@ -708,12 +762,19 @@ fn excerpt(text: &str, terms: &[String]) -> (SharedString, Vec<Range<usize>>) {
 
 impl Focusable for SearchView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.input.focus_handle(cx)
+        if self.collection.is_some() {
+            self.collection_focus.clone()
+        } else {
+            self.input.focus_handle(cx)
+        }
     }
 }
 
 impl Render for SearchView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.collection.is_some() {
+            return self.render_collection(cx);
+        }
         v_flex()
             .id("search-view")
             .size_full()
@@ -752,6 +813,7 @@ impl Render for SearchView {
                     ),
             )
             .child(self.render_body(cx))
+            .into_any_element()
     }
 }
 
@@ -774,6 +836,350 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn open_collection(
+        server: &SlowServer,
+        collection: Collection,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<SearchView>) {
+        let (window, view) = open_search(server, cx);
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                *v = SearchView::new_collection(v.session.clone(), collection, window, cx);
+                v.focus(window, cx);
+            })
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, _| matches!(v.status, Status::Done))
+        });
+        (window, view)
+    }
+
+    #[gpui_kit::test]
+    fn non_active_channel_removal_prunes_saved_and_closes_pinned(cx: &mut TestAppContext) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let removed = AtomicBool::new(false);
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("GET", "/api/v4/users/me/teams/team/channels") => Reply::json(json!([
+                    {"id":"town", "team_id":"team", "name":"town-square", "type":"O"},
+                    {"id":"other", "team_id":"team", "name":"other", "type":"O"}
+                ])),
+                ("GET", "/api/v4/users/me/posts/flagged" | "/api/v4/channels/other/pinned") => {
+                    Reply::json(json!({"posts":{
+                        "a":{"id":"a", "channel_id":"other", "create_at":3},
+                        "b":{"id":"b", "channel_id":"town", "create_at":2},
+                        "c":{"id":"c", "channel_id":"town", "create_at":1}
+                    }}))
+                }
+                ("DELETE", "/api/v4/channels/other/members/me") => {
+                    removed.store(true, Ordering::SeqCst);
+                    Reply::json(json!({}))
+                }
+                ("GET", "/api/v4/channels/other/members/me") if removed.load(Ordering::SeqCst) => {
+                    Reply::json(json!({})).status(403)
+                }
+                _ => route(request),
+            }
+        });
+        let (window, saved) = open_collection(&server, Collection::Saved, cx);
+        let session = saved.read_with(cx, |v, _| v.session.clone());
+        let pinned = cx
+            .update_window(window, |_, window, cx| {
+                cx.new(|cx| {
+                    SearchView::new_collection(
+                        session.clone(),
+                        Collection::Pinned("other".into()),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+        wait_until(cx, |cx| {
+            pinned.read_with(cx, |v, _| matches!(v.status, Status::Done))
+        });
+        let closed = Rc::new(RefCell::new(0));
+        let sink = closed.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&pinned, move |_, event, _| {
+                if matches!(event, SearchEvent::Close) {
+                    *sink.borrow_mut() += 1;
+                }
+            })
+        });
+        saved.update(cx, |v, _| v.selected = Some(1));
+        session.update(cx, |s, cx| {
+            s.open_channel(&"town".into(), cx);
+            s.leave_channel(&"other".into(), cx);
+        });
+        wait_until(cx, |cx| saved.read_with(cx, |v, _| v.results.len() == 2));
+        saved.read_with(cx, |v, _| {
+            assert_eq!(v.results[v.selected.unwrap()].id.as_str(), "b")
+        });
+        assert_eq!(*closed.borrow(), 1);
+        assert!(pinned.read_with(cx, |v, _| v.collection_unavailable && v.results.is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn collection_events_refresh_loaded_depth_without_moving_selection_or_anchor(
+        cx: &mut TestAppContext,
+    ) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let version = Arc::new(AtomicUsize::new(0));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let version = version.clone();
+            move |request| {
+                let current = version.load(Ordering::SeqCst);
+                match (request.method(), request.path().split('?').next().unwrap_or_default()) {
+                    ("GET", "/api/v4/users/me/preferences/flagged_post") => Reply::json(json!((0..120).map(|i| json!({"user_id":"me", "category":"flagged_post", "name":format!("p{i}"), "value":"true"})).collect::<Vec<_>>())),
+                    ("PUT", "/api/v4/users/me/preferences") => { version.store(1, Ordering::SeqCst); Reply::json(json!({})) },
+                    ("GET", "/api/v4/users/me/posts/flagged") => {
+                        let mut rows: Vec<_> = (0..120).rev().map(|i| json!({"id":format!("p{i}"), "channel_id":"town", "create_at":i+1, "message":format!("version {current}")})).collect();
+                        if current > 0 { rows.insert(0, json!({"id":"newer", "channel_id":"town", "create_at":200})); }
+                        let page = if request.path().contains("page=1&") { 1 } else { 0 };
+                        if current == 3 && page == 1 { return Reply::json(json!({})).status(500); }
+                        let posts: serde_json::Map<_,_> = rows.into_iter().skip(page*60).take(60).map(|p| (p["id"].as_str().unwrap().to_string(), p)).collect();
+                        Reply::json(json!({"posts":posts})).delay(if current > 0 && page == 1 { Duration::from_millis(80) } else { Duration::ZERO })
+                    }
+                    _ => route(request),
+                }
+            }
+        });
+        let (window, view) = open_collection(&server, Collection::Saved, cx);
+        let session = view.read_with(cx, |v, _| v.session.clone());
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.is_saved(&"p0".into()))
+        });
+        view.update(cx, |v, cx| v.load_more(cx));
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 120));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |v, _| {
+                v.selected = Some(90);
+                v.collection_scroll.scroll_to(gpui_kit::ListOffset {
+                    item_ix: 80,
+                    offset_in_item: px(3.),
+                });
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let assert_position = |cx: &mut TestAppContext, top: usize| {
+            view.read_with(cx, |v, _| {
+                assert_eq!(v.results.len(), 120);
+                assert_eq!(v.results[v.selected.unwrap()].id.as_str(), "p29");
+                let offset = v.collection_scroll.logical_scroll_top();
+                assert_eq!(offset.item_ix, top);
+                assert_eq!(offset.offset_in_item, px(3.));
+                assert_eq!(v.results[top].id.as_str(), "p39");
+            });
+        };
+        assert_position(cx, 80);
+        session.update(cx, |s, cx| s.set_saved(&"newer".into(), true, cx));
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, _| matches!(v.status, Status::Searching))
+        });
+        assert_position(cx, 80);
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, _| matches!(v.status, Status::Done))
+        });
+        assert_position(cx, 81);
+        version.store(2, Ordering::SeqCst);
+        session.update(cx, |_, cx| {
+            let mut post = Post::default();
+            post.id = "p29".into();
+            post.channel_id = "town".into();
+            cx.emit(session::SessionEvent::PostChanged(Arc::new(post)));
+        });
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, _| {
+                matches!(v.status, Status::Done)
+                    && v.results[v.selected.unwrap()].message == "version 2"
+            })
+        });
+        assert_position(cx, 81);
+        version.store(3, Ordering::SeqCst);
+        session.update(cx, |_, cx| cx.emit(session::SessionEvent::SavedChanged));
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, _| matches!(v.status, Status::Failed(_)))
+        });
+        assert_position(cx, 81);
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.results[v.selected.unwrap()].message, "version 2")
+        });
+    }
+
+    #[gpui_kit::test]
+    fn saved_collection_refreshes_after_save_and_remove(cx: &mut TestAppContext) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let saved = Arc::new(AtomicBool::new(false));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let saved = saved.clone();
+            move |request| match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("PUT", "/api/v4/users/me/preferences") => {
+                    saved.store(true, Ordering::SeqCst);
+                    Reply::json(json!({}))
+                }
+                ("POST", "/api/v4/users/me/preferences/delete") => {
+                    saved.store(false, Ordering::SeqCst);
+                    Reply::json(json!({}))
+                }
+                ("GET", "/api/v4/users/me/preferences/flagged_post") => {
+                    Reply::json(if saved.load(Ordering::SeqCst) {
+                        json!([{"user_id":"me", "category":"flagged_post", "name":"new", "value":"true"}])
+                    } else {
+                        json!([])
+                    })
+                }
+                ("GET", "/api/v4/users/me/posts/flagged") => {
+                    Reply::json(if saved.load(Ordering::SeqCst) {
+                        json!({"posts":{"new":{"id":"new", "channel_id":"town", "create_at":1}}})
+                    } else {
+                        json!({})
+                    })
+                }
+                _ => route(request),
+            }
+        });
+        let (window, search) = open_search(&server, cx);
+        let session = search.read_with(cx, |v, _| v.session.clone());
+        let view = cx
+            .update_window(window, |_, window, cx| {
+                cx.new(|cx| {
+                    SearchView::new_collection(session.clone(), Collection::Saved, window, cx)
+                })
+            })
+            .unwrap();
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, _| matches!(v.status, Status::Done))
+        });
+        session.update(cx, |s, cx| s.set_saved(&"new".into(), true, cx));
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 1));
+        session.update(cx, |s, cx| s.set_saved(&"new".into(), false, cx));
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, _| {
+                v.results.is_empty() && matches!(v.status, Status::Done)
+            })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn collections_open_newest_first_with_arrows_and_enter(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("GET", "/api/v4/users/me/posts/flagged" | "/api/v4/channels/town/pinned") => {
+                    Reply::json(json!({
+                        "order": ["old", "new"], "posts": {
+                            "old": {"id":"old", "channel_id":"town", "message":"old", "create_at":1},
+                            "new": {"id":"new", "channel_id":"town", "message":"new", "create_at":2}
+                        }
+                    }))
+                }
+                _ => route(request),
+            }
+        });
+        let (window, view) = open_search(&server, cx);
+        let opened = opened(&view, cx);
+        for collection in [Collection::Saved, Collection::Pinned("town".into())] {
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |v, cx| {
+                    v.collection = Some(collection);
+                    v.load_collection(0, cx);
+                    v.focus(window, cx);
+                })
+            })
+            .unwrap();
+            wait_until(cx, |cx| {
+                view.read_with(cx, |v, _| matches!(v.status, Status::Done))
+            });
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.press("home", cx);
+                window.press("enter", cx);
+                window.press("down", cx);
+                window.press("enter", cx);
+            })
+            .unwrap();
+        }
+        assert_eq!(*opened.borrow(), ["new", "old", "new", "old"]);
+    }
+
+    #[gpui_kit::test]
+    fn saved_pagination_keeps_rows_on_failure_and_retries(cx: &mut TestAppContext) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let fail = Arc::new(AtomicBool::new(true));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let fail = fail.clone();
+            move |request| {
+                if request.method() == "GET"
+                    && request
+                        .path()
+                        .starts_with("/api/v4/users/me/posts/flagged?")
+                {
+                    if request.path().contains("page=1&") {
+                        return if fail.load(Ordering::SeqCst) {
+                            Reply::not_found()
+                        } else {
+                            Reply::json(
+                                json!({"posts":{"older":{"id":"older", "channel_id":"town"}}}),
+                            )
+                        };
+                    }
+                    let posts: serde_json::Map<String, serde_json::Value> = (1..=60)
+                        .map(|i| {
+                            (
+                                format!("p{i}"),
+                                json!({"id":format!("p{i}"), "channel_id":"town", "create_at":i}),
+                            )
+                        })
+                        .collect();
+                    return Reply::json(json!({"posts":posts}));
+                }
+                route(request)
+            }
+        });
+        let (window, view) = open_search(&server, cx);
+        view.update(cx, |v, cx| {
+            v.collection = Some(Collection::Saved);
+            v.load_collection(0, cx);
+        });
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 60));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("more-collection", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.more_failed));
+        assert_eq!(view.read_with(cx, |v, _| v.results.len()), 60);
+        fail.store(false, Ordering::SeqCst);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("retry-collection-page", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 61));
+        assert!(view.read_with(cx, |v, _| v.next_page.is_none()));
+    }
 
     #[test]
     fn excerpts_advance_past_multibyte_whitespace() {

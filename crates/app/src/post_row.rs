@@ -59,6 +59,8 @@ pub const QUICK_REACTIONS: [(&str, &str); 4] = [
 #[derive(Clone, Debug)]
 pub enum PostAction {
     OpenThread,
+    SetSaved(bool),
+    SetPinned(bool),
     OpenLink(String),
     ToggleReaction(String),
     MarkUnread,
@@ -96,6 +98,7 @@ pub struct PostRow {
     custom_emoji: CustomEmojis,
     emoji_store: Option<Entity<session::EmojiStore>>,
     reaction_focus_fallback: Option<FocusHandle>,
+    saved: bool,
     has_permalink: bool,
     on_action: PostActionHandler,
 }
@@ -119,9 +122,15 @@ impl PostRow {
             custom_emoji: CustomEmojis::default(),
             emoji_store: None,
             reaction_focus_fallback: None,
+            saved: false,
             has_permalink: false,
             on_action,
         }
+    }
+
+    pub fn saved(mut self, saved: bool) -> Self {
+        self.saved = saved;
+        self
     }
 
     pub fn has_permalink(mut self, available: bool) -> Self {
@@ -1031,6 +1040,7 @@ impl RenderOnce for PostRow {
             self.link_preview_url(),
             self.has_permalink,
             !post.is_reply(),
+            (self.saved, post.is_pinned),
         )
         .into();
         let row = h_flex()
@@ -1118,6 +1128,36 @@ impl RenderOnce for PostRow {
                                         .size_full(),
                                     )
                                     .children(self.render_mention(mention, cx))
+                                }),
+                        )
+                    })
+                    .when(self.saved || post.is_pinned, |this| {
+                        this.child(
+                            h_flex()
+                                .gap_3()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .when(self.saved, |this| {
+                                    this.child(
+                                        h_flex()
+                                            .gap_1()
+                                            .id("saved-indicator")
+                                            .role(gpui_kit::Role::Group)
+                                            .aria_label("Saved message")
+                                            .child(Icon::new(IconName::Bookmark).xsmall())
+                                            .child("Saved"),
+                                    )
+                                })
+                                .when(post.is_pinned, |this| {
+                                    this.child(
+                                        h_flex()
+                                            .gap_1()
+                                            .id("pinned-indicator")
+                                            .role(gpui_kit::Role::Group)
+                                            .aria_label("Pinned message")
+                                            .child(Icon::new(IconName::Pin).xsmall())
+                                            .child("Pinned"),
+                                    )
                                 }),
                         )
                     })
@@ -1408,6 +1448,7 @@ fn post_menu_entries(
     link: Option<SharedString>,
     has_permalink: bool,
     is_root: bool,
+    (saved, pinned): (bool, bool),
 ) -> Vec<PostMenuEntry> {
     let item = |label: String, action: PostAction| {
         PostMenuEntry::Command(label.into(), PostCommand::Post(action))
@@ -1427,6 +1468,19 @@ fn post_menu_entries(
     if is_root {
         entries.push(item("Mark as unread".into(), PostAction::MarkUnread));
     }
+    entries.push(item(
+        if saved {
+            "Remove from saved"
+        } else {
+            "Save message"
+        }
+        .into(),
+        PostAction::SetSaved(!saved),
+    ));
+    entries.push(item(
+        if pinned { "Unpin" } else { "Pin to channel" }.into(),
+        PostAction::SetPinned(!pinned),
+    ));
     entries.push(item("Copy text".into(), PostAction::CopyText));
     if has_permalink {
         entries.push(item("Copy link".into(), PostAction::CopyLink));
@@ -1856,6 +1910,22 @@ mod tests {
     }
 
     #[test]
+    fn saved_and_pinned_menu_commands_reverse_the_displayed_state() {
+        for saved in [false, true] {
+            for pinned in [false, true] {
+                let entries =
+                    post_menu_entries(false, false, &[], None, true, true, (saved, pinned));
+                assert!(entries.iter().any(|entry| matches!(entry,
+                    PostMenuEntry::Command(label, PostCommand::Post(PostAction::SetSaved(next)))
+                    if *next != saved && label == if saved { "Remove from saved" } else { "Save message" })));
+                assert!(entries.iter().any(|entry| matches!(entry,
+                    PostMenuEntry::Command(label, PostCommand::Post(PostAction::SetPinned(next)))
+                    if *next != pinned && label == if pinned { "Unpin" } else { "Pin to channel" })));
+            }
+        }
+    }
+
+    #[test]
     fn menu_reaches_files_and_link_preview() {
         let mut file = FileInfo::default();
         file.name = "report.pdf".into();
@@ -1866,6 +1936,7 @@ mod tests {
             Some("https://example.com".into()),
             false,
             true,
+            (false, false),
         );
         let labels = labels(&entries);
         assert!(labels.contains(&"Open report.pdf"));
@@ -1880,26 +1951,27 @@ mod tests {
     #[test]
     fn mark_unread_is_offered_only_for_root_posts() {
         for is_mine in [false, true] {
-            let roots = post_menu_entries(is_mine, false, &[], None, false, true);
+            let roots = post_menu_entries(is_mine, false, &[], None, false, true, (false, false));
             assert!(roots.iter().any(|entry| matches!(entry,
                 PostMenuEntry::Command(label, PostCommand::Post(PostAction::MarkUnread))
                     if label == "Mark as unread")));
-            let replies = post_menu_entries(is_mine, false, &[], None, false, false);
+            let replies =
+                post_menu_entries(is_mine, false, &[], None, false, false, (false, false));
             assert!(!labels(&replies).contains(&"Mark as unread"));
         }
     }
 
     #[test]
     fn copy_link_is_available_only_with_a_permalink() {
-        let entries = post_menu_entries(false, false, &[], None, true, true);
+        let entries = post_menu_entries(false, false, &[], None, true, true, (false, false));
         assert!(labels(&entries).contains(&"Copy link"));
-        let entries = post_menu_entries(false, false, &[], None, false, true);
+        let entries = post_menu_entries(false, false, &[], None, false, true, (false, false));
         assert!(!labels(&entries).contains(&"Copy link"));
     }
 
     #[test]
     fn menu_without_attachments_has_no_open_section() {
-        let entries = post_menu_entries(true, false, &[], None, false, true);
+        let entries = post_menu_entries(true, false, &[], None, false, true, (false, false));
         let labels = labels(&entries);
         assert!(!labels.iter().any(|label| label.starts_with("Open")));
         assert_eq!(labels.last(), Some(&"Delete…"));

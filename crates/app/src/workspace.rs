@@ -27,13 +27,14 @@ use crate::{
     actions::{
         CloseConversation, Dismiss, FocusComposer, LeaveChannel, NextChannel, NextUnreadChannel,
         PreviousChannel, PreviousUnreadChannel, QuickSwitch, RESET_ZOOM_KEY, SearchConversation,
-        SearchTeam, ShowSettings, ShowShortcuts, ShowThreads, ToggleChannelMute, ToggleFavorite,
-        WORKSPACE_CONTEXT, ZOOM_IN_KEY, ZOOM_OUT_KEY, shortcut_label,
+        SearchTeam, ShowPinned, ShowSaved, ShowSettings, ShowShortcuts, ShowThreads,
+        ToggleChannelMute, ToggleFavorite, WORKSPACE_CONTEXT, ZOOM_IN_KEY, ZOOM_OUT_KEY,
+        shortcut_label,
     },
     cache,
     dither::DitherView,
     extensions, persist,
-    search::{SearchEvent, SearchView},
+    search::{Collection, SearchEvent, SearchView},
     sidebar::{SidebarEvent, SidebarView, sections},
     skeleton, switcher,
     threads_view::{ThreadsView, ThreadsViewEvent},
@@ -557,8 +558,42 @@ impl Workspace {
         }
     }
 
+    fn show_saved(&mut self, _: &ShowSaved, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_collection(Collection::Saved, window, cx);
+    }
+
+    fn show_pinned(&mut self, _: &ShowPinned, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(channel) = self.active.clone() {
+            self.open_collection(Collection::Pinned(channel), window, cx);
+        }
+    }
+
+    fn open_collection(
+        &mut self,
+        collection: Collection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.leave_threads(cx);
+        let session = self.session.clone();
+        let search = cx.new(|cx| SearchView::new_collection(session, collection, window, cx));
+        let subscription = cx.subscribe_in(&search, window, Self::on_search_event);
+        self.search = Some((search.clone(), subscription));
+        self.search_open = true;
+        self.close_thread(window, cx);
+        search.update(cx, |view, cx| view.focus(window, cx));
+        cx.notify();
+    }
+
     fn open_search(&mut self, scope: SearchScope, window: &mut Window, cx: &mut Context<Self>) {
         self.leave_threads(cx);
+        if self
+            .search
+            .as_ref()
+            .is_some_and(|(view, _)| view.read(cx).is_collection())
+        {
+            self.search = None;
+        }
         let search = match &self.search {
             Some((search, _)) => {
                 search.update(cx, |search, cx| search.set_scope(scope, window, cx));
@@ -838,7 +873,7 @@ impl Workspace {
 
     fn show_shortcuts(&mut self, _: &ShowShortcuts, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, |dialog, window, cx| {
-            let rows: [(&str, Box<dyn Action>); 12] = [
+            let rows: [(&str, Box<dyn Action>); 14] = [
                 ("Jump to a channel or person", Box::new(QuickSwitch)),
                 (
                     "Search messages in the conversation",
@@ -846,6 +881,8 @@ impl Workspace {
                 ),
                 ("Search all channels in this team", Box::new(SearchTeam)),
                 ("Threads", Box::new(ShowThreads)),
+                ("Saved messages", Box::new(ShowSaved)),
+                ("Pinned messages", Box::new(ShowPinned)),
                 ("Next channel", Box::new(NextChannel)),
                 ("Previous channel", Box::new(PreviousChannel)),
                 ("Next unread channel", Box::new(NextUnreadChannel)),
@@ -858,6 +895,11 @@ impl Workspace {
             let theme = cx.theme();
             let zoom = [ZOOM_IN_KEY, ZOOM_OUT_KEY, RESET_ZOOM_KEY].map(shortcut_label);
             let fixed = [
+                (
+                    "Select a saved or pinned message",
+                    "↑ / ↓ / Home / End".to_string(),
+                ),
+                ("Open selected message", "Enter".to_string()),
                 ("Select a thread", "↑ / ↓ / Home / End".to_string()),
                 ("Open selected thread", "Enter".to_string()),
                 ("Thread actions", "Tab to More actions, Enter".to_string()),
@@ -1202,6 +1244,8 @@ impl Render for Workspace {
             .bg(backdrop)
             .on_action(cx.listener(Self::quick_switch))
             .on_action(cx.listener(Self::show_threads))
+            .on_action(cx.listener(Self::show_saved))
+            .on_action(cx.listener(Self::show_pinned))
             .on_action(cx.listener(|this, _: &NextChannel, window, cx| {
                 this.step_channel(1, false, window, cx)
             }))
@@ -1441,6 +1485,67 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn saved_and_pinned_shortcuts_open_replies_through_show_result(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("GET", "/api/v4/users/me/posts/flagged" | "/api/v4/channels/town/pinned") => {
+                    Reply::json(json!({"posts": {
+                        "reply": {"id":"reply", "channel_id":"town", "root_id":"root", "user_id":"ann", "message":"Saved reply", "create_at":30}
+                    }}))
+                }
+                _ => route(request),
+            }
+        });
+        let (window, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| w.session.read(cx).is_loaded())
+        });
+        for key in [
+            if cfg!(target_os = "macos") {
+                "cmd-shift-s"
+            } else {
+                "ctrl-shift-s"
+            },
+            if cfg!(target_os = "macos") {
+                "cmd-shift-p"
+            } else {
+                "ctrl-shift-p"
+            },
+        ] {
+            cx.update_window(window, |_, window, cx| {
+                workspace.update(cx, |w, cx| w.open_channel(&"town".into(), window, cx));
+                window.render_frame(cx);
+                window.press(key, cx);
+            })
+            .unwrap();
+            wait_until(cx, |cx| {
+                cx.update_window(window, |_, window, cx| {
+                    use gpui_kit::test::TestQueryExt as _;
+                    window.render_frame(cx);
+                    window.try_find_by_label("…: Saved reply").is_some()
+                        || window.try_find_by_label("ann: Saved reply").is_some()
+                })
+                .unwrap()
+            });
+            cx.update_window(window, |_, window, cx| window.press("enter", cx))
+                .unwrap();
+            wait_until(cx, |cx| workspace.read_with(cx, |w, _| w.thread.is_some()));
+            workspace.read_with(cx, |w, cx| {
+                assert_eq!(
+                    w.thread.as_ref().unwrap().0.read(cx).kind().root(),
+                    Some(&PostId::from("root"))
+                );
+                assert!(w.search_open);
+            });
+            cx.update_window(window, |_, window, cx| window.press("escape", cx))
+                .unwrap();
+        }
     }
 
     #[gpui_kit::test]

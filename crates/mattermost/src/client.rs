@@ -477,6 +477,30 @@ impl Client {
         self.get(format!("posts/{post}")).await
     }
 
+    /// Saved (flagged) posts, newest first, one page at a time.
+    pub async fn flagged_posts(
+        &self,
+        user: &UserId,
+        page: usize,
+        per_page: usize,
+    ) -> Result<PostList> {
+        self.get(format!(
+            "users/{user}/posts/flagged?page={page}&per_page={per_page}"
+        ))
+        .await
+    }
+
+    pub async fn pinned_posts(&self, channel: &ChannelId) -> Result<PostList> {
+        self.get(format!("channels/{channel}/pinned")).await
+    }
+
+    pub async fn set_post_pinned(&self, post: &PostId, pinned: bool) -> Result<()> {
+        let action = if pinned { "pin" } else { "unpin" };
+        self.post::<serde_json::Value, _>(format!("posts/{post}/{action}"), serde_json::json!({}))
+            .await?;
+        Ok(())
+    }
+
     pub async fn delete_post(&self, post: &PostId) -> Result<()> {
         self.request::<serde_json::Value, ()>(Method::DELETE, format!("posts/{post}"), None)
             .await
@@ -1065,6 +1089,57 @@ mod tests {
         ] {
             let empty: UserAutocomplete = serde_json::from_value(value).unwrap();
             assert!(empty.users().is_empty() && empty.out_of_channel().is_empty());
+        }
+    }
+
+    #[test]
+    fn saved_and_pinned_request_shapes() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (request.method(), request.path()) {
+                ("GET", "/api/v4/users/me/posts/flagged?page=2&per_page=60")
+                | ("GET", "/api/v4/channels/town/pinned") => Reply::json(
+                    json!({"order": ["p"], "posts": {"p": {"id": "p", "is_pinned": true}}}),
+                ),
+                (
+                    "POST",
+                    "/api/v4/posts/p/pin"
+                    | "/api/v4/posts/p/unpin"
+                    | "/api/v4/users/me/preferences/delete",
+                )
+                | ("PUT", "/api/v4/users/me/preferences") => Reply::json(json!({"status":"OK"})),
+                _ => Reply::not_found(),
+            }
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        assert!(
+            block_on(client.flagged_posts(&"me".into(), 2, 60))
+                .unwrap()
+                .posts[&PostId::from("p")]
+                .is_pinned
+        );
+        assert!(
+            block_on(client.pinned_posts(&"town".into())).unwrap().posts[&PostId::from("p")]
+                .is_pinned
+        );
+        block_on(client.set_post_pinned(&"p".into(), true)).unwrap();
+        block_on(client.set_post_pinned(&"p".into(), false)).unwrap();
+        let preference = Preference::new("me".into(), "flagged_post", "p", "true");
+        block_on(client.save_preferences(&"me".into(), vec![preference.clone()])).unwrap();
+        block_on(client.delete_preferences(&"me".into(), vec![preference])).unwrap();
+        for (method, path) in [
+            ("PUT", "/api/v4/users/me/preferences"),
+            ("POST", "/api/v4/users/me/preferences/delete"),
+        ] {
+            let requests = server.requests();
+            let request = requests
+                .iter()
+                .find(|r| r.method() == method && r.path() == path)
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+            assert_eq!(
+                body,
+                json!([{"user_id":"me", "category":"flagged_post", "name":"p", "value":"true"}])
+            );
         }
     }
 
