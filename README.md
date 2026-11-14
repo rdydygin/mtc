@@ -218,21 +218,36 @@ notifications) is itself registered as the `Core` extension.
 ## Development
 
 ```sh
-cargo test --workspace     # client parsing, message preparation, Timeline behavior
-cargo clippy --workspace --all-targets
+cargo test --workspace --locked # client parsing, message preparation, Timeline behavior
+cargo clippy --workspace --all-targets --locked -- -D warnings
 # Live SSO exchange against a server, after running the browser leg yourself:
 MTC_SSO_SERVER=… MTC_SSO_CALLBACK='…/login/desktop?…' cargo test -p mattermost -- --ignored
 ```
 
-CI (`.github/workflows/ci.yml`) runs rustfmt, clippy with warnings denied, and the tests on
-every pull request and push to `main`. Every push to `main` also publishes a release:
-`.github/workflows/release.yml` picks the next patch after the newest `v*` tag (or the
-`version` in `Cargo.toml`, when that is higher), stamps it into the build, builds a universal
-(Apple Silicon and Intel) `mtc.app` with `script/bundle-macos --universal`, and attaches it to
-a GitHub release tagged `v<version>`. Nothing is committed back, so to start a new minor or
-major series, bump `version` in `Cargo.toml`. Running the Release workflow from the Actions
-tab releases any branch the same way, and pushing a tag (`git tag v0.3.0 && git push origin
-v0.3.0`) releases that commit as exactly that version.
+Work on a short-lived feature branch, open a pull request into `main`, and merge after
+all required CI checks pass. Merging does not publish a release. CI
+(`.github/workflows/ci.yml`) runs on PRs targeting `main` and pushes to `main`, and can
+also be run manually. It checks rustfmt on Ubuntu, clippy (warnings denied) and tests
+on macOS, and builds, clippy and tests on Linux and Windows. Cargo builds and tests
+use `--locked`; all compilation denies warnings. GPUI tests use the in-process test
+platform, without a display server or GPU rendering tests. CI and releases use the
+stable Rust toolchain.
+
+To release, push a `vMAJOR.MINOR.PATCH` tag (for example,
+`git tag v0.3.0 && git push origin v0.3.0`), or go to **Actions → Release → Run workflow**
+and choose a branch or tag. Manual branch runs accept an optional `version` such as
+`0.3.0`; when empty, the version is the next patch after the newest `v*` tag, or the
+workspace version in `Cargo.toml` when higher. A tag run uses that tag's exact version.
+To start a new minor or major series by default, bump `version` in `Cargo.toml`.
+
+The Release workflow reruns the full CI on the exact source commit before building.
+It stamps the selected version into the checkout (nothing is committed back), builds a
+universal (Apple Silicon and Intel) `mtc.app` with `script/bundle-macos --universal`,
+and packages a zip, SHA-256 checksum and update feed. A separate publishing job creates
+a draft release, uploads all assets, verifies that the tag still points to the built
+commit, then publishes. Existing releases, including drafts, are refused; if publication
+fails, inspect and remove the draft before retrying. Only the publishing job can write
+tags or releases. Linux and Windows are checked by CI; release downloads remain macOS-only.
 
 The release also carries `latest.json`, the update feed: the version, the release page,
 and each download's URL and SHA-256. Installed copies read it from
