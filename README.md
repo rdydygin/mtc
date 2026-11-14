@@ -230,6 +230,10 @@ Dependencies point downward. The app depends on `gpui-kit` alone for UI.
 - **Skeletons while loading.** The window, sidebar, and conversation show their shape
   while their content is on the way, with the same lanes as the real rows, so
   nothing moves when it arrives.
+- **Large-team sidebar.** Conversation sections, lowercase sort keys, and group labels
+  are retained across renders; presence and custom-status updates reuse them.
+  Expanded sections use a GPUI virtual list, so only viewport rows are built and
+  collapsed sections build none. Keyboard navigation and ⌘K share the cached order.
 - **Virtualized timelines.** Posts render through a GPUI list anchored to the composer
   (`app/src/post_scroller.rs`). `Timeline` emits splice events
   (`Spliced { old, new_count }`, `Updated(ix)`), so a new post or an edit measures one

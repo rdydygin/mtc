@@ -156,7 +156,7 @@ impl Workspace {
                 s.timeline(TimelineKind::Channel(ChannelId::from(id.as_str())), cx);
             });
         }
-        let sidebar = cx.new(|cx| SidebarView::new(session.clone(), cx));
+        let sidebar = cx.new(|cx| SidebarView::new(session.clone(), window, cx));
         let (directory, emoji, server) = {
             let session = session.read(cx);
             (
@@ -2288,11 +2288,11 @@ mod tests {
             let session = w.session.read(cx);
             assert!(
                 !crate::sidebar::sections(session, cx)
-                    .direct
+                    .direct()
                     .contains(&"dm-0".into())
             );
             let all = crate::sidebar::conversation_sections(session, cx);
-            assert_eq!(all.direct.len(), 25);
+            assert_eq!(all.direct().len(), 25);
         });
         cx.update_window(handle, |_, window, cx| {
             workspace.update(cx, |w, cx| w.quick_switch(&QuickSwitch, window, cx));

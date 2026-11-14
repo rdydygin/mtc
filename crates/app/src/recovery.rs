@@ -147,8 +147,8 @@ pub(crate) mod tests {
             })
         });
         let (handle, _) = cx.update(|cx| {
-            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
-                cx.new(|cx| crate::sidebar::SidebarView::new(session.clone(), cx))
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| crate::sidebar::SidebarView::new(session.clone(), window, cx))
             })
             .unwrap()
         });

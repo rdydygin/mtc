@@ -39,6 +39,7 @@ pub struct Directory {
     /// Counts changes to `users` (not presence), so a copy kept elsewhere
     /// can tell when it is out of date.
     revision: u64,
+    names_revision: u64,
     statuses: HashMap<UserId, Status>,
     /// Only active status reads have tokens; status events invalidate them.
     status_requests: HashMap<UserId, u64>,
@@ -63,6 +64,7 @@ impl Directory {
             users,
             remembered: HashSet::new(),
             revision: 0,
+            names_revision: 0,
             statuses: HashMap::new(),
             status_requests: HashMap::new(),
             next_status_request: 0,
@@ -95,6 +97,23 @@ impl Directory {
     /// Changes whenever a user is added or changed.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Changes only when a display name becomes known or changes, not presence,
+    /// avatars or custom status. Conversation labels depend on this revision.
+    pub fn names_revision(&self) -> u64 {
+        self.names_revision
+    }
+
+    fn insert_user(&mut self, user: User) {
+        if self
+            .users
+            .get(&user.id)
+            .is_none_or(|old| old.display_name() != user.display_name())
+        {
+            self.names_revision += 1;
+        }
+        self.users.insert(user.id.clone(), Arc::new(user));
     }
 
     pub fn status(&self, id: &UserId) -> Status {
@@ -214,7 +233,7 @@ impl Directory {
                             this.remembered.remove(id);
                         }
                         for user in users {
-                            this.users.insert(user.id.clone(), Arc::new(user));
+                            this.insert_user(user);
                         }
                         this.revision += 1;
                     }
@@ -287,7 +306,11 @@ impl Directory {
         cx: &mut Context<Self>,
     ) {
         if let Some(user) = self.users.get_mut(id) {
+            let name = user.display_name().to_string();
             change(Arc::make_mut(user));
+            if name != user.display_name() {
+                self.names_revision += 1;
+            }
             let user = user.clone();
             self.request_status_emoji([user.as_ref()], cx);
             self.revision += 1;
@@ -301,7 +324,7 @@ impl Directory {
         self.request_status_emoji(&users, cx);
         for user in users {
             self.remembered.remove(&user.id);
-            self.users.insert(user.id.clone(), Arc::new(user));
+            self.insert_user(user);
         }
         self.revision += 1;
         cx.notify();
@@ -321,7 +344,7 @@ impl Directory {
         self.request_status_emoji(&users, cx);
         for user in users {
             self.remembered.insert(user.id.clone());
-            self.users.insert(user.id.clone(), Arc::new(user));
+            self.insert_user(user);
         }
         self.revision += 1;
         cx.notify();

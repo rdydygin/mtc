@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
@@ -22,6 +23,11 @@ use crate::{
     retry::{is_transient, retry},
     timeline::{CLIENT_NONCE, LoadState, now_millis, send_ids},
 };
+
+#[path = "conversations.rs"]
+mod conversations;
+pub use conversations::ChannelSections;
+use conversations::ConversationCache;
 
 /// How long a "typing" signal stays visible without being repeated.
 const TYPING_TTL: Duration = Duration::from_secs(6);
@@ -168,6 +174,7 @@ pub struct Session {
     _commands_task: Option<Task<()>>,
     commands_generation: u64,
     channels: HashMap<ChannelId, ChannelEntry>,
+    conversations: RefCell<ConversationCache>,
     /// Completed lists invalidate older channel hydration.
     channel_list_generation: u64,
     /// Monotonic team selection revision, including round trips to the same team.
@@ -275,6 +282,7 @@ impl Session {
             _commands_task: None,
             commands_generation: 0,
             channels: HashMap::new(),
+            conversations: RefCell::default(),
             channel_list_generation: 0,
             team_revision: 0,
             hydrated_channels: HashSet::new(),
@@ -395,7 +403,7 @@ impl Session {
 
     /// The name people know a channel by. Direct and group messages are
     /// named after the other participants.
-    pub fn channel_label(&self, entry: &ChannelEntry, cx: &App) -> SharedString {
+    fn compute_channel_label(&self, entry: &ChannelEntry, cx: &App) -> SharedString {
         let channel = &entry.channel;
         if let Some(partner) = channel.direct_partner(&self.me.id) {
             if partner == self.me.id {
@@ -480,6 +488,7 @@ impl Session {
                     if this.team != guess || guess.is_none() {
                         this.refresh_commands(cx);
                         this.channels.clear();
+                        this.invalidate_conversations();
                         this.channels_state = LoadState::NotLoaded;
                         this.load_channels(cx);
                     }
@@ -510,6 +519,7 @@ impl Session {
         self.team = Some(team);
         self.refresh_commands(cx);
         self.channels.clear();
+        self.invalidate_conversations();
         self.channel_list_generation += 1;
         self.channels_state = LoadState::NotLoaded;
         self.load_channels(cx);
@@ -600,6 +610,7 @@ impl Session {
                     // from, takes its threads with it.
                     let lost = this.channels.keys().any(|id| !channels.contains_key(id));
                     this.channels = channels;
+                    this.invalidate_conversations();
                     this.channels_state = LoadState::Loaded;
                     if let Some(id) = this.unread_channel.as_ref()
                         && !this.channel_sync.get(id).is_some_and(|sync| sync.running)
@@ -662,7 +673,7 @@ impl Session {
                             .map(|u| u.id.clone())
                             .filter(|id| id != &this.me.id)
                             .collect();
-                        this.group_members.insert(channel, ids);
+                        this.set_group_members(channel, ids);
                         users.extend(members);
                     }
                     this.directory.update(cx, |d, cx| d.insert(users, cx));
@@ -688,10 +699,14 @@ impl Session {
             };
             let _ = this.update(cx, |this, cx| match result {
                 Ok(preferences) => {
-                    this.favorites = preferences
+                    let favorites = preferences
                         .iter()
                         .filter_map(Preference::favorite_channel)
                         .collect();
+                    if this.favorites != favorites {
+                        this.favorites = favorites;
+                        this.invalidate_conversations();
+                    }
                     cx.notify();
                 }
                 Err(err) => this.handle_error(err, cx),
@@ -841,6 +856,7 @@ impl Session {
                     .entry(id.clone())
                     .or_insert(ChannelEntry { channel, member });
                 this.hydrated_channels.insert(id);
+                this.invalidate_conversations();
                 this.directory.update(cx, |d, cx| d.ensure(partner, cx));
                 this.load_group_members(cx);
                 cx.notify();
@@ -913,6 +929,7 @@ impl Session {
             member.msg_count_root = entry.channel.total_msg_count_root;
         }
         self.touched_members.insert(channel.clone());
+        self.invalidate_conversation_visibility();
         cx.notify();
         let sync = self.channel_sync.entry(channel.clone()).or_default();
         if explicit
@@ -1116,6 +1133,7 @@ impl Session {
             }
         }
         self.touched_members.insert(channel);
+        self.invalidate_conversation_visibility();
         cx.notify();
     }
 
@@ -1143,6 +1161,7 @@ impl Session {
         );
         self.mute_pending.insert(channel.clone());
         self.touched_members.insert(channel.clone());
+        self.invalidate_conversation_visibility();
         cx.notify();
         let client = self.client.clone();
         let user = self.me.id.clone();
@@ -1164,6 +1183,7 @@ impl Session {
                             }
                         }
                     }
+                    this.invalidate_conversation_visibility();
                     cx.emit(SessionEvent::SendFailed {
                         message: format!("Couldn’t change channel mute state. {err:#}").into(),
                     });
@@ -1193,6 +1213,7 @@ impl Session {
         {
             self.touched_members.insert(member.channel_id);
             current.notify_props = member.notify_props;
+            self.invalidate_conversation_visibility();
             cx.notify();
         }
     }
@@ -1568,6 +1589,7 @@ impl Session {
         if !changed {
             return;
         }
+        self.invalidate_conversations();
         cx.notify();
         let client = self.client.clone();
         let me = self.me.id.clone();
@@ -1583,6 +1605,7 @@ impl Session {
             };
             if let Err(err) = result {
                 let _ = this.update(cx, |this, cx| {
+                    this.invalidate_conversations();
                     if favorite {
                         this.favorites.remove(&channel);
                     } else {
@@ -1601,6 +1624,7 @@ impl Session {
     /// Leave `channel`. It leaves the sidebar at once and comes back if the
     /// server refuses.
     pub fn leave_channel(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        self.invalidate_conversations();
         let Some(entry) = self.channels.remove(channel) else {
             return;
         };
@@ -1623,6 +1647,7 @@ impl Session {
                     // they'll include it again when it is next shown.
                     if this.team == team {
                         this.channels.entry(channel).or_insert(entry);
+                        this.invalidate_conversations();
                     }
                     cx.emit(SessionEvent::SendFailed {
                         message: format!("Couldn’t leave {label}. {err:#}").into(),
@@ -1671,6 +1696,7 @@ impl Session {
                     .entry(id.clone())
                     .or_insert(ChannelEntry { channel, member });
                 this.hydrated_channels.insert(id.clone());
+                this.invalidate_conversations();
                 this.directory.update(cx, |d, cx| d.ensure([user], cx));
                 cx.notify();
             })?;
@@ -1758,7 +1784,8 @@ impl Session {
                     .entry(id.clone())
                     .or_insert(ChannelEntry { channel, member });
                 this.hydrated_channels.insert(id.clone());
-                this.group_members.insert(id.clone(), users.clone());
+                this.invalidate_conversations();
+                this.set_group_members(id.clone(), users.clone());
                 this.directory.update(cx, |d, cx| d.ensure(users, cx));
                 cx.notify();
             })?;
@@ -1801,6 +1828,7 @@ impl Session {
                     },
                 );
                 this.hydrated_channels.insert(id.clone());
+                this.invalidate_conversations();
                 cx.notify();
                 Ok(())
             })??;
@@ -1979,6 +2007,7 @@ impl Session {
                     };
                 }
                 if changed {
+                    self.invalidate_conversations();
                     cx.notify();
                 }
             }
@@ -1993,6 +2022,7 @@ impl Session {
                         .remove(&ChannelId::from(preference.name.as_str()));
                 }
                 if changed {
+                    self.invalidate_conversations();
                     cx.notify();
                 }
             }
@@ -2059,12 +2089,23 @@ impl Session {
             }
         }
         if changed {
+            self.invalidate_conversation_visibility();
             cx.notify();
         }
     }
 
     /// Update unread state for a new post.
     fn note_activity(&mut self, post: &Post, mentions_me: bool, cx: &mut Context<Self>) {
+        if let Some(entry) = self.channel(&post.channel_id)
+            && entry.kind().is_direct_or_group()
+            && !self.is_favorite(&post.channel_id)
+        {
+            if post.create_at > entry.last_activity() {
+                self.invalidate_conversations();
+            } else {
+                self.invalidate_conversation_visibility();
+            }
+        }
         self.dirty_member_snapshot(&post.channel_id);
         let Some(entry) = self.channels.get_mut(&post.channel_id) else {
             // A channel we don't know yet (new DM, just added).
@@ -4335,6 +4376,84 @@ mod slow_network_tests {
                 }
             }
         }
+    }
+
+    #[gpui_kit::test]
+    fn retained_sections_follow_renames_and_authoritative_membership_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let channels = Arc::new(std::sync::Mutex::new(json!([
+            {"id":"town", "team_id":"team", "name":"town-square", "display_name":"Zulu", "type":"O"},
+            {"id":"design", "team_id":"team", "name":"design", "display_name":"Design", "type":"P"}
+        ])));
+        let remote = channels.clone();
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            if request.method() == "GET" && request.path() == "/api/v4/users/me/teams/team/channels"
+            {
+                Reply::json(remote.lock().unwrap().clone())
+            } else {
+                route(request)
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        let before = session.read_with(cx, |s, cx| {
+            let sections = s.conversation_sections(cx);
+            assert_eq!(
+                sections.channels(),
+                &[ChannelId::from("design"), ChannelId::from("town")]
+            );
+            sections
+        });
+        channels.lock().unwrap()[0]["display_name"] = json!("Alpha");
+        session.update(cx, |s, cx| {
+            s.handle_event(
+                mattermost::Event::ChannelsChanged {
+                    name: "channel_updated".into(),
+                    team_id: "team".into(),
+                    user_id: "me".into(),
+                },
+                cx,
+            )
+        });
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        let renamed = session.read_with(cx, |s, cx| {
+            let sections = s.conversation_sections(cx);
+            assert!(!Rc::ptr_eq(&before, &sections));
+            assert_eq!(
+                sections.channels(),
+                &[ChannelId::from("town"), ChannelId::from("design")]
+            );
+            assert_eq!(
+                s.channel_label(s.channel(&"town".into()).unwrap(), cx),
+                "Alpha"
+            );
+            sections
+        });
+        *channels.lock().unwrap() = json!([
+            {"id":"town", "team_id":"team", "name":"town-square", "display_name":"Alpha", "type":"O"},
+            {"id":"new", "team_id":"team", "name":"new", "display_name":"Beta", "type":"P"}
+        ]);
+        session.update(cx, |s, cx| {
+            s.handle_event(
+                mattermost::Event::ChannelsChanged {
+                    name: "user_added".into(),
+                    team_id: "team".into(),
+                    user_id: "me".into(),
+                },
+                cx,
+            )
+        });
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        session.read_with(cx, |s, cx| {
+            let sections = s.sidebar_sections(cx);
+            assert!(!Rc::ptr_eq(&renamed, &sections));
+            assert_eq!(
+                sections.channels(),
+                &[ChannelId::from("town"), ChannelId::from("new")]
+            );
+            assert!(s.channel(&"design".into()).is_none());
+        });
     }
 
     #[gpui_kit::test]
