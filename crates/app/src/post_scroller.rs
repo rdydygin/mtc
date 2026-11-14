@@ -77,10 +77,19 @@ impl PostScrollerState {
             && !self.list.is_scrolled_to_end().unwrap_or(false)
     }
 
-    /// Start over with `count` rows, following the newest.
-    pub fn reset(&mut self, count: usize, cx: &mut Context<Self>) {
+    /// Rebuild rows, retaining the reader's post and offset when it survives.
+    /// Without an anchor, follow the newest (including the initial load).
+    pub fn reset_with_anchor(
+        &mut self,
+        count: usize,
+        anchor: Option<ListOffset>,
+        cx: &mut Context<Self>,
+    ) {
         self.list.reset(count);
         self.list.set_follow_mode(FollowMode::Tail);
+        if let Some(anchor) = anchor {
+            self.list.scroll_to(anchor);
+        }
         self.fits = false;
         cx.notify();
     }
@@ -142,7 +151,6 @@ impl PostScrollerState {
         cx.notify();
     }
 
-    #[cfg(test)]
     pub(crate) fn is_following_tail(&self) -> bool {
         self.list.is_following_tail()
     }
