@@ -1410,15 +1410,12 @@ mod slow_network_tests {
     use gpui_kit::{AppContext as _, Entity, SharedString, TestAppContext};
     use mattermost::{
         Client, PostId, TeamId, User,
-        testing::{Network, Reply, Request, SlowServer},
+        testing::{Gate, Network, Reply, Request, SlowServer},
     };
     use serde_json::json;
 
     use super::{Session, SessionEvent};
     use crate::{EmojiStore, LoadState, ThreadFilter, TimelineKind};
-
-    /// One round trip on a poor mobile or satellite link.
-    const ROUND_TRIP: Duration = Duration::from_millis(400);
 
     fn route(request: &Request) -> Reply {
         let path = request.path().split('?').next().unwrap_or_default();
@@ -1478,13 +1475,11 @@ mod slow_network_tests {
         }
     }
 
-    fn arrival(server: &SlowServer, path: &str) -> Duration {
+    fn requested(server: &SlowServer, method: &str, path: &str) -> bool {
         server
             .requests()
             .iter()
-            .find(|r| r.path().split('?').next() == Some(path))
-            .unwrap_or_else(|| panic!("{path} was never requested"))
-            .at()
+            .any(|r| r.method() == method && r.path().split('?').next() == Some(path))
     }
 
     #[gpui_kit::test]
@@ -1749,71 +1744,93 @@ mod slow_network_tests {
 
     #[gpui_kit::test]
     fn the_sidebar_fills_in_one_round_trip(cx: &mut TestAppContext) {
-        let server = SlowServer::start(Network::new(ROUND_TRIP), route);
+        let teams = Gate::default();
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let teams = teams.clone();
+            move |request| {
+                let reply = route(request);
+                if request.method() == "GET" && request.path() == "/api/v4/users/me/teams" {
+                    reply.wait_for(teams.clone())
+                } else {
+                    reply
+                }
+            }
+        });
         let session = start(&server, cx);
         wait_until(cx, |cx| {
-            session.read_with(cx, |s, _| s.is_loaded() && s.teams_loaded())
+            requested(&server, "GET", "/api/v4/users/me/teams")
+                && session.read_with(cx, |s, _| s.is_loaded())
         });
-
-        // The remembered team's channels and read state were asked for
-        // before the team list came back, not after it.
-        let teams = arrival(&server, "/api/v4/users/me/teams");
-        for path in [
-            "/api/v4/users/me/teams/team/channels",
-            "/api/v4/users/me/teams/team/channels/members",
-        ] {
-            let at = arrival(&server, path);
-            assert!(
-                at < teams + ROUND_TRIP / 2,
-                "{path} at {at:?}, teams at {teams:?}"
-            );
-        }
+        // The remembered team's channels and read state arrived while the
+        // team list was still held back.
         session.read_with(cx, |s, _| {
+            assert!(!s.teams_loaded());
             assert!(s.channel(&"town".into()).is_some());
+        });
+        teams.open();
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.teams_loaded()));
+        session.read_with(cx, |s, _| {
             assert_eq!(s.team().map(|t| t.display_name.as_str()), Some("Team"));
         });
     }
 
     #[gpui_kit::test]
     fn the_last_conversation_loads_alongside_the_sidebar(cx: &mut TestAppContext) {
-        let server = SlowServer::start(Network::new(ROUND_TRIP), route);
+        let channels = Gate::default();
+        let authors = Gate::default();
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let channels = channels.clone();
+            let authors = authors.clone();
+            move |request| {
+                let reply = route(request);
+                match (
+                    request.method(),
+                    request.path().split('?').next().unwrap_or_default(),
+                ) {
+                    (
+                        "GET",
+                        "/api/v4/users/me/teams/team/channels"
+                        | "/api/v4/users/me/teams/team/channels/members",
+                    ) => reply.wait_for(channels.clone()),
+                    ("POST", "/api/v4/users/ids" | "/api/v4/users/status/ids") => {
+                        reply.wait_for(authors.clone())
+                    }
+                    _ => reply,
+                }
+            }
+        });
         let session = start(&server, cx);
-        // What the workspace does at startup for the conversation open last.
         let timeline = session.update(cx, |s, cx| {
             s.timeline(TimelineKind::Channel("town".into()), cx)
         });
         wait_until(cx, |cx| {
-            session.read_with(cx, |s, _| s.is_loaded())
-                && timeline.read_with(cx, |t, _| t.state() == &LoadState::Loaded)
+            timeline.read_with(cx, |t, _| t.state() == &LoadState::Loaded)
         });
-        // Its posts were asked for alongside the channel list, not once the
-        // list had confirmed the channel.
-        let channels = arrival(&server, "/api/v4/users/me/teams/team/channels");
-        let posts = arrival(&server, "/api/v4/channels/town/posts");
-        assert!(
-            posts < channels + ROUND_TRIP / 2,
-            "posts at {posts:?}, channels at {channels:?}"
-        );
+        // Posts do not wait for the channel lists to confirm the channel.
+        session.read_with(cx, |s, _| assert!(!s.is_loaded()));
         timeline.read_with(cx, |t, _| assert_eq!(t.entries().len(), 1));
+        channels.open();
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
 
-        // Then the authors: their profiles and presence in one round trip.
-        let directory = session.read_with(cx, |s, _| s.directory().clone());
-        wait_until(cx, |cx| {
-            directory.read_with(cx, |d, _| d.user(&"ann".into()).is_some())
+        // Both author requests must start before either response is released.
+        wait_until(cx, |_| {
+            requested(&server, "POST", "/api/v4/users/ids")
+                && server
+                    .requests()
+                    .iter()
+                    .filter(|r| r.method() == "POST" && r.path() == "/api/v4/users/status/ids")
+                    .count()
+                    == 2
         });
-        let users = arrival(&server, "/api/v4/users/ids");
-        // The first presence request is the user's own, at startup.
-        let statuses = server
-            .requests()
-            .iter()
-            .filter(|r| r.path() == "/api/v4/users/status/ids")
-            .map(|r| r.at())
-            .max()
-            .unwrap();
-        assert!(
-            statuses.abs_diff(users) < ROUND_TRIP / 2,
-            "{users:?} vs {statuses:?}"
-        );
+        let directory = session.read_with(cx, |s, _| s.directory().clone());
+        directory.read_with(cx, |d, _| assert!(d.user(&"ann".into()).is_none()));
+        authors.open();
+        wait_until(cx, |cx| {
+            directory.read_with(cx, |d, _| {
+                d.user(&"ann".into()).is_some()
+                    && d.status(&"ann".into()) == mattermost::Status::Online
+            })
+        });
     }
 
     #[gpui_kit::test]
@@ -2023,9 +2040,20 @@ mod slow_network_tests {
         }
     }
 
-    fn leave_design(status: u16, cx: &mut TestAppContext) -> (SlowServer, Entity<Session>) {
-        let server = SlowServer::start(Network::new(Duration::from_millis(20)), move |request| {
-            leave_route(request, status)
+    fn leave_design(status: u16, cx: &mut TestAppContext) -> (SlowServer, Entity<Session>, Gate) {
+        let leave = Gate::default();
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let leave = leave.clone();
+            move |request| {
+                let reply = leave_route(request, status);
+                if request.method() == "DELETE"
+                    && request.path() == "/api/v4/channels/design/members/me"
+                {
+                    reply.wait_for(leave.clone())
+                } else {
+                    reply
+                }
+            }
         });
         let session = start(&server, cx);
         wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
@@ -2041,12 +2069,13 @@ mod slow_network_tests {
         session.update(cx, |s, cx| s.leave_channel(&"design".into(), cx));
         // Gone from the sidebar before the server answers.
         session.read_with(cx, |s, _| assert!(s.channel(&"design".into()).is_none()));
-        (server, session)
+        (server, session, leave)
     }
 
     #[gpui_kit::test]
     fn leaving_a_channel_takes_it_out_of_the_sidebar(cx: &mut TestAppContext) {
-        let (server, session) = leave_design(200, cx);
+        let (server, session, leave) = leave_design(200, cx);
+        leave.open();
         // Its thread leaves the Threads pane once the server agrees.
         let threads = session.read_with(cx, |s, _| s.threads().clone());
         wait_until(cx, |cx| {
@@ -2130,8 +2159,9 @@ mod slow_network_tests {
 
     #[gpui_kit::test]
     fn a_refused_leave_puts_the_channel_back(cx: &mut TestAppContext) {
-        let (_server, session) = leave_design(403, cx);
+        let (_server, session, leave) = leave_design(403, cx);
         let failures = failures(&session, cx);
+        leave.open();
         wait_until(cx, |cx| {
             session.read_with(cx, |s, _| s.channel(&"design".into()).is_some())
         });
@@ -2145,32 +2175,66 @@ mod slow_network_tests {
 
     #[gpui_kit::test]
     fn a_refused_leave_after_a_team_switch_stays_with_its_team(cx: &mut TestAppContext) {
-        // On a slow link, the long refusal arrives well after the other
-        // team's short channel lists.
-        let network = Network::new(Duration::ZERO).bandwidth(1_000_000);
-        let server = SlowServer::start(network, |request| {
-            match request.path().split('?').next().unwrap_or_default() {
-                "/api/v4/users/me/teams/other/channels"
-                | "/api/v4/users/me/teams/other/channels/members" => Reply::json(json!([])),
-                "/api/v4/channels/design/members/me" => Reply::json(json!({
+        let leave = Gate::default();
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let leave = leave.clone();
+            move |request| match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("GET", "/api/v4/users/me/teams") => Reply::json(json!([
+                    { "id": "team", "name": "team" },
+                    { "id": "other", "name": "other" },
+                ])),
+                (
+                    "GET",
+                    "/api/v4/users/me/teams/other/channels"
+                    | "/api/v4/users/me/teams/other/channels/members",
+                ) => Reply::json(json!([])),
+                ("DELETE", "/api/v4/channels/design/members/me") => Reply::json(json!({
                     "message": "You can't leave this channel.",
-                    "detail": "x".repeat(1_000_000),
                 }))
-                .status(403),
+                .status(403)
+                .wait_for(leave.clone()),
                 _ => leave_route(request, 403),
             }
         });
         let session = start(&server, cx);
-        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
-        let failures = failures(&session, cx);
-        session.update(cx, |s, cx| {
-            s.leave_channel(&"design".into(), cx);
-            s.select_team("other".into(), cx);
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.is_loaded() && s.teams_loaded())
         });
-        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        session.read_with(cx, |s, _| assert!(s.channel(&"design".into()).is_some()));
+        let failures = failures(&session, cx);
+        session.update(cx, |s, cx| s.leave_channel(&"design".into(), cx));
+        wait_until(cx, |_| {
+            requested(&server, "DELETE", "/api/v4/channels/design/members/me")
+        });
+        session.update(cx, |s, cx| s.select_team("other".into(), cx));
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| {
+                s.is_loaded()
+                    && s.team()
+                        .is_some_and(|team| team.id == TeamId::from("other"))
+            })
+        });
+        assert!(requested(
+            &server,
+            "GET",
+            "/api/v4/users/me/teams/other/channels"
+        ));
+        assert!(requested(
+            &server,
+            "GET",
+            "/api/v4/users/me/teams/other/channels/members"
+        ));
         assert!(failures.borrow().is_empty(), "refused before the switch");
+        leave.open();
         wait_until(cx, |_| !failures.borrow().is_empty());
-        session.read_with(cx, |s, _| assert!(s.channel(&"design".into()).is_none()));
+        assert_eq!(failures.borrow().len(), 1);
+        session.read_with(cx, |s, _| {
+            assert_eq!(s.team().map(|team| team.id.as_str()), Some("other"));
+            assert!(s.channel(&"design".into()).is_none());
+        });
     }
 
     #[gpui_kit::test]
@@ -2286,7 +2350,10 @@ mod slow_network_tests {
         // The first lookup fails through all of its retries.
         let lookups = Arc::new(AtomicUsize::new(0));
         let seen = lookups.clone();
-        let server = SlowServer::start(Network::new(Duration::from_millis(20)), move |_request| {
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), move |request| {
+            if request.method() != "POST" || request.path() != "/api/v4/emoji/names" {
+                return Reply::not_found();
+            }
             if seen.fetch_add(1, Ordering::SeqCst) < 4 {
                 return Reply::json(json!({ "message": "Bad gateway" })).status(502);
             }
@@ -2392,7 +2459,7 @@ mod slow_network_tests {
         let lookups = server
             .requests()
             .iter()
-            .filter(|r| r.path() == "/api/v4/emoji/names")
+            .filter(|r| r.method() == "POST" && r.path() == "/api/v4/emoji/names")
             .count();
         assert_eq!(lookups, 1);
     }

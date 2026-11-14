@@ -17,6 +17,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
+    sync::watch,
     task::JoinHandle,
 };
 
@@ -85,6 +86,22 @@ impl Request {
     }
 }
 
+/// Hold responses until the test opens the gate.
+#[derive(Clone, Debug)]
+pub struct Gate(watch::Sender<bool>);
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self(watch::channel(false).0)
+    }
+}
+
+impl Gate {
+    pub fn open(&self) {
+        self.0.send_replace(true);
+    }
+}
+
 /// What the server sends back.
 #[derive(Clone, Debug)]
 pub struct Reply {
@@ -92,6 +109,7 @@ pub struct Reply {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     stall_after: Option<usize>,
+    gate: Option<Gate>,
 }
 
 impl Reply {
@@ -105,6 +123,7 @@ impl Reply {
             headers: Vec::new(),
             body,
             stall_after: None,
+            gate: None,
         }
     }
 
@@ -119,6 +138,12 @@ impl Reply {
 
     pub fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Hold the entire response until `gate` opens, without blocking I/O workers.
+    pub fn wait_for(mut self, gate: Gate) -> Self {
+        self.gate = Some(gate);
         self
     }
 
@@ -219,6 +244,10 @@ async fn serve(
         log.lock().unwrap().push(request.clone());
 
         let reply = route(&request);
+        if let Some(gate) = &reply.gate {
+            let mut open = gate.0.subscribe();
+            open.wait_for(|open| *open).await.expect("gate stays alive");
+        }
         tokio::time::sleep(network.latency).await;
         let mut head = format!(
             "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n",
