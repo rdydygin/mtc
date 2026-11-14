@@ -7,6 +7,18 @@ use crate::{
     CustomEmojis, Directory, EmojiStore, PreparedMessage, prepare::custom_emoji_names, retry::retry,
 };
 
+/// Mattermost persists props, unlike its short-lived pending_post_id echo.
+pub(crate) const CLIENT_NONCE: &str = "mtc_pending_id";
+
+pub(crate) fn send_ids(post: &Post) -> impl Iterator<Item = &str> {
+    post.props
+        .get(CLIENT_NONCE)
+        .and_then(|v| v.as_str())
+        .into_iter()
+        .chain(Some(post.pending_post_id.as_str()))
+        .filter(|id| !id.is_empty())
+}
+
 /// Posts requested per page. Large enough to fill a tall window, small
 /// enough to decode in well under a frame.
 pub const PAGE_SIZE: usize = 60;
@@ -36,7 +48,7 @@ impl TimelineKind {
     }
 
     /// Whether `post` belongs in this conversation.
-    fn accepts(&self, post: &Post) -> bool {
+    pub(crate) fn accepts(&self, post: &Post) -> bool {
         match self {
             Self::Channel(channel) => &post.channel_id == channel && !post.is_reply(),
             Self::Thread { root, .. } => &post.id == root || &post.root_id == root,
@@ -211,6 +223,9 @@ pub struct Timeline {
     /// Confirmed deletes stay hidden until outstanding requests settle.
     deleted: HashSet<PostId>,
     requests_in_flight: usize,
+    catch_up_queued: bool,
+    /// Freeze the gap boundary before newly connected socket traffic advances it.
+    catch_up_since: Option<Millis>,
     state: LoadState,
     has_older: bool,
     loading_older: bool,
@@ -249,6 +264,8 @@ impl Timeline {
             revision: 0,
             deleted: HashSet::new(),
             requests_in_flight: 0,
+            catch_up_queued: false,
+            catch_up_since: None,
             state: LoadState::NotLoaded,
             has_older: true,
             loading_older: false,
@@ -357,7 +374,7 @@ impl Timeline {
                         cx.notify();
                     }
                 }
-                this.finish_request();
+                this.finish_request(cx);
             });
         }));
     }
@@ -373,6 +390,19 @@ impl Timeline {
         self.reset_pagination();
         self.has_older = matches!(self.kind, TimelineKind::Channel(_)) && fetched >= PAGE_SIZE;
         let entries = self.adopt(prepared);
+        if self.catch_up_queued && self.catch_up_since.is_none() {
+            // An initial load had no confirmed boundary when hello arrived.
+            // Use its REST snapshot, excluding socket posts received meanwhile.
+            self.catch_up_since = Some(
+                entries
+                    .iter()
+                    .map(Entry::changed_at)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_sub(1_000)
+                    .max(0),
+            );
+        }
         let ids: HashSet<_> = entries.iter().map(|e| e.id().clone()).collect();
         // Keep optimistic posts and changes made while the request was in flight.
         self.entries.retain(|e| {
@@ -441,7 +471,7 @@ impl Timeline {
             };
             let _ = this.update(cx, |this, cx| {
                 if generation != this.pagination_generation {
-                    this.finish_request();
+                    this.finish_request(cx);
                     return;
                 }
                 this.loading_older = false;
@@ -468,28 +498,38 @@ impl Timeline {
                         log::warn!("loading older posts: {err:#}");
                     }
                 }
-                this.finish_request();
+                this.finish_request(cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
-    /// Catch up after a reconnect: apply everything that changed while the
-    /// socket was down.
+    /// Catch up on connection, after any overlapping REST reads settle.
     pub fn catch_up(&mut self, cx: &mut Context<Self>) {
+        if self.requests_in_flight > 0 {
+            if !self.catch_up_queued {
+                self.catch_up_since = self.confirmed_since();
+            }
+            self.catch_up_queued = true;
+            return;
+        }
         match self.state {
             LoadState::Loaded => {}
             // The first load gave up while the network was down.
             LoadState::Failed(_) => return self.reload(cx),
             LoadState::NotLoaded | LoadState::Loading => return,
         }
+        let since = self
+            .catch_up_since
+            .take()
+            .or_else(|| self.confirmed_since());
         let TimelineKind::Channel(channel) = &self.kind else {
             // A thread is small; reloading it is simpler than merging.
             self.reload(cx);
             return;
         };
-        let Some(since) = self.confirmed_since() else {
+        let Some(since) = since else {
             self.reload(cx);
             return;
         };
@@ -505,9 +545,7 @@ impl Timeline {
                     for post in list.into_chronological() {
                         if this.kind.accepts(&post) {
                             let entry = Entry::new(post, Delivery::Sent, &this.custom_emoji);
-                            if let Some(event) = this.merge(entry, Some(revision)) {
-                                events.push(event);
-                            }
+                            events.extend(this.merge(entry, Some(revision)));
                         }
                     }
                     if !events.is_empty() {
@@ -523,7 +561,7 @@ impl Timeline {
                         cx.notify();
                     }
                 }
-                this.finish_request();
+                this.finish_request(cx);
             });
         })
         .detach();
@@ -550,7 +588,7 @@ impl Timeline {
             return;
         }
         let entry = Entry::new(post, Delivery::Sent, &self.custom_emoji);
-        if let Some(event) = self.merge(entry, revision) {
+        for event in self.merge(entry, revision) {
             let range = match &event {
                 TimelineEvent::Updated(ix) => *ix..ix + 1,
                 TimelineEvent::Spliced { old, new_count } => old.start..old.start + new_count,
@@ -563,7 +601,37 @@ impl Timeline {
     }
 
     /// Merge server state without undoing newer posts.
-    fn merge(&mut self, mut entry: Entry, revision: Option<u64>) -> Option<TimelineEvent> {
+    fn merge(&mut self, entry: Entry, revision: Option<u64>) -> Vec<TimelineEvent> {
+        let mut events = Vec::new();
+        // REST may have already loaded the real-id row without an echo ID.
+        // Remove the optimistic twin even when merging the real row is a no-op
+        // (or it holds a newer edit). Consumers need the deletion splice too.
+        if let Some(real_ix) = self.position(entry.id())
+            && let Some(ix) = self.optimistic_position(&entry.post)
+            && ix != real_ix
+        {
+            self.entries.remove(ix);
+            events.push(TimelineEvent::Spliced {
+                old: ix..ix + 1,
+                new_count: 0,
+            });
+        }
+        events.extend(self.merge_post(entry, revision));
+        events
+    }
+
+    fn optimistic_position(&self, post: &Post) -> Option<usize> {
+        self.entries.iter().position(|e| {
+            e.delivery != Delivery::Sent
+                && e.post.channel_id == post.channel_id
+                && e.post.root_id == post.root_id
+                && e.post.user_id == post.user_id
+                && send_ids(post)
+                    .any(|id| e.id().as_str() == id || send_ids(&e.post).any(|other| other == id))
+        })
+    }
+
+    fn merge_post(&mut self, mut entry: Entry, revision: Option<u64>) -> Option<TimelineEvent> {
         if entry.post.delete_at > 0 {
             if self.requests_in_flight > 0 {
                 self.deleted.insert(entry.id().clone());
@@ -579,12 +647,9 @@ impl Timeline {
         if self.deleted.contains(entry.id()) {
             return None;
         }
-        let pending = PostId::from(entry.post.pending_post_id.as_str());
-        let ix = self.position(entry.id()).or_else(|| {
-            (!pending.is_empty())
-                .then(|| self.position(&pending))
-                .flatten()
-        });
+        let ix = self
+            .position(entry.id())
+            .or_else(|| self.optimistic_position(&entry.post));
         if let Some(ix) = ix {
             let current = &self.entries[ix];
             if current.delivery == Delivery::Sent {
@@ -646,10 +711,13 @@ impl Timeline {
         self.requests_in_flight += 1;
     }
 
-    fn finish_request(&mut self) {
+    fn finish_request(&mut self, cx: &mut Context<Self>) {
         self.requests_in_flight -= 1;
         if self.requests_in_flight == 0 {
             self.deleted.clear();
+            if std::mem::take(&mut self.catch_up_queued) {
+                self.catch_up(cx);
+            }
         }
     }
 
@@ -975,10 +1043,10 @@ mod tests {
             // A root not loaded yet may still be present in an outstanding page.
             t.delete(&post("b", 20), cx);
             assert_eq!(t.deleted.len(), 1);
-            t.finish_request();
+            t.finish_request(cx);
             t.upsert(post("b", 20), cx);
             assert!(t.entries().is_empty());
-            t.finish_request();
+            t.finish_request(cx);
             assert!(t.deleted.is_empty());
             assert_eq!(t.requests_in_flight, 0);
         });
@@ -1109,7 +1177,7 @@ mod tests {
             t.delete(&post("b", 20), cx);
             t.upsert(post("b", 20), cx);
             assert!(t.entries().is_empty());
-            t.finish_request();
+            t.finish_request(cx);
         });
     }
 
@@ -1144,7 +1212,7 @@ mod tests {
             );
             assert_eq!(t.entries()[0].post().message, "live edit");
             assert_eq!(t.entries()[2].delivery(), Delivery::Pending);
-            t.finish_request();
+            t.finish_request(cx);
         });
     }
 

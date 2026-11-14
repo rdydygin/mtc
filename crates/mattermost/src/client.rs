@@ -450,6 +450,7 @@ impl Client {
         root: Option<&PostId>,
         pending_post_id: &str,
         file_ids: &[String],
+        props: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Post> {
         let body = json!({
             "channel_id": channel,
@@ -457,6 +458,7 @@ impl Client {
             "root_id": root.map(|r| r.as_str()).unwrap_or(""),
             "pending_post_id": pending_post_id,
             "file_ids": file_ids,
+            "props": props,
         });
         self.post("posts".into(), body).await
     }
@@ -468,6 +470,11 @@ impl Client {
             Some(json!({ "message": message })),
         )
         .await
+    }
+
+    /// Fetch one post to reconcile an ambiguous write outcome.
+    pub async fn get_post(&self, post: &PostId) -> Result<Post> {
+        self.get(format!("posts/{post}")).await
     }
 
     pub async fn delete_post(&self, post: &PostId) -> Result<()> {
