@@ -154,12 +154,19 @@ pub fn is_automatic() -> bool {
     persist::read_with(|state| state.updates) == Updates::Automatic
 }
 
-/// The feed to read: `MTC_UPDATE_FEED`, for trying an update from a fork or
-/// a local server, or the official releases.
+/// Only debug builds may replace the official release feed.
 fn feed_override() -> Option<String> {
-    std::env::var("MTC_UPDATE_FEED")
-        .ok()
-        .filter(|feed| !feed.is_empty())
+    let feed = std::env::var("MTC_UPDATE_FEED").ok()?;
+    if feed.is_empty() {
+        return None;
+    }
+    match manifest::validate_override(&feed, cfg!(debug_assertions)) {
+        Ok(()) => Some(feed),
+        Err(err) => {
+            log::warn!("ignoring MTC_UPDATE_FEED: {err:#}");
+            None
+        }
+    }
 }
 
 /// Whether this copy can install updates itself, rather than only say a new

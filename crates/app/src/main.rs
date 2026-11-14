@@ -19,6 +19,8 @@ mod emoji_picker;
 mod extensions;
 mod http;
 mod image_viewer;
+#[cfg(any(not(target_os = "macos"), test))]
+mod instance;
 mod keychain;
 mod lang_icon;
 mod links;
@@ -63,6 +65,35 @@ fn main() {
         urls
     };
 
+    // Lock before reading profile state or publishing a rendezvous endpoint.
+    // macOS bundles use LaunchServices; direct development launches stay usable.
+    #[cfg(not(target_os = "macos"))]
+    let _profile_lock = if std::env::var("MTC_ALLOW_MULTIPLE").as_deref() == Ok("1") {
+        log::warn!(
+            "MTC_ALLOW_MULTIPLE=1: profile locking disabled; shared state may be overwritten"
+        );
+        None
+    } else {
+        let Some(directory) = dirs::config_dir().map(|path| path.join("mtc")) else {
+            log::error!("cannot locate the mtc profile directory; refusing to start");
+            return;
+        };
+        match instance::acquire(&directory) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                let outcome = deep_link::wait_for_running(&launch_urls);
+                log::info!(
+                    "mtc is already running for this profile (handoff: {outcome:?}); exiting"
+                );
+                return;
+            }
+            Err(err) => {
+                log::error!("cannot lock the mtc profile ({err}); refusing to start");
+                return;
+            }
+        }
+    };
+
     // SSO callback URLs arrive before or after launch (from macOS, or from
     // processes the browser starts elsewhere); forward them into the app
     // once it is running.
@@ -93,14 +124,6 @@ fn main() {
             cache::flush();
         })
         .detach();
-        cx.spawn(async move |cx| {
-            use futures::StreamExt as _;
-            while let Some(urls) = urls_rx.next().await {
-                cx.update(|cx| sso::handle_open_urls(urls, cx));
-            }
-        })
-        .detach();
-
         // Window geometry is a platform boundary, so it is in pixels.
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -111,10 +134,23 @@ fn main() {
             window_min_size: Some(size(px(720.), px(480.))),
             ..TitleBar::window_options()
         };
-        gpui_kit::open_window(options, cx, |window, cx| {
+        let (main_window, _) = gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| AppRoot::new(window, cx))
         })
         .expect("failed to open the main window");
-        cx.activate(true);
+        let _ = main_window.update(cx, |_, window, _| window.activate_window());
+        cx.spawn(async move |cx| {
+            use futures::StreamExt as _;
+            while let Some(urls) = urls_rx.next().await {
+                cx.update(|cx| {
+                    // An empty authenticated v2 handoff is an activation request.
+                    let _ = main_window.update(cx, |_, window, _| window.activate_window());
+                    if !urls.is_empty() {
+                        sso::handle_open_urls(urls, cx);
+                    }
+                });
+            }
+        })
+        .detach();
     });
 }

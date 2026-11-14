@@ -70,6 +70,12 @@ window is from an older version with an incompatible sign-in protocol, the new p
 exits without forwarding the link or starting a second window. Quit the old mtc, reopen
 mtc, and retry sign-in, or paste the link into the waiting sign-in panel.
 
+Linux and Windows hold an exclusive profile lock until exit. An ordinary second
+launch requests activation through the authenticated v2 handoff and exits. It retries
+for up to three seconds if the first instance is still publishing its listener. If the
+running instance cannot be contacted, the second launch reports that and exits;
+it never opens another writer. macOS app bundles use LaunchServices.
+
 If the browser can't hand control back, copy the address of the page it ends on
 (`…/login/desktop?client_token=…&server_token=…`) and paste it into mtc. On older
 servers, copy the "click here" link on the final page (`mmauth://callback?…`) instead. Servers
@@ -395,8 +401,26 @@ redirects to the newest release that isn't a draft or pre-release, so publishing
 release is all it takes to ship an update. Release downloads, unlike the GitHub API,
 aren't rate-limited per address. To try an update end to end, bump the version, bundle
 it, serve a `latest.json` that points at its zip, and start an older build with
-`MTC_UPDATE_FEED=http://…/latest.json` (debug builds only check on their own when it is
-set).
+`MTC_UPDATE_FEED=http://127.0.0.1:8000/latest.json` on a **debug build**
+(bundle with `script/bundle-macos --debug`). Debug builds only check on their own
+when this variable is set. Release builds ignore it and log why;
+they always use the official feed. Start the test bundle directly with
+
+```sh
+MTC_UPDATE_FEED=http://127.0.0.1:8000/latest.json target/debug/bundle/mtc.app/Contents/MacOS/mtc
+```
+
+The feed, declared downloads, and every redirect hop must use HTTPS, regardless
+of hostname. Only debug overrides starting on loopback HTTP may use HTTP to
+localhost or a loopback IP for local testing. HTTPS can never redirect or point
+to an HTTP download, including loopback. Redirect counts are limited. Release
+builds trust the fixed official HTTPS feed; archive integrity is checked against
+its SHA-256 plus the bundle identifier, version, and signature.
+
+On Linux and Windows, `MTC_ALLOW_MULTIPLE=1 cargo run -p mtc` bypasses the profile
+lock for development; use it only with throwaway profile data, since processes then
+share state and caches. Normal `cargo run` uses the same lock as release builds.
+macOS direct `cargo run` launches remain unlocked.
 
 To run a throwaway server locally:
 `docker run --platform linux/amd64 -d --name mtc-mattermost -p 8065:8065 mattermost/mattermost-preview`.

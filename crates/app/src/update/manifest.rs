@@ -44,7 +44,7 @@ impl Manifest {
             if !is_sha256(&download.sha256) {
                 bail!("release feed has a malformed checksum");
             }
-            if !is_secure(&download.url) {
+            if !is_secure(&download.url, cfg!(debug_assertions)) {
                 bail!("release feed offers a download that isn’t over HTTPS");
             }
         }
@@ -53,16 +53,49 @@ impl Manifest {
 }
 
 /// HTTPS, or plain HTTP to this computer, for trying an update locally.
-fn is_secure(url: &str) -> bool {
+pub(super) fn is_secure(url: &str, allow_loopback: bool) -> bool {
     let Ok(url) = url::Url::parse(url) else {
         return false;
     };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
     match (url.scheme(), url.host()) {
-        ("https", _) => true,
-        ("http", Some(url::Host::Domain(name))) => name == "localhost",
-        ("http", Some(url::Host::Ipv4(ip))) => ip.is_loopback(),
-        ("http", Some(url::Host::Ipv6(ip))) => ip.is_loopback(),
+        ("https", Some(_)) => true,
+        ("http", Some(url::Host::Domain(name))) => allow_loopback && name == "localhost",
+        ("http", Some(url::Host::Ipv4(ip))) => allow_loopback && ip.is_loopback(),
+        ("http", Some(url::Host::Ipv6(ip))) => allow_loopback && ip.is_loopback(),
         _ => false,
+    }
+}
+
+/// Overrides are a development tool, never a release trust root.
+pub(super) fn validate_override(feed: &str, debug: bool) -> Result<()> {
+    anyhow::ensure!(debug, "release builds always use the official feed");
+    anyhow::ensure!(
+        is_secure(feed, debug),
+        "the feed must use HTTPS or loopback HTTP"
+    );
+    Ok(())
+}
+
+/// Hosts may change as GitHub moves assets between CDNs. Trust the HTTPS
+/// feed and its archive checksum, rather than a list of CDN hostnames.
+/// A secure source can never downgrade, including to loopback HTTP.
+pub(super) fn allowed_url(source: &url::Url, target: &url::Url, debug: bool) -> bool {
+    is_secure(target.as_str(), debug && source.scheme() == "http")
+}
+
+impl Manifest {
+    pub(super) fn validate_downloads(&self, feed: &url::Url) -> Result<()> {
+        for download in self.downloads.values() {
+            let target = url::Url::parse(&download.url)?;
+            anyhow::ensure!(
+                allowed_url(feed, &target, cfg!(debug_assertions)),
+                "release downloads require HTTPS (loopback HTTP only for debug testing)"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -136,6 +169,133 @@ mod tests {
     }
 
     #[test]
+    fn feed_override_policy_table() {
+        for (feed, debug_ok) in [
+            (FEED_URL, true),
+            ("https://example.com/latest.json", true),
+            ("http://localhost:8000/latest.json", true),
+            ("http://127.0.0.2:8000/latest.json", true),
+            ("http://[::1]:8000/latest.json", true),
+            ("http://example.com/latest.json", false),
+            ("http://localhost.evil/latest.json", false),
+            ("http://192.168.1.2/latest.json", false),
+            ("file:///tmp/latest.json", false),
+            ("garbage", false),
+        ] {
+            assert_eq!(validate_override(feed, true).is_ok(), debug_ok, "{feed}");
+            assert!(validate_override(feed, false).is_err(), "{feed}");
+        }
+    }
+
+    #[test]
+    fn download_and_redirect_policy_table() {
+        for (source, target, debug, allowed) in [
+            (
+                FEED_URL,
+                "https://release-assets.githubusercontent.com/archive.zip",
+                false,
+                true,
+            ),
+            (
+                FEED_URL,
+                "https://any-other-cdn.example/archive.zip",
+                false,
+                true,
+            ),
+            (FEED_URL, "https://example.com:444/archive.zip", false, true),
+            (FEED_URL, "http://example.com/archive.zip", false, false),
+            (FEED_URL, "http://127.0.0.1/archive.zip", true, false),
+            (
+                FEED_URL,
+                "https://user:password@example.com/archive.zip",
+                false,
+                false,
+            ),
+            (FEED_URL, "ftp://example.com/archive.zip", false, false),
+            (FEED_URL, "file:///tmp/archive.zip", false, false),
+            (
+                "http://127.0.0.1:8000/feed",
+                "http://localhost:8001/archive.zip",
+                true,
+                true,
+            ),
+            (
+                "http://127.0.0.1:8000/feed",
+                "http://[::1]/archive.zip",
+                true,
+                true,
+            ),
+            (
+                "http://127.0.0.1:8000/feed",
+                "http://localhost/archive.zip",
+                false,
+                false,
+            ),
+            (
+                "http://127.0.0.1:8000/feed",
+                "http://example.com/archive.zip",
+                true,
+                false,
+            ),
+            (
+                "http://127.0.0.1:8000/feed",
+                "https://example.com/archive.zip",
+                true,
+                true,
+            ),
+            (
+                "https://example.com/redirect",
+                "http://localhost/archive.zip",
+                true,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                allowed_url(
+                    &url::Url::parse(source).unwrap(),
+                    &url::Url::parse(target).unwrap(),
+                    debug
+                ),
+                allowed,
+                "{source} -> {target}, debug={debug}"
+            );
+        }
+        let feed = url::Url::parse(FEED_URL).unwrap();
+        for (target, allowed) in [
+            (
+                "https://release-assets.githubusercontent.com/archive.zip",
+                true,
+            ),
+            ("https://arbitrary.example/archive.zip", true),
+            ("http://127.0.0.1/archive.zip", false),
+            ("http://example.com/archive.zip", false),
+            ("ftp://example.com/archive.zip", false),
+        ] {
+            let mut manifest = Manifest::parse(FEED.as_bytes()).unwrap();
+            manifest.downloads.get_mut("macos-universal").unwrap().url = target.into();
+            assert_eq!(
+                manifest.validate_downloads(&feed).is_ok(),
+                allowed,
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirected_https_manifest_rejects_a_loopback_download() {
+        let mut manifest = Manifest::parse(FEED.as_bytes()).unwrap();
+        manifest.downloads.get_mut("macos-universal").unwrap().url =
+            "http://127.0.0.1/archive.zip".into();
+        let original = url::Url::parse("http://127.0.0.1/latest.json").unwrap();
+        let final_url = url::Url::parse("https://cdn.example/latest.json").unwrap();
+        assert_eq!(
+            manifest.validate_downloads(&original).is_ok(),
+            cfg!(debug_assertions)
+        );
+        assert!(manifest.validate_downloads(&final_url).is_err());
+    }
+
+    #[test]
     fn parses_the_feed_the_release_workflow_writes() {
         let manifest = Manifest::parse(FEED.as_bytes()).unwrap();
         assert_eq!(manifest.version, v("0.2.0"));
@@ -159,7 +319,10 @@ mod tests {
             "https://github.com/rdydygin/mtc/releases/download",
             "http://127.0.0.1:8000",
         );
-        assert!(Manifest::parse(local.as_bytes()).is_ok());
+        assert_eq!(
+            Manifest::parse(local.as_bytes()).is_ok(),
+            cfg!(debug_assertions)
+        );
         assert!(Manifest::parse(b"<html>Not Found</html>").is_err());
     }
 
