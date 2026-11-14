@@ -18,14 +18,16 @@ company's single sign-on.
 mtc keeps itself up to date. A few seconds after launch, and every six hours while it
 runs, it looks for a new release. On macOS it downloads the new `mtc.app` in the
 background, checks it against the release's SHA-256 checksum, its bundle identifier,
-version, and signature, and puts it in place of the running copy. The new version
-starts the next time you open mtc, or right away with **Restart to update** in the
-title bar.
+version, and signature, and atomically exchanges it with the running copy on
+filesystems that support it. Other filesystems keep a backup during replacement
+and try to restore it if installation fails. If restoration fails, the backup’s
+location is reported for manual recovery. The new version starts the next time you
+open mtc, or right away with **Restart to update** in the title bar.
 
 To install itself, mtc must run from a folder it can write to, such as `/Applications`
 or `~/Applications`. A copy opened straight from Downloads runs from a read-only
-location until it is moved; that copy, builds you made yourself, and Linux and Windows
-show **Update available** instead, linking to the release.
+location until it is moved; that copy, a symlink to an app, builds you made yourself,
+and Linux and Windows show **Update available** instead, linking to the release.
 
 **Settings** (⌘,) shows the version you're running under **Updates**, with a **Check for
 updates** button that reports the result in place: up to date, a new version, or why the
