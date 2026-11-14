@@ -517,6 +517,7 @@ impl TimelineView {
                     self.focus_composer(window, cx);
                 }
             }
+            PostAction::AddReaction => {} // Handled by the row’s retained picker.
             PostAction::ToggleReaction(name) => {
                 self.session
                     .update(cx, |s, cx| s.toggle_reaction(&post, &name, cx));
@@ -665,6 +666,8 @@ impl TimelineView {
             .client(session.client().clone())
             .directory(session.directory().clone())
             .custom_emoji(session.custom_emoji().clone())
+            .emoji_store(session.emoji_store().clone())
+            .reaction_focus_fallback(self.composer.focus_handle(cx))
             .into_any_element()
     }
 
@@ -1339,6 +1342,52 @@ mod tests {
                 v.timeline.read(cx).entries().len()
             );
         });
+    }
+
+    fn disappearing_reaction_trigger_returns_focus(virtualize: bool, cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (view, _) = open_channel(&server, cx);
+        let handle = cx.update(|cx| *cx.windows().last().unwrap());
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within("n119").click("add-reaction", cx);
+            assert_eq!(window.find("emoji-search").focused(), Some(true));
+            view.update(cx, |v, cx| {
+                if virtualize {
+                    v.scroller.update(cx, |s, cx| s.scroll_to_item(0, cx));
+                } else {
+                    v.timeline.update(cx, |t, cx| t.remove(&"n119".into(), cx));
+                }
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.find_all("emoji-search").is_empty(),
+                "the departed post's picker must close"
+            );
+            assert!(
+                view.read(cx).composer.focus_handle(cx).is_focused(window),
+                "the surviving composer must receive focus"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn removing_a_post_with_an_open_emoji_picker_restores_composer_focus(cx: &mut TestAppContext) {
+        disappearing_reaction_trigger_returns_focus(false, cx);
+    }
+
+    #[gpui_kit::test]
+    fn virtualizing_a_post_with_an_open_emoji_picker_restores_composer_focus(
+        cx: &mut TestAppContext,
+    ) {
+        disappearing_reaction_trigger_returns_focus(true, cx);
     }
 
     #[gpui_kit::test]
