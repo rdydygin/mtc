@@ -72,7 +72,11 @@ pub enum Event {
     UserUpdated(User),
     /// Channel membership or metadata changed (joined, left, created,
     /// renamed, a new direct message, …). Reload the channel list.
-    ChannelsChanged,
+    ChannelsChanged {
+        name: String,
+        team_id: TeamId,
+        user_id: UserId,
+    },
     /// Someone added a custom emoji to the server.
     EmojiAdded(Emoji),
     /// The current user saved preferences, possibly on another device.
@@ -310,7 +314,16 @@ pub(crate) fn parse_event(text: &str) -> Option<Event> {
         },
         "channel_created" | "channel_deleted" | "channel_restored" | "channel_updated"
         | "channel_converted" | "direct_added" | "group_added" | "user_added" | "user_removed"
-        | "added_to_team" | "leave_team" => Event::ChannelsChanged,
+        | "added_to_team" | "leave_team" => Event::ChannelsChanged {
+            name: raw.event.clone(),
+            team_id: data
+                .get("team_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| str_field(broadcast, "team_id"))
+                .into(),
+            user_id: str_field(data, "user_id").into(),
+        },
         "emoji_added" => Event::EmojiAdded(embedded(data, "emoji")?),
         "preferences_changed" => Event::PreferencesChanged(embedded(data, "preferences")?),
         "preference_changed" => Event::PreferencesChanged(vec![embedded(data, "preference")?]),
@@ -479,6 +492,22 @@ mod tests {
             );
         }
         assert!(parse_event(r#"{"event":"channel_member_updated","data":{}}"#).is_none());
+    }
+
+    #[test]
+    fn channel_changes_preserve_event_scope() {
+        for event in [
+            "channel_created",
+            "channel_updated",
+            "user_added",
+            "user_removed",
+        ] {
+            let text = serde_json::json!({ "event": event, "data": { "user_id": "ann" }, "broadcast": { "team_id": "team" } }).to_string();
+            assert!(
+                matches!(parse_event(&text), Some(Event::ChannelsChanged { name, team_id, user_id })
+                if name == event && team_id.as_str() == "team" && user_id.as_str() == "ann")
+            );
+        }
     }
 
     #[test]

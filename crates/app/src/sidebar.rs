@@ -1096,8 +1096,7 @@ pub fn favorite_label(favorite: bool) -> &'static str {
     }
 }
 
-/// Ask before leaving `channel`, then leave it. mtc can't browse for
-/// channels to join, so coming back takes another app or an invitation.
+/// Ask before leaving `channel`, explaining how to return.
 pub fn confirm_leave(
     session: &Entity<Session>,
     channel: &ChannelId,
@@ -1112,7 +1111,7 @@ pub fn confirm_leave(
     let description = if entry.kind() == ChannelType::Private {
         "This channel is private. Ask someone in it to add you back."
     } else {
-        "You can rejoin from Mattermost in your browser, or ask someone to add you back."
+        "You can rejoin with Browse channels in ⌘K."
     };
     let session = session.clone();
     let channel = channel.clone();
