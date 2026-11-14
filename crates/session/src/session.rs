@@ -121,12 +121,20 @@ pub enum Connection {
 
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
+    SavedChanged,
+    Reconnected,
+    PostChanged(Arc<Post>),
     /// The server rejected the session; the user must sign in again.
     SignedOut,
     /// A post arrived from someone else.
-    Posted { post: Arc<Post>, mentions_me: bool },
+    Posted {
+        post: Arc<Post>,
+        mentions_me: bool,
+    },
     /// A send failed; the message is kept so the user can retry.
-    SendFailed { message: SharedString },
+    SendFailed {
+        message: SharedString,
+    },
     /// Channel discovery may have changed on the server.
     ChannelsChanged,
     /// A server event this crate does not model, for extensions.
@@ -189,6 +197,11 @@ pub struct Session {
     /// Favorite channels in every team; the server keeps them as
     /// preferences, synced across the user's devices.
     favorites: HashSet<ChannelId>,
+    saved: HashSet<PostId>,
+    saved_revision: u64,
+    saved_load_generation: u64,
+    saving: HashSet<PostId>,
+    pinning: HashSet<PostId>,
     /// The other members of each group message, for naming it.
     group_members: HashMap<ChannelId, Vec<UserId>>,
     emoji: Entity<EmojiStore>,
@@ -291,6 +304,11 @@ impl Session {
             teams_state: LoadState::NotLoaded,
             teams_loaded: false,
             favorites: HashSet::new(),
+            saved: HashSet::new(),
+            saved_revision: 0,
+            saved_load_generation: 0,
+            saving: HashSet::new(),
+            pinning: HashSet::new(),
             group_members: HashMap::new(),
             emoji,
             custom_emoji: CustomEmojis::default(),
@@ -322,6 +340,7 @@ impl Session {
         };
         this.load_teams(cx);
         this.load_favorites(cx);
+        this.load_saved(cx);
         let me_id = this.me.id.clone();
         this.directory
             .update(cx, |d, cx| d.refresh_statuses(vec![me_id], cx));
@@ -680,6 +699,130 @@ impl Session {
                     cx.notify();
                 }
                 Err(err) => log::warn!("loading group members: {err:#}"),
+            });
+        })
+        .detach();
+    }
+
+    pub fn is_saved(&self, post: &PostId) -> bool {
+        self.saved.contains(post)
+    }
+
+    fn apply_saved(&mut self, preferences: &[Preference], deleted: bool, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for preference in preferences
+            .iter()
+            .filter(|p| p.category == "flagged_post" && p.user_id == self.me.id)
+        {
+            self.saved_revision += 1;
+            let id = PostId::from(preference.name.as_str());
+            changed |= if !deleted && preference.value == "true" {
+                self.saved.insert(id)
+            } else {
+                self.saved.remove(&id)
+            };
+        }
+        if changed {
+            cx.emit(SessionEvent::SavedChanged);
+            cx.notify();
+        }
+    }
+
+    fn load_saved(&mut self, cx: &mut Context<Self>) {
+        self.saved_load_generation += 1;
+        let generation = self.saved_load_generation;
+        let client = self.client.clone();
+        let revision = self.saved_revision;
+        cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let result = retry(&executor, || client.my_preferences("flagged_post")).await;
+            let result = match result {
+                Err(err) if err.downcast_ref::<ApiError>() == Some(&ApiError::Status(404)) => {
+                    Ok(Vec::new())
+                }
+                result => result,
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.saved_load_generation != generation {
+                    return;
+                }
+                if this.saved_revision != revision {
+                    // The snapshot predates a live preference event. Fetch a fresh
+                    // baseline as well: the event only describes the changed posts.
+                    this.load_saved(cx);
+                    return;
+                }
+                match result {
+                    Ok(preferences) => {
+                        this.saved = preferences
+                            .into_iter()
+                            .filter(|p| p.value == "true" && p.user_id == this.me.id)
+                            .map(|p| PostId::from(p.name.as_str()))
+                            .collect();
+                        cx.emit(SessionEvent::SavedChanged);
+                        cx.notify();
+                    }
+                    Err(err) => this.handle_error(err, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn set_saved(&mut self, post: &PostId, saved: bool, cx: &mut Context<Self>) {
+        if !self.saving.insert(post.clone()) {
+            return;
+        }
+        let post = post.clone();
+        let client = self.client.clone();
+        let me = self.me.id.clone();
+        let revision = self.saved_revision;
+        let preference = Preference::new(me.clone(), "flagged_post", post.to_string(), "true");
+        cx.spawn(async move |this, cx| {
+            let result = if saved {
+                client.save_preferences(&me, vec![preference.clone()]).await
+            } else {
+                client
+                    .delete_preferences(&me, vec![preference.clone()])
+                    .await
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.saving.remove(&post);
+                match result {
+                    Ok(()) if this.saved_revision == revision => {
+                        this.apply_saved(&[preference], !saved, cx)
+                    }
+                    Ok(()) => this.load_saved(cx),
+                    Err(_) => cx.emit(SessionEvent::SendFailed {
+                        message: "Couldn’t update saved messages. Try again from the message menu."
+                            .into(),
+                    }),
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn set_pinned(&mut self, post: &PostId, pinned: bool, cx: &mut Context<Self>) {
+        if !self.pinning.insert(post.clone()) {
+            return;
+        }
+        let post = post.clone();
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                client.set_post_pinned(&post, pinned).await?;
+                client.get_post(&post).await
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.pinning.remove(&post);
+                match result {
+                    Ok(post) => this.route_edited(post, cx),
+                    Err(err) => cx.emit(SessionEvent::SendFailed {
+                        message: pin_error(&err).into(),
+                    }),
+                }
             });
         })
         .detach();
@@ -1879,6 +2022,7 @@ impl Session {
         log::debug!("event: {event:?}");
         match event {
             Event::Connected => {
+                cx.emit(SessionEvent::Reconnected);
                 self.connection = Connection::Online;
                 // Anything could have happened while we were away, and a
                 // load that gave up while the network was down can now work.
@@ -1893,6 +2037,7 @@ impl Session {
                         self.load_channels(cx);
                     }
                     self.load_favorites(cx);
+                    self.load_saved(cx);
                     self.threads.update(cx, |t, cx| t.refresh(cx));
                 }
                 for timeline in self.live_timelines() {
@@ -1995,6 +2140,7 @@ impl Session {
                     .update(cx, |store, cx| store.add(vec![emoji], cx));
             }
             Event::PreferencesChanged(preferences) => {
+                self.apply_saved(&preferences, false, cx);
                 let mut changed = false;
                 for preference in preferences
                     .iter()
@@ -2012,6 +2158,7 @@ impl Session {
                 }
             }
             Event::PreferencesDeleted(preferences) => {
+                self.apply_saved(&preferences, true, cx);
                 let mut changed = false;
                 for preference in preferences
                     .iter()
@@ -2166,6 +2313,7 @@ impl Session {
     }
 
     fn route_edited(&mut self, post: Post, cx: &mut Context<Self>) {
+        cx.emit(SessionEvent::PostChanged(Arc::new(post.clone())));
         if !post.is_reply() {
             self.threads
                 .update(cx, |t, cx| t.note_root_edited(&post, cx));
@@ -2192,6 +2340,7 @@ impl Session {
     }
 
     fn route_deleted(&mut self, post: &Post, cx: &mut Context<Self>) {
+        cx.emit(SessionEvent::PostChanged(Arc::new(post.clone())));
         if let Some(confirmed) = self.deleting.get_mut(&post.id) {
             *confirmed = true;
         }
@@ -2231,6 +2380,17 @@ impl Session {
     }
 }
 
+fn pin_error(error: &anyhow::Error) -> &'static str {
+    if error
+        .downcast_ref::<ApiError>()
+        .is_some_and(|e| *e == ApiError::Status(403))
+    {
+        "You don’t have permission to pin or unpin messages in this channel."
+    } else {
+        "Couldn’t update the pinned message. Try again from the message menu."
+    }
+}
+
 /// Startup against a server behind a slow link: every response takes one
 /// round trip, and what can overlap must.
 #[cfg(test)]
@@ -2253,8 +2413,9 @@ mod slow_network_tests {
     };
     use serde_json::json;
 
-    use super::{Session, SessionEvent};
+    use super::{Session, SessionEvent, pin_error};
     use crate::{EmojiStore, LoadState, ThreadFilter, TimelineKind};
+    use mattermost::{Event, Post, Preference};
 
     fn route(request: &Request) -> Reply {
         let path = request.path().split('?').next().unwrap_or_default();
@@ -5146,5 +5307,247 @@ mod slow_network_tests {
             .filter(|r| r.method() == "POST" && r.path() == "/api/v4/emoji/names")
             .count();
         assert_eq!(lookups, 1);
+    }
+
+    #[gpui_kit::test]
+    fn saved_snapshot_retries_after_live_preference_changes(cx: &mut TestAppContext) {
+        for deleted in [false, true] {
+            let waiting = Arc::new(AtomicBool::new(false));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (release, receive) = std::sync::mpsc::channel();
+            let receive = std::sync::Mutex::new(receive);
+            let server = SlowServer::start(Network::new(Duration::ZERO), {
+                let waiting = waiting.clone();
+                let calls = calls.clone();
+                move |request| {
+                    if request.method() == "GET"
+                        && request.path() == "/api/v4/users/me/preferences/flagged_post"
+                    {
+                        let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                        if first {
+                            waiting.store(true, Ordering::SeqCst);
+                            receive
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(10))
+                                .unwrap();
+                        }
+                        let mut prefs = vec![
+                            json!({"user_id":"me", "category":"flagged_post", "name":"existing", "value":"true"}),
+                        ];
+                        if first == deleted {
+                            prefs.push(json!({"user_id":"me", "category":"flagged_post", "name":"external", "value":"true"}));
+                        }
+                        return Reply::json(json!(prefs));
+                    }
+                    route(request)
+                }
+            });
+            let session = start(&server, cx);
+            wait_until(cx, |_| waiting.load(Ordering::SeqCst));
+            session.update(cx, |s, cx| {
+                let preferences = vec![Preference::new(
+                    "me".into(),
+                    "flagged_post",
+                    "external",
+                    "true",
+                )];
+                s.handle_event(
+                    if deleted {
+                        Event::PreferencesDeleted(preferences)
+                    } else {
+                        Event::PreferencesChanged(preferences)
+                    },
+                    cx,
+                );
+            });
+            release.send(()).unwrap();
+            wait_until(cx, |cx| {
+                session.read_with(cx, |s, _| s.is_saved(&"existing".into()))
+            });
+            session.read_with(cx, |s, _| {
+                assert_eq!(s.is_saved(&"external".into()), !deleted)
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn older_parallel_saved_snapshot_cannot_replace_the_latest_load(cx: &mut TestAppContext) {
+        let waiting = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, receive) = std::sync::mpsc::channel();
+        let receive = std::sync::Mutex::new(receive);
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let waiting = waiting.clone();
+            let calls = calls.clone();
+            move |request| {
+                if request.method() == "GET"
+                    && request.path() == "/api/v4/users/me/preferences/flagged_post"
+                {
+                    let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                    if first {
+                        waiting.store(true, Ordering::SeqCst);
+                        receive
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
+                    }
+                    return Reply::json(
+                        json!([{"user_id":"me", "category":"flagged_post", "name":if first {"old"} else {"latest"}, "value":"true"}]),
+                    );
+                }
+                route(request)
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |_| waiting.load(Ordering::SeqCst));
+        session.update(cx, |s, cx| s.load_saved(cx));
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.is_saved(&"latest".into()))
+        });
+        release.send(()).unwrap();
+        // Deliver the released older response without starting another load
+        // that could hide an incorrect overwrite.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        for _ in 0..20 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        session.read_with(cx, |s, _| {
+            assert!(s.is_saved(&"latest".into()));
+            assert!(!s.is_saved(&"old".into()));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn pin_writes_update_timelines_and_denials_keep_state(cx: &mut TestAppContext) {
+        let pinned = Arc::new(AtomicBool::new(false));
+        let deny = Arc::new(AtomicBool::new(false));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let pinned = pinned.clone();
+            let deny = deny.clone();
+            move |request| match (request.method(), request.path()) {
+                ("POST", "/api/v4/posts/p1/pin" | "/api/v4/posts/p1/unpin") => {
+                    if deny.load(Ordering::SeqCst) {
+                        return Reply::json(json!({})).status(403);
+                    }
+                    pinned.store(request.path().ends_with("/pin"), Ordering::SeqCst);
+                    Reply::json(json!({}))
+                }
+                ("GET", "/api/v4/posts/p1") => Reply::json(
+                    json!({"id":"p1", "channel_id":"town", "is_pinned":pinned.load(Ordering::SeqCst), "update_at":10}),
+                ),
+                _ => route(request),
+            }
+        });
+        let session = start(&server, cx);
+        let timeline = session.update(cx, |s, cx| {
+            s.timeline(TimelineKind::Channel("town".into()), cx)
+        });
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| t.position(&"p1".into()).is_some())
+        });
+        session.update(cx, |s, cx| s.set_pinned(&"p1".into(), true, cx));
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| t.entries()[0].post().is_pinned)
+        });
+        deny.store(true, Ordering::SeqCst);
+        let errors = Rc::new(RefCell::new(Vec::new()));
+        let sink = errors.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&session, move |_, event, _| {
+                if let SessionEvent::SendFailed { message } = event {
+                    sink.borrow_mut().push(message.clone());
+                }
+            })
+        });
+        session.update(cx, |s, cx| s.set_pinned(&"p1".into(), false, cx));
+        wait_until(cx, |_| !errors.borrow().is_empty());
+        assert_eq!(
+            errors.borrow()[0],
+            "You don’t have permission to pin or unpin messages in this channel."
+        );
+        assert!(timeline.read_with(cx, |t, _| t.entries()[0].post().is_pinned));
+    }
+
+    #[test]
+    fn pin_permission_copy_is_actionable_without_server_details() {
+        assert_eq!(
+            pin_error(&ApiError::Status(403).into()),
+            "You don’t have permission to pin or unpin messages in this channel."
+        );
+        assert!(pin_error(&ApiError::Status(500).into()).contains("Try again"));
+    }
+
+    #[gpui_kit::test]
+    fn saved_preferences_and_pin_events_update_session_and_both_timelines(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (request.method(), request.path()) {
+                ("PUT", "/api/v4/users/me/preferences")
+                | ("POST", "/api/v4/users/me/preferences/delete") => {
+                    Reply::json(serde_json::json!({"status":"OK"}))
+                }
+                _ => route(request),
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        session.update(cx, |s, cx| s.set_saved(&"p1".into(), true, cx));
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.is_saved(&"p1".into()))
+        });
+        session.update(cx, |s, cx| s.set_saved(&"p1".into(), false, cx));
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| !s.is_saved(&"p1".into()))
+        });
+        session.update(cx, |s, cx| {
+            let preference = Preference::new("me".into(), "flagged_post", "p1", "true");
+            s.handle_event(Event::PreferencesChanged(vec![preference.clone()]), cx);
+            assert!(s.is_saved(&"p1".into()));
+            s.handle_event(Event::PreferencesDeleted(vec![preference.clone()]), cx);
+            assert!(!s.is_saved(&"p1".into()));
+            let foreign = Preference::new("other".into(), "flagged_post", "p1", "true");
+            s.handle_event(Event::PreferencesChanged(vec![foreign]), cx);
+            assert!(!s.is_saved(&"p1".into()));
+            s.handle_event(Event::PreferencesChanged(vec![preference]), cx);
+            s.handle_event(
+                Event::PreferencesChanged(vec![Preference::new(
+                    "me".into(),
+                    "flagged_post",
+                    "p1",
+                    "false",
+                )]),
+                cx,
+            );
+            assert!(!s.is_saved(&"p1".into()));
+            let channel = s.timeline(TimelineKind::Channel("town".into()), cx);
+            let thread = s.timeline(
+                TimelineKind::Thread {
+                    channel: "town".into(),
+                    root: "p1".into(),
+                },
+                cx,
+            );
+            let mut post = Post::default();
+            post.id = "p1".into();
+            post.channel_id = "town".into();
+            post.update_at = 1;
+            for timeline in [&channel, &thread] {
+                timeline.update(cx, |t, cx| t.upsert(post.clone(), cx));
+            }
+            post.is_pinned = true;
+            post.update_at = 2;
+            s.handle_event(Event::PostEdited(post), cx);
+            for timeline in [&channel, &thread] {
+                let t = timeline.read(cx);
+                assert!(
+                    t.entries()[t.position(&"p1".into()).unwrap()]
+                        .post()
+                        .is_pinned
+                );
+            }
+        });
     }
 }

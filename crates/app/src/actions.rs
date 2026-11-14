@@ -24,6 +24,8 @@ actions!(
         SearchTeam,
         /// Show the threads you follow.
         ShowThreads,
+        ShowSaved,
+        ShowPinned,
         CloseConversation,
         /// Add the open conversation to favorites, or remove it.
         ToggleFavorite,
@@ -107,6 +109,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(primary!("f"), SearchConversation, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new(primary!("shift-f"), SearchTeam, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new(primary!("shift-t"), ShowThreads, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new(primary!("shift-s"), ShowSaved, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new(primary!("shift-p"), ShowPinned, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("alt-down", NextChannel, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("alt-up", PreviousChannel, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("alt-shift-down", NextUnreadChannel, Some(WORKSPACE_CONTEXT)),
@@ -191,6 +195,8 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Search Conversation…", SearchConversation),
             MenuItem::action("Search All Channels…", SearchTeam),
             MenuItem::action("Threads", ShowThreads),
+            MenuItem::action("Saved", ShowSaved),
+            MenuItem::action("Pinned Messages", ShowPinned),
             MenuItem::action("Close Conversation", CloseConversation),
             MenuItem::separator(),
             MenuItem::action("Next Channel", NextChannel),

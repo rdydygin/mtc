@@ -439,6 +439,7 @@ impl PostEmbed {
 #[serde(default)]
 #[non_exhaustive]
 pub struct Post {
+    pub is_pinned: bool,
     pub id: PostId,
     pub create_at: Millis,
     pub update_at: Millis,

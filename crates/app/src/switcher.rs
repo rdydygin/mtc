@@ -157,6 +157,11 @@ pub fn open(
         ),
     ];
     if let Some(active) = &active {
+        commands.push(action_item(
+            "Pinned messages",
+            IconName::Pin,
+            actions::ShowPinned,
+        ));
         let favorite = session_ref.is_favorite(active);
         commands.push(action_item(
             crate::sidebar::favorite_label(favorite),
@@ -198,6 +203,7 @@ pub fn open(
     }
     commands.extend([
         action_item("Threads", IconName::MessagesSquare, actions::ShowThreads),
+        action_item("Saved", IconName::Bookmark, actions::ShowSaved),
         action_item(
             "Close conversation",
             IconName::X,

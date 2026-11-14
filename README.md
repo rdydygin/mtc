@@ -86,6 +86,8 @@ On Linux and Windows, use Ctrl where the table says ⌘, Alt for ⌥, and Shift 
 | ⌘F | Search the conversation's messages |
 | ⌘⇧F | Search all channels in the current team |
 | ⌘⇧T | Threads you follow |
+| ⌘⇧S | Saved messages |
+| ⌘⇧P | Pinned messages in the current channel |
 | ⌥↑ / ⌥↓ | Previous / next channel |
 | ⌥⇧↑ / ⌥⇧↓ | Previous / next unread channel |
 | Enter / ⇧Enter | Accept a visible suggestion or send / new line |
@@ -147,6 +149,15 @@ hides the list without changing your text. Suggestions stay out of code spans an
 fences and leave IME composition keys alone.
 
 Editing keeps your unsent text and attachments; saving or canceling restores them.
+
+Use **Save message** in a message’s menu to keep it in **Saved** (⌘⇧S or ⌘K).
+Saved messages sync with Mattermost’s flagged posts. **Pin to channel** shares a
+message with the channel; open **Pinned messages** from the pin in the channel
+header, ⌘⇧P, or ⌘K. Saved and pinned messages carry a labeled icon. Both panes
+list newest messages first; ↑ / ↓ / Home / End selects, Enter opens the message
+in its channel or thread, and Esc closes the pane. **Show more messages** loads
+older saved messages. **Remove from saved** and **Unpin** reverse the actions.
+Pinning may require permission from your channel administrator.
 
 Right-click a message to reply, react, mark it unread, copy its text or Mattermost link,
 edit, or delete it. **Mark as unread** is available for root messages, not thread

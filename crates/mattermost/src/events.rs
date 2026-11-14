@@ -366,6 +366,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_saved_preferences_and_pin_edits() {
+        let pref = json!([{"user_id":"me", "category":"flagged_post", "name":"p", "value":"true"}]);
+        for name in ["preferences_changed", "preferences_deleted"] {
+            let event = parse_event(
+                &json!({"event": name, "data": {"preferences": pref.to_string()}}).to_string(),
+            )
+            .unwrap();
+            let preferences = match event {
+                Event::PreferencesChanged(p) | Event::PreferencesDeleted(p) => p,
+                _ => panic!("wrong event"),
+            };
+            assert_eq!(preferences[0].category, "flagged_post");
+            assert_eq!(preferences[0].name, "p");
+        }
+        let event = parse_event(&json!({"event":"post_edited", "data":{"post": json!({"id":"p", "is_pinned":true}).to_string()}}).to_string()).unwrap();
+        assert!(matches!(event, Event::PostEdited(post) if post.is_pinned));
+    }
+
+    #[test]
     fn parses_posted_with_embedded_post() {
         let text = r#"{"event":"posted","data":{"post":"{\"id\":\"p1\",\"channel_id\":\"c1\",\"user_id\":\"u1\",\"message\":\"hi\",\"create_at\":5}","mentions":"[\"u2\"]","team_id":"t1"},"broadcast":{"channel_id":"c1"},"seq":3}"#;
         match parse_event(text) {
