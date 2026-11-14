@@ -137,7 +137,11 @@ Enter toggles the reaction, and Esc closes the picker and returns focus.
 Type `@` at a word start to suggest people and `@here`, `@channel`, or `@all`.
 Known people appear immediately; server matches put current-channel members first,
 then other team members. Type `~` to suggest joined channels in the current team,
-or `/` at the beginning for commands. ↑/↓ selects a row; Tab or Enter inserts it
+or `/` at the beginning for commands. Server commands appear with their argument
+hints and descriptions alongside built-in extension commands; extensions take precedence
+when names match. The team's command list is cached and refreshed when switching teams
+or reconnecting. If loading fails, cached and built-in commands remain available.
+Argument values are not autocompleted. ↑/↓ selects a row; Tab or Enter inserts it
 at the caret without sending. Enter sends when no suggestions are visible; Esc
 hides the list without changing your text. Suggestions stay out of code spans and
 fences and leave IME composition keys alone.

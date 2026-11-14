@@ -88,6 +88,7 @@ pub struct Composer {
     focus_handle: FocusHandle,
     selected_suggestion: usize,
     selected_emoji: Option<String>,
+    selected_command: Option<String>,
     dismissed: Option<Token>,
     token: Option<Token>,
     composing: bool,
@@ -170,6 +171,7 @@ impl Composer {
             focus_handle,
             selected_suggestion: 0,
             selected_emoji: None,
+            selected_command: None,
             dismissed: None,
             token: None,
             composing: false,
@@ -398,6 +400,7 @@ impl Composer {
     pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_suggestion = 0;
         self.selected_emoji = None;
+        self.selected_command = None;
         self.dismissed = None;
         self.input.update(cx, |state, cx| {
             state.set_value(text.to_string(), window, cx);
@@ -452,6 +455,7 @@ impl Composer {
         self._subscriptions
             .push(cx.observe_in(&session, window, |this, _, window, cx| {
                 this.refresh_suggestions(window, cx);
+                this.reconcile_command_selection(cx);
                 cx.notify();
             }));
         let store = session.read(cx).emoji_store().clone();
@@ -495,6 +499,7 @@ impl Composer {
         self.remote_users.clear();
         self.selected_suggestion = 0;
         self.selected_emoji = None;
+        self.selected_command = None;
         self.dismissed = None;
         self.token = token.clone();
         self.lookup_team = team.clone();
@@ -514,6 +519,7 @@ impl Composer {
                 .first()
                 .map(|row| row.completion.clone());
         }
+        self.reconcile_command_selection(cx);
         let (Some(token), Some(team)) = (token, team) else {
             return;
         };
@@ -610,8 +616,24 @@ impl Composer {
         cx.notify();
     }
 
+    fn reconcile_command_selection(&mut self, cx: &gpui_kit::App) {
+        if self
+            .current_token(cx)
+            .is_some_and(|token| token.kind == Kind::Command)
+        {
+            let matches = self.suggestion_matches(cx);
+            self.selected_command = matches
+                .get(self.selected_index(&matches))
+                .map(|row| row.completion.clone());
+        }
+    }
+
     fn selected_index(&self, matches: &[Suggestion]) -> usize {
-        if let Some(name) = &self.selected_emoji {
+        if let Some(name) = self
+            .selected_command
+            .as_ref()
+            .or(self.selected_emoji.as_ref())
+        {
             matches
                 .iter()
                 .position(|row| &row.completion == name)
@@ -666,6 +688,13 @@ impl Composer {
                     .is_some_and(|token| token.kind == Kind::Emoji)
             {
                 self.selected_emoji = Some(matches[self.selected_suggestion].completion.clone());
+            }
+            if matches!(key, "up" | "down")
+                && self
+                    .current_token(cx)
+                    .is_some_and(|token| token.kind == Kind::Command)
+            {
+                self.selected_command = Some(matches[self.selected_suggestion].completion.clone());
             }
             cx.notify();
             cx.stop_propagation();
@@ -739,20 +768,35 @@ impl Composer {
                     })
                     .collect()
             }
-            Kind::Command => extensions::slash_commands(cx)
-                .iter()
-                .filter(|c| c.name().starts_with(&token.query))
-                .take(6)
-                .map(|c| Suggestion {
-                    id: format!("command-{}", c.name()),
-                    completion: format!("/{}", c.name()),
-                    label: format!("/{}", c.name()),
-                    detail: format!("{} {}", c.hint_text(), c.description())
-                        .trim()
-                        .to_string(),
-                    user: None,
-                })
-                .collect(),
+            Kind::Command => {
+                let extensions = extensions::slash_commands(cx);
+                let mut seen: HashSet<_> =
+                    extensions.iter().map(|c| c.name().to_string()).collect();
+                let mut matches: Vec<_> = extensions
+                    .iter()
+                    .filter(|c| c.name().starts_with(&token.query))
+                    .map(|c| Suggestion::command(c.name(), c.hint_text(), c.description()))
+                    .collect();
+                if let Some(session) = &self.session {
+                    let session = session.read(cx);
+                    let mut server: Vec<_> = session
+                        .autocomplete_commands()
+                        .iter()
+                        .filter(|c| {
+                            !c.trigger().is_empty() && c.trigger().starts_with(&token.query)
+                        })
+                        .collect();
+                    server.sort_by_key(|c| c.trigger());
+                    matches.extend(
+                        server
+                            .into_iter()
+                            .filter(|c| seen.insert(c.trigger().to_string()))
+                            .map(|c| Suggestion::command(c.trigger(), c.hint(), c.description())),
+                    );
+                }
+                matches.truncate(6);
+                matches
+            }
             Kind::Channel => {
                 let Some(session) = &self.session else {
                     return Vec::new();
@@ -1700,6 +1744,128 @@ mod tests {
             assert!(c.files[2].uploaded.is_some());
         });
         assert_eq!(&*events.borrow(), &[("Saved edit".into(), 0)]);
+    }
+
+    #[gpui_kit::test]
+    fn command_refresh_keeps_selection_and_internal_slashes_complete(cx: &mut TestAppContext) {
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = std::sync::Mutex::new(wait);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            if request.method() == "GET"
+                && request.path() == "/api/v4/teams/team/commands/autocomplete"
+            {
+                let refresh = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
+                if refresh {
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                    Reply::json(json!([
+                        {"trigger":"ops/abort"}, {"trigger":"ops/deploy"}, {"trigger":"ops/status"}
+                    ]))
+                } else {
+                    Reply::json(json!([{"trigger":"ops/deploy"}, {"trigger":"ops/status"}]))
+                }
+            } else {
+                route(request)
+            }
+        });
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        let session = composer.read_with(cx, |c, _| c.session.clone().unwrap());
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.autocomplete_commands().len() == 2)
+        });
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("/ops/d", window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("tab", cx);
+            assert_eq!(composer.read(cx).text(cx), "/ops/deploy ");
+            session.update(cx, |s, cx| {
+                s.select_team("other".into(), cx);
+                s.select_team("team".into(), cx);
+            });
+            composer.update(cx, |c, cx| c.set_text("/ops/", window, cx));
+        })
+        .unwrap();
+        wait_until(cx, |_| {
+            server
+                .requests()
+                .iter()
+                .filter(|r| {
+                    r.method() == "GET" && r.path() == "/api/v4/teams/team/commands/autocomplete"
+                })
+                .count()
+                == 2
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.press("down", cx);
+            assert_eq!(window.find("command-ops/status").selected(), Some(true));
+        })
+        .unwrap();
+        release.send(()).unwrap();
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.autocomplete_commands().len() == 3)
+        });
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(window.find("command-ops/status").selected(), Some(true));
+            assert_eq!(window.find("command-ops/deploy").selected(), Some(false));
+            window.press("tab", cx);
+            assert_eq!(composer.read(cx).text(cx), "/ops/status ");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn server_slash_commands_complete_and_extensions_take_precedence(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            if request.method() == "GET"
+                && request.path() == "/api/v4/teams/team/commands/autocomplete"
+            {
+                Reply::json(json!([
+                    {"trigger":"poll", "auto_complete_hint":"[question]", "auto_complete_desc":"Create a poll"},
+                    {"trigger":"shrug", "auto_complete_desc":"Server collision"}
+                ]))
+            } else {
+                route(request)
+            }
+        });
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        wait_until(cx, |cx| {
+            composer.read_with(cx, |c, cx| {
+                c.session
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .autocomplete_commands()
+                    .len()
+                    == 2
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("/po", window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            let matches = composer.read(cx).suggestion_matches(cx);
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].label, "/poll");
+            assert_eq!(matches[0].detail, "[question] Create a poll");
+            assert!(window.find("command-poll").selected().unwrap());
+            window.press("tab", cx);
+            assert_eq!(composer.read(cx).text(cx), "/poll ");
+            composer.update(cx, |c, cx| c.set_text("/shr", window, cx));
+            let matches = composer.read(cx).suggestion_matches(cx);
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].completion, "/shrug");
+            assert!(!matches[0].detail.contains("Server collision"));
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

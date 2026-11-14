@@ -26,6 +26,21 @@ fn name_char(c: char) -> bool {
 /// even when the caret is in its middle, but search only its prefix.
 pub(super) fn token_at(text: &str, caret: usize) -> Option<Token> {
     let before = text.get(..caret)?;
+    // A command is the leading word; slashes inside its trigger are literal.
+    if let Some(query) = before.strip_prefix('/')
+        && query.chars().all(|c| name_char(c) || c == '/')
+    {
+        let end = caret
+            + text[caret..]
+                .find(|c: char| !name_char(c) && c != '/')
+                .unwrap_or(text.len() - caret);
+        return Some(Token {
+            kind: Kind::Command,
+            range: 0..end,
+            query: query.to_lowercase(),
+        });
+    }
+
     let start = before
         .char_indices()
         .rev()
@@ -33,7 +48,6 @@ pub(super) fn token_at(text: &str, caret: usize) -> Option<Token> {
         .map(|(ix, _)| ix)?;
     let marker = text[start..].chars().next()?;
     let kind = match marker {
-        '/' if start == 0 => Kind::Command,
         '@' => Kind::Person,
         '~' => Kind::Channel,
         ':' if before[start + 1..]
@@ -141,6 +155,16 @@ pub(super) struct Suggestion {
 }
 
 impl Suggestion {
+    pub fn command(name: &str, hint: &str, description: &str) -> Self {
+        Self {
+            id: format!("command-{name}"),
+            completion: format!("/{name}"),
+            label: format!("/{name}"),
+            detail: format!("{hint} {description}").trim().to_string(),
+            user: None,
+        }
+    }
+
     pub fn person(user: Arc<User>) -> Self {
         let full_name = format!("{} {}", user.first_name, user.last_name);
         Self {
@@ -200,6 +224,21 @@ pub(super) fn channel_matches<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_words_allow_internal_slashes_and_replace_the_whole_trigger() {
+        for (text, caret, query, end) in [
+            ("/ops/", 5, "ops/", 5),
+            ("/ops/d", 6, "ops/d", 6),
+            ("/ops/deploy argument", 6, "ops/d", 11),
+        ] {
+            let token = token_at(text, caret).unwrap();
+            assert_eq!(token.kind, Kind::Command);
+            assert_eq!(token.query, query);
+            assert_eq!(token.range, 0..end);
+        }
+        assert!(token_at("/ops/deploy ", 12).is_none());
+    }
 
     #[test]
     fn indentation_only_blocks_tokens_on_the_current_line() {

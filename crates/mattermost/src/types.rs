@@ -104,6 +104,31 @@ pub struct User {
     pub props: serde_json::Map<String, serde_json::Value>,
 }
 
+/// An autocomplete-enabled slash command supplied by the server.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AutocompleteCommand {
+    #[serde(default)]
+    trigger: String,
+    #[serde(default)]
+    auto_complete_hint: String,
+    #[serde(default)]
+    auto_complete_desc: String,
+}
+
+impl AutocompleteCommand {
+    pub fn trigger(&self) -> &str {
+        &self.trigger
+    }
+
+    pub fn hint(&self) -> &str {
+        &self.auto_complete_hint
+    }
+
+    pub fn description(&self) -> &str {
+        &self.auto_complete_desc
+    }
+}
+
 /// People in the channel first, followed by matching people elsewhere in the team.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
