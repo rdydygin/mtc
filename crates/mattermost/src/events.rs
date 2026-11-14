@@ -45,6 +45,8 @@ pub enum Event {
         team_id: TeamId,
     },
     PostEdited(Post),
+    /// A deletion notification. The embedded post may be the pre-deletion
+    /// snapshot (`delete_at == 0`); this event confirms deletion by identity.
     PostDeleted(Post),
     ReactionAdded(Reaction),
     ReactionRemoved(Reaction),
@@ -364,6 +366,73 @@ pub(crate) fn parse_event(text: &str) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_post_deleted_preserves_the_pre_deletion_snapshot() {
+        // Verbatim run-2.log frame, LF line 1589 (v10.11.26).
+        let event = parse_event(include_str!("../tests/fixtures/run-2-post-deleted.json")).unwrap();
+        let Event::PostDeleted(post) = event else {
+            panic!("post_deleted event must not require a tombstone timestamp")
+        };
+        assert_eq!(post.id.as_str(), "er184nh4rbrw5co7stwgfa6fxa");
+        assert_eq!(post.channel_id.as_str(), "3fcw3ww6jpbmmra9unzowree3y");
+        assert_eq!(post.user_id.as_str(), "9ygscr9sdbnwxfz7kdwkwddb7e");
+        assert_eq!(post.message, "second root");
+        assert_eq!(post.delete_at, 0);
+        assert_eq!(post.update_at, post.create_at);
+    }
+
+    // Verbatim WS frames from Actions run-1.log, lines 1604/1606/1977.
+    #[test]
+    fn live_posted_frames_scope_mentions_to_the_recipient() {
+        let sender =
+            parse_event(include_str!("../tests/fixtures/run-1-posted-sender.json")).unwrap();
+        let recipient = parse_event(include_str!(
+            "../tests/fixtures/run-1-posted-recipient.json"
+        ))
+        .unwrap();
+        let Event::Posted {
+            post: sent,
+            mentions: sender_mentions,
+            ..
+        } = sender
+        else {
+            panic!("sender posted frame")
+        };
+        let Event::Posted {
+            post: received,
+            mentions: recipient_mentions,
+            team_id,
+        } = recipient
+        else {
+            panic!("recipient posted frame")
+        };
+        assert_eq!(sent.id, received.id);
+        assert_eq!(sent.pending_post_id, received.pending_post_id);
+        assert!(sender_mentions.is_empty());
+        assert_eq!(
+            recipient_mentions,
+            vec![UserId::from("54ncrawb93btzxx5pqms719ebo")]
+        );
+        assert_eq!(team_id.as_str(), "k413i14iqtrtbgogib9qtz8ppw");
+    }
+
+    #[test]
+    fn live_channel_member_updated_keeps_embedded_notify_props() {
+        let event = parse_event(include_str!(
+            "../tests/fixtures/run-1-channel-member-updated.json"
+        ))
+        .unwrap();
+        let Event::ChannelMemberUpdated(member) = event else {
+            panic!("channel_member_updated frame")
+        };
+        assert_eq!(member.channel_id.as_str(), "zjc6secg53nw8xd9yeh666o3oa");
+        assert_eq!(member.user_id.as_str(), "a8k4gfhkztyebfhamasuxs8qqy");
+        assert!(member.is_muted());
+        assert_eq!(member.notify_props["mark_unread"], "mention");
+        assert_eq!(member.msg_count, 2);
+        assert_eq!(member.msg_count_root, 1);
+    }
 
     #[test]
     fn parses_saved_preferences_and_pin_edits() {

@@ -369,6 +369,42 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 MTC_SSO_SERVER=… MTC_SSO_CALLBACK='…/login/desktop?…' cargo test -p mattermost -- --ignored
 ```
 
+Live REST/WebSocket contracts and GPUI session flows run against a disposable
+Mattermost server, with no browser setup:
+
+```sh
+script/live-test                  # Docker + curl; starts/reuses mtc-live-mattermost
+# Or point at an already running disposable server:
+MTC_LIVE_SERVER=http://localhost:8065 cargo test --locked -p mattermost --test live -- --ignored --test-threads=1
+MTC_LIVE_SERVER=http://localhost:8065 cargo test --locked -p session --test live -- --ignored --test-threads=1
+# Delete all local test data and bootstrap credentials:
+docker rm -f mtc-live-mattermost
+```
+
+The script and the informational **Live Mattermost contract tests** CI job pin
+`mattermost/mattermost-preview:10.11.26` (a 10.x release; preview bundles the database).
+The tests create the first user `mtc_live_admin` with password
+`Live-test-Password9!`, then provision uniquely named users, a team and public/private
+channels on every run. They retain the test data so reruns can be inspected. Use a
+fresh preview instance initially; an existing server needs that bootstrap admin.
+Tests enable open signup/user creation, disable email verification, and set
+`ServiceSettings.CollapsedThreads=always_on`, `EnableCommands`, `EnableCustomEmoji`
+and `TeamSettings.EnableCustomUserStatuses` through the admin config API. CI/script
+set the same values in environment variables; tests also save the user's CRT preference. No local
+mode or license is required. These tests change server configuration: point them
+only at disposable instances. Custom emoji checks skip only if the resulting config
+explicitly reports them disabled. External OpenGraph scraping is excluded; uploaded
+file metadata is checked instead.
+
+Both integration targets are ignored by normal workspace tests, and explicitly
+skip with a message when `MTC_LIVE_SERVER` is absent even under `--ignored`.
+A recording proxy forwards every request to the real server and captures request,
+status, response body and raw WebSocket events in test output (printed on failure by
+the test harness). It also interrupts WebSockets for reconnect/catch-up assertions;
+REST stays live. Credentials are omitted from request logs. Run with `--nocapture`
+to see passing transcripts too. The live CI job uses the normal workflow triggers
+and read-only permissions; it is not yet a required branch-protection check.
+
 Work on a short-lived feature branch, open a pull request into `main`, and merge after
 all required CI checks pass. Merging does not publish a release. CI
 (`.github/workflows/ci.yml`) runs on PRs targeting `main` and pushes to `main`, and can

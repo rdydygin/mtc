@@ -18,3 +18,8 @@ serde_json.workspace = true
 [dev-dependencies]
 gpui-kit = { workspace = true, default-features = false, features = ["test-support"] }
 mattermost = { workspace = true, features = ["test-support"] }
+# Shared live fixture uses the same HTTP/WS stack as mattermost; no new versions.
+reqwest.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tokio-tungstenite.workspace = true
