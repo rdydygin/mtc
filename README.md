@@ -44,7 +44,15 @@ session. The official Mattermost app keeps `mattermost://`, so the two don't col
 Servers older than 9.1 don't have that hand-back, so mtc uses the mobile apps' flow
 instead: the browser returns an `mmauth://` link that carries the session itself. mtc
 picks the flow from the server's version and only accepts the link while it is waiting
-for a sign-in.
+for a sign-in. Since these legacy links are not tied to the sign-in attempt, mtc asks
+you to check the full name, @username, and server before continuing. This also applies
+to pasted links. Choose "Continue as @username" only for your account, or choose "Use
+a different account" (Escape) to discard the session and return to the provider
+buttons. Keyboard focus starts on the account summary; Tab reaches "Use a different
+account" first, then "Continue as @username". mtc also tries to revoke the discarded
+session on the server. Canceling, changing servers, or starting again clears the pending confirmation; a newer callback
+replaces it. Servers 9.1 and later keep their attempt-bound desktop flow without this
+extra step.
 
 macOS only delivers these links to an installed app bundle, so for SSO run mtc as an app:
 

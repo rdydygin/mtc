@@ -17,6 +17,7 @@
 //!      opens `mmauth://callback?MMAUTHTOKEN=…`, which carries the session
 //!      token itself. Nothing ties it to one attempt, so the app accepts it
 //!      only while an attempt is waiting, and we check it by loading the user.
+//!      The app must then ask the user to confirm the account before signing in.
 //!
 //! The callback URL can also be pasted by hand: for the desktop handoff the
 //! browser's address bar still holds the `/login/desktop` URL, and for the

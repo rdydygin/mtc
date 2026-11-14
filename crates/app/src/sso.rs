@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _,
+    ActiveTheme as _, Sizable as _, StyledExt as _, ThemeStyled as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -21,9 +21,10 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, Global, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, Task, WeakEntity, Window, div,
-    prelude::FluentBuilder as _,
+    AnyWindowHandle, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Global,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window,
+    base::TestSupportExt as _, div, prelude::FluentBuilder as _,
 };
 use mattermost::{
     Client, User,
@@ -63,6 +64,12 @@ struct SsoCallbacks {
 impl Global for SsoCallbacks {}
 
 pub struct SsoPanel {
+    window: AnyWindowHandle,
+    confirmation_focus: FocusHandle,
+    provider_focus: FocusHandle,
+    // The validated legacy session stays local until the user accepts it.
+    confirmation: Option<(Client, User)>,
+    revision: u64,
     server: String,
     lookup: Lookup,
     pending: Option<(SsoAttempt, SharedString)>,
@@ -99,6 +106,11 @@ impl SsoPanel {
             .take()
             .is_some_and(|at| at.elapsed() < ORPHAN_WINDOW);
         Self {
+            window: window.window_handle(),
+            confirmation_focus: cx.focus_handle(),
+            provider_focus: cx.focus_handle().tab_stop(true),
+            confirmation: None,
+            revision: 0,
             server: String::new(),
             lookup: Lookup::Idle,
             pending: None,
@@ -166,6 +178,7 @@ impl SsoPanel {
     }
 
     fn start(&mut self, provider: &SsoProvider, cx: &mut Context<Self>) {
+        self.cancel_completion();
         let handoff = match &self.lookup {
             Lookup::Loaded(options) => options.handoff,
             _ => Handoff::default(),
@@ -186,7 +199,6 @@ impl SsoPanel {
                 return;
             }
         }
-        self.cancel_completion();
         self.pending = Some((sso, provider.label().to_string().into()));
         self.error = None;
         cx.notify();
@@ -204,6 +216,8 @@ impl SsoPanel {
 
     /// Dropping the task prevents a late result from signing in after cancellation.
     fn cancel_completion(&mut self) {
+        self.revision += 1;
+        self.confirmation = None;
         self._completion_task = None;
         self.completing = false;
         self.pending = None;
@@ -213,14 +227,37 @@ impl SsoPanel {
         self.cancel_completion();
         self.error = None;
         self.paste.update(cx, |p, cx| p.set_value("", window, cx));
+        self.provider_focus.focus(window, cx);
         cx.notify();
+    }
+
+    fn use_different_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((client, _)) = self.confirmation.take() {
+            // Revocation must survive leaving this panel, but never block retrying.
+            cx.background_spawn(async move {
+                let _ = client.logout().await;
+            })
+            .detach();
+        }
+        self.cancel(window, cx);
+    }
+
+    fn confirm(&mut self, revision: u64, cx: &mut Context<Self>) {
+        if revision != self.revision {
+            return;
+        }
+        if let Some((client, me)) = self.confirmation.take() {
+            self.cancel_completion();
+            cx.emit(SsoEvent::SignedIn { client, me });
+            cx.notify();
+        }
     }
 
     fn complete(&mut self, callback: String, cx: &mut Context<Self>) {
         let Some((sso, _)) = self.pending.clone() else {
             return;
         };
-        if self.completing || callback.trim().is_empty() {
+        if callback.trim().is_empty() || (self.completing && sso.handoff() == Handoff::Desktop) {
             return;
         }
         self.finish_sign_in(async move { sso.complete(&callback).await }, cx);
@@ -231,14 +268,28 @@ impl SsoPanel {
         completion: impl Future<Output = anyhow::Result<(Client, User)>> + 'static,
         cx: &mut Context<Self>,
     ) {
+        let Some((attempt, _)) = &self.pending else {
+            return;
+        };
+        let handoff = attempt.handoff();
+        // A newer callback replaces both the validation task and any decision.
+        self.revision += 1;
+        let revision = self.revision;
+        self.confirmation = None;
         self.completing = true;
         self.error = None;
         cx.notify();
         self._completion_task = Some(cx.spawn(async move |this, cx| {
             let result = completion.await;
             let _ = this.update(cx, |this, cx| {
+                if this.revision != revision {
+                    return;
+                }
                 this.completing = false;
                 match result {
+                    Ok((client, me)) if handoff == Handoff::Mobile => {
+                        this.show_confirmation(client, me, cx);
+                    }
                     Ok((client, me)) => {
                         this.pending = None;
                         cx.emit(SsoEvent::SignedIn { client, me });
@@ -248,6 +299,93 @@ impl SsoPanel {
                 cx.notify();
             });
         }));
+    }
+
+    fn show_confirmation(&mut self, client: Client, me: User, cx: &mut Context<Self>) {
+        self.confirmation = Some((client, me));
+        // Focus the decision, never its commit button: Enter from the paste
+        // field (or a held key) must not accept an account.
+        let focus = self.confirmation_focus.clone();
+        let paste = self.paste.clone();
+        let _ = self.window.update(cx, |_, window, cx| {
+            paste.update(cx, |paste, cx| paste.set_value("", window, cx));
+            focus.focus(window, cx);
+        });
+    }
+
+    fn render_confirmation(
+        &self,
+        client: &Client,
+        me: &User,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let name = me.display_name();
+        let title = format!("Continue as {name}?");
+        let account = format!("@{}", me.username);
+        // Include the port and site path as well as the host for self-hosted servers.
+        let server = client.server().as_str().trim_end_matches('/').to_string();
+        let revision = self.revision;
+        v_flex()
+            // Pressed state belongs to this decision, not the panel location.
+            // Replacing an account must discard native mouse/key-down state.
+            .id(("sso-confirmation", revision))
+            .key_context("SsoConfirmation")
+            .on_action(
+                cx.listener(|this, _: &crate::actions::Dismiss, window, cx| {
+                    this.use_different_account(window, cx);
+                }),
+            )
+            .gap_4()
+            .child(
+                v_flex()
+                    .id("sso-account")
+                    .role(gpui_kit::Role::Group)
+                    .aria_label(format!("{title} {account} on {server}"))
+                    .test_support()
+                    .track_focus(&self.confirmation_focus)
+                    .when(self.confirmation_focus.is_focused(window), |this| {
+                        this.focus_ring_style(window, cx)
+                    })
+                    .gap_1()
+                    .child(div().text_lg().font_semibold().child(title))
+                    .child(div().text_sm().child(account))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(server),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .child("Check that this is the account you want to use."),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    // Keep visual and Tab order aligned. A queued Tab followed
+                    // by Enter/Space must reach the safe action on arrival.
+                    .child(
+                        Button::new("different-sso-account")
+                            .outline()
+                            .w_full()
+                            .label("Use a different account")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.use_different_account(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("confirm-sso")
+                            .primary()
+                            .w_full()
+                            .label(format!("Continue as @{}", me.username))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.confirm(revision, cx)),
+                            ),
+                    ),
+            )
     }
 
     fn provider_icon(kind: SsoKind) -> IconName {
@@ -291,7 +429,11 @@ impl SsoPanel {
                     .text_color(theme.muted_foreground)
                     .child(hint),
             )
-            .child(Input::new(&self.paste).disabled(self.completing))
+            .child(
+                Input::new(&self.paste)
+                    .id("sso-paste")
+                    .disabled(self.completing),
+            )
             .child(
                 h_flex().justify_end().child(
                     Button::new("cancel-sso")
@@ -305,9 +447,14 @@ impl SsoPanel {
 }
 
 impl Render for SsoPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let error = self.error.clone();
-        let content = if let Some((sso, provider)) = self.pending.clone() {
+        let content = if let Some((client, me)) = &self.confirmation {
+            Some(
+                self.render_confirmation(client, me, window, cx)
+                    .into_any_element(),
+            )
+        } else if let Some((sso, provider)) = self.pending.clone() {
             Some(
                 self.render_waiting(&provider, sso.handoff(), cx)
                     .into_any_element(),
@@ -320,10 +467,13 @@ impl Render for SsoPanel {
                     Some(
                         v_flex()
                             .gap_2()
-                            .children(providers.into_iter().map(|provider| {
+                            .children(providers.into_iter().enumerate().map(|(ix, provider)| {
                                 let label = format!("Continue with {}", provider.label());
                                 let id = SharedString::from(format!("sso-{:?}", provider.kind()));
                                 Button::new(id)
+                                    .when(ix == 0, |button| {
+                                        button.track_focus(&self.provider_focus)
+                                    })
                                     .outline()
                                     .w_full()
                                     .icon(Self::provider_icon(provider.kind()))
@@ -516,7 +666,448 @@ mod tests {
         cx.update(|cx| {
             assert!(!panel.read(cx).is_waiting());
             assert!(!panel.read(cx).completing);
+            assert!(panel.read(cx).confirmation.is_none());
         });
+    }
+
+    fn legacy_server() -> mattermost::testing::SlowServer {
+        use mattermost::testing::{Network, Reply, SlowServer};
+        use serde_json::json;
+        SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (request.method(), request.path()) {
+                ("GET", "/api/v4/config/client?format=old") => Reply::json(json!({
+                    "Version": "9.0.0", "EnableSignUpWithGitLab": "true"
+                })),
+                ("GET", "/api/v4/users/me") => {
+                    let username = if request.header("Authorization") == Some("Bearer bob") {
+                        "bob"
+                    } else {
+                        "ann"
+                    };
+                    Reply::json(json!({"id": username, "username": username,
+                        "first_name": if username == "ann" { "Ann" } else { "Bob" },
+                        "last_name": "Lee"}))
+                }
+                // Even failed revocation must leave the user free to retry.
+                ("POST", "/api/v4/users/logout") => Reply::json(json!({})).status(503),
+                _ => Reply::not_found(),
+            }
+        })
+    }
+
+    fn legacy_panel(
+        server: &mattermost::testing::SlowServer,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<SsoPanel>) {
+        cx.executor().allow_parking();
+        let options = futures::executor::block_on(sso::login_options(&server.url())).unwrap();
+        cx.update(gpui_kit::init);
+        cx.update(crate::actions::init);
+        let (window, panel) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut panel = SsoPanel::new(window, cx);
+                    panel.server = server.url();
+                    panel.lookup = Lookup::Loaded(options);
+                    panel
+                })
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("sso-GitLab", cx);
+        })
+        .unwrap();
+        (window, panel)
+    }
+
+    fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for SSO");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_confirmation(panel: &Entity<SsoPanel>, cx: &mut TestAppContext) {
+        wait_until(cx, |cx| {
+            panel.read_with(cx, |p, _| p.confirmation.is_some())
+        });
+    }
+
+    #[gpui_kit::test]
+    fn legacy_links_and_paste_require_explicit_account_confirmation(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        let server = legacy_server();
+        let (window, panel) = legacy_panel(&server, cx);
+        let accounts = Rc::new(RefCell::new(Vec::new()));
+        let observed = accounts.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&panel, move |_, event, _| {
+                let SsoEvent::SignedIn { client, me } = event;
+                observed
+                    .borrow_mut()
+                    .push((me.username.clone(), client.server().to_string()));
+            })
+        });
+        for pasted in [false, true] {
+            if pasted {
+                cx.update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    window.click("sso-GitLab", cx);
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                        "mmauth://callback?MMAUTHTOKEN=ann".into(),
+                    ));
+                    window.click("sso-paste", cx);
+                    window.press("secondary-v", cx);
+                })
+                .unwrap();
+            } else {
+                cx.update(|cx| {
+                    handle_open_urls(vec!["mmauth://callback?MMAUTHTOKEN=ann".into()], cx)
+                });
+            }
+            wait_for_confirmation(&panel, cx);
+            assert_eq!(accounts.borrow().len(), usize::from(pasted));
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(
+                    window.find("sso-account").label(),
+                    Some(format!("Continue as Ann Lee? @ann on {}", server.url()).as_str())
+                );
+                assert!(panel.read(cx).confirmation_focus.is_focused(window));
+                window.press("enter", cx);
+                assert!(
+                    panel.read(cx).confirmation.is_some(),
+                    "stray Enter accepted account"
+                );
+                if pasted {
+                    window.click("confirm-sso", cx);
+                } else {
+                    window.press("tab", cx);
+                    assert_eq!(window.find("different-sso-account").focused(), Some(true));
+                    window.press("tab", cx);
+                    assert_eq!(window.find("confirm-sso").focused(), Some(true));
+                    window.press("enter", cx);
+                }
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert_eq!(accounts.borrow().len(), 1 + usize::from(pasted));
+            assert_eq!(
+                accounts.borrow().last().unwrap(),
+                &("ann".into(), format!("{}/", server.url()))
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    fn different_account_and_escape_discard_and_revoke_without_waiting(cx: &mut TestAppContext) {
+        let server = legacy_server();
+        let (window, panel) = legacy_panel(&server, cx);
+        let _subscription =
+            cx.update(|cx| cx.subscribe(&panel, |_, _, _| panic!("discard signed in")));
+        for escape in [false, true] {
+            cx.update(|cx| {
+                panel.update(cx, |p, cx| {
+                    p.receive("mmauth://callback?MMAUTHTOKEN=ann".into(), cx)
+                })
+            });
+            wait_for_confirmation(&panel, cx);
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                if escape {
+                    window.press("tab", cx);
+                    window.press("escape", cx);
+                } else {
+                    window.click("different-sso-account", cx);
+                }
+                assert!(panel.read(cx).confirmation.is_none());
+                assert!(!panel.read(cx).is_waiting());
+                assert!(window.find("sso-GitLab").visible());
+                assert_eq!(window.find("sso-GitLab").focused(), Some(true));
+                assert!(panel.read(cx).paste.read(cx).value().is_empty());
+            })
+            .unwrap();
+            wait_until(cx, |_| {
+                server
+                    .requests()
+                    .iter()
+                    .filter(|r| r.method() == "POST" && r.path() == "/api/v4/users/logout")
+                    .count()
+                    == 1 + usize::from(escape)
+            });
+            if !escape {
+                cx.update_window(window, |_, window, cx| window.click("sso-GitLab", cx))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn newer_callbacks_replace_the_account_and_reject_old_actions(cx: &mut TestAppContext) {
+        let server = legacy_server();
+        let (window, panel) = legacy_panel(&server, cx);
+        let _subscription =
+            cx.update(|cx| cx.subscribe(&panel, |_, _, _| panic!("stale action signed in")));
+        cx.update(|cx| {
+            panel.update(cx, |p, cx| {
+                p.receive("mmauth://callback?MMAUTHTOKEN=ann".into(), cx)
+            })
+        });
+        wait_for_confirmation(&panel, cx);
+        let old_revision = panel.read_with(cx, |p, _| p.revision);
+        cx.update(|cx| {
+            panel.update(cx, |p, cx| {
+                p.receive("mmauth://callback?MMAUTHTOKEN=bob".into(), cx);
+                assert!(p.confirmation.is_none());
+            })
+        });
+        wait_for_confirmation(&panel, cx);
+        cx.update(|cx| {
+            panel.update(cx, |p, cx| {
+                assert_eq!(p.confirmation.as_ref().unwrap().1.username, "bob");
+                p.confirm(old_revision, cx);
+                assert!(p.confirmation.is_some());
+            })
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("confirm-sso").label(), Some("Continue as @bob"));
+        })
+        .unwrap();
+        cx.update(|cx| {
+            panel.update(cx, |p, cx| {
+                p.receive("mmauth://callback?invalid".into(), cx)
+            })
+        });
+        wait_until(cx, |cx| panel.read_with(cx, |p, _| !p.completing));
+        cx.update(|cx| {
+            assert!(panel.read(cx).confirmation.is_none());
+            assert!(panel.read(cx).error.is_some());
+        });
+    }
+
+    /// Resolve validation through the production completion task without drawing
+    /// a waiting frame between the old and new accounts.
+    fn resolve_account(panel: &Entity<SsoPanel>, username: &str, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            panel.update(cx, |p, cx| {
+                let client = Client::new_unverified(&p.server, username).unwrap();
+                let mut me = User::default();
+                me.username = username.into();
+                me.first_name = username.into();
+                p.finish_sign_in(async move { Ok((client, me)) }, cx);
+            })
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn replacing_confirmation_cancels_a_mouse_press_on_the_previous_account(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::{MouseButton, test::TestEventExt as _};
+        use std::{cell::RefCell, rc::Rc};
+        let server = legacy_server();
+        let (window, panel) = legacy_panel(&server, cx);
+        let accounts = Rc::new(RefCell::new(Vec::new()));
+        let observed = accounts.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&panel, move |_, event, _| {
+                let SsoEvent::SignedIn { me, .. } = event;
+                observed.borrow_mut().push(me.username.clone());
+            })
+        });
+        resolve_account(&panel, "ann", cx);
+        let down = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let point = window.find("confirm-sso").bounds().center();
+                window.pointer_move(point, None, cx);
+                window.pointer_down(point, MouseButton::Left, cx);
+                point
+            })
+            .unwrap();
+        // No render while validation replaces Ann with Bob. The next frame
+        // must not inherit Ann's pending mouse-down at the same coordinates.
+        cx.update(|cx| {
+            panel.update(cx, |p, cx| {
+                p.finish_sign_in(std::future::pending(), cx);
+                // Deliver the validated result synchronously: running the executor
+                // here could draw the waiting state and accidentally mask the race.
+                p.completing = false;
+                let client = Client::new_unverified(&server.url(), "bob").unwrap();
+                let mut me = User::default();
+                me.username = "bob".into();
+                me.first_name = "bob".into();
+                p.show_confirmation(client, me, cx);
+            })
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("confirm-sso").label(), Some("Continue as @bob"));
+            assert_eq!(window.find("confirm-sso").bounds().center(), down);
+            window.pointer_up(down, MouseButton::Left, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            accounts.borrow().is_empty(),
+            "mouse-up accepted a replacement account"
+        );
+        cx.update_window(window, |_, window, cx| window.click("confirm-sso", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(&*accounts.borrow(), &["bob"]);
+    }
+
+    #[gpui_kit::test]
+    fn queued_login_keys_cannot_accept_an_arriving_account(cx: &mut TestAppContext) {
+        use crate::login::LoginView;
+        use gpui_kit::test::TestEventExt as _;
+        let server = legacy_server();
+        cx.executor().allow_parking();
+        let options = futures::executor::block_on(sso::login_options(&server.url())).unwrap();
+        cx.update(gpui_kit::init);
+        cx.update(crate::actions::init);
+        let (window, login) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| LoginView::new(None, window, cx))
+            })
+            .unwrap()
+        });
+        let panel = cx.update(|cx| {
+            cx.global::<SsoCallbacks>()
+                .panel
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .unwrap()
+        });
+        let _subscription =
+            cx.update(|cx| cx.subscribe(&login, |_, _, _| panic!("queued keys signed in")));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("login-server", cx);
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(server.url()));
+            window.press("secondary-a", cx);
+            window.press("secondary-v", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        // Keep provider discovery deterministic; exercise the real LoginView,
+        // server field, SSO task, focus tree and SignedIn forwarding below.
+        cx.update(|cx| {
+            panel.update(cx, |p, cx| {
+                p._lookup_task = None;
+                p.server = server.url();
+                p.lookup = Lookup::Loaded(options);
+                cx.notify();
+            })
+        });
+        for key in ["enter", "space"] {
+            for held in [false, true] {
+                cx.update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    window.click("sso-GitLab", cx);
+                    window.click("login-server", cx);
+                    assert_eq!(window.find("login-server").focused(), Some(true));
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                        "mmauth://callback?MMAUTHTOKEN=ann".into(),
+                    ));
+                })
+                .unwrap();
+                // The injected callback resolves before queued Tab/paste/Enter
+                // (or Space/repeat) intended for the waiting paste input runs.
+                resolve_account(&panel, "bob", cx);
+                cx.update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    assert!(panel.read(cx).confirmation_focus.is_focused(window));
+                    // Unaccompanied activation and repeat on arrival are inert.
+                    window.key_down(key, held, cx);
+                    window.key_up(key, cx);
+                    assert!(panel.read(cx).confirmation.is_some());
+                    window.press("tab", cx);
+                    assert_eq!(window.find("different-sso-account").focused(), Some(true));
+                    window.press("secondary-v", cx);
+                    window.key_down(key, false, cx);
+                    if held {
+                        window.key_down(key, true, cx);
+                        window.key_down(key, true, cx);
+                    }
+                    window.key_up(key, cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                assert!(!panel.read_with(cx, |p, _| p.is_waiting()));
+                assert!(panel.read_with(cx, |p, _| p.confirmation.is_none()));
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn cancelling_changing_server_and_restarting_clear_confirmations(cx: &mut TestAppContext) {
+        let server = legacy_server();
+        let (window, panel) = legacy_panel(&server, cx);
+        let _subscription =
+            cx.update(|cx| cx.subscribe(&panel, |_, _, _| panic!("cancelled account signed in")));
+        for change in ["cancel", "server", "start", "new callback"] {
+            let (send, receive) = futures::channel::oneshot::channel();
+            cx.update(|cx| {
+                panel.update(cx, |p, cx| {
+                    p.pending = Some((
+                        SsoAttempt::new(&server.url(), Handoff::Mobile).unwrap(),
+                        "GitLab".into(),
+                    ));
+                    p.finish_sign_in(async move { receive.await.unwrap() }, cx);
+                })
+            });
+            send.send(signed_in()).ok().unwrap();
+            cx.run_until_parked();
+            assert!(panel.read_with(cx, |p, _| p.confirmation.is_some()));
+            let old_revision = panel.read_with(cx, |p, _| p.revision);
+            cx.update_window(window, |_, window, cx| {
+                panel.update(cx, |p, cx| {
+                    match change {
+                        "cancel" => p.cancel(window, cx),
+                        "server" => p.set_server("", cx),
+                        "start" => {
+                            p.server = server.url();
+                            p.lookup = Lookup::Loaded(
+                                futures::executor::block_on(sso::login_options(&server.url()))
+                                    .unwrap(),
+                            );
+                            let Lookup::Loaded(options) = &p.lookup else {
+                                unreachable!()
+                            };
+                            p.start(&options.providers[0].clone(), cx);
+                        }
+                        _ => p.finish_sign_in(std::future::pending(), cx),
+                    }
+                    assert!(p.confirmation.is_none());
+                    p.confirm(old_revision, cx);
+                })
+            })
+            .unwrap();
+        }
+        // Replace a validation still in flight; even a racing success is obsolete.
+        let (send, receive) = futures::channel::oneshot::channel();
+        cx.update(|cx| {
+            panel.update(cx, |p, cx| {
+                p.finish_sign_in(async move { receive.await.unwrap() }, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| panel.update(cx, |p, cx| p.finish_sign_in(std::future::pending(), cx)));
+        let _ = send.send(signed_in());
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |p, _| p.confirmation.is_none()));
     }
 
     /// The panel in a column as narrow as the sign-in card's.
@@ -527,6 +1118,52 @@ mod tests {
     impl Render for Narrow {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             v_flex().w(px(WIDTH)).child(self.0.clone())
+        }
+    }
+
+    #[gpui_kit::test]
+    fn account_confirmation_fits_the_sign_in_column_at_larger_text_sizes(cx: &mut TestAppContext) {
+        use gpui_kit::component::{Theme, ThemeMode};
+        cx.update(gpui_kit::init);
+        let (window, _) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                let panel = cx.new(|cx| {
+                    let mut panel = SsoPanel::new(window, cx);
+                    let mut me = User::default();
+                    me.first_name = "Ann Alexandra Catherine".into();
+                    me.last_name = "Lee de la Cruz".into();
+                    me.username = "ann.alexandra.lee".into();
+                    panel.confirmation = Some((
+                        Client::new_unverified("https://chat.example.com/mattermost", "token")
+                            .unwrap(),
+                        me,
+                    ));
+                    panel.confirmation_focus.focus(window, cx);
+                    panel
+                });
+                cx.new(|_| Narrow(panel))
+            })
+            .unwrap()
+        });
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            for font_size in [16., 20.] {
+                cx.update_window(window, |_, window, cx| {
+                    Theme::change(mode, Some(window), cx);
+                    Theme::update(cx, |theme| theme.font_size = px(font_size));
+                    window.render_frame(cx);
+                    let account = window.find("sso-account").bounds();
+                    let confirm = window.find("confirm-sso").bounds();
+                    let different = window.find("different-sso-account").bounds();
+                    assert_eq!(account.left(), confirm.left());
+                    assert_eq!(confirm.left(), different.left());
+                    assert_eq!(confirm.right(), different.right());
+                    assert!(account.right() <= px(WIDTH));
+                    assert!(confirm.right() <= px(WIDTH));
+                    assert!(different.top() > account.bottom());
+                    assert!(confirm.top() > different.bottom());
+                })
+                .unwrap();
+            }
         }
     }
 
