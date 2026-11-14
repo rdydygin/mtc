@@ -108,7 +108,11 @@ shortcuts, and unrecognized file types are shown in the file manager instead of 
 On macOS, downloaded attachments are marked for Gatekeeper checks. On Windows,
 documents and media are marked as Internet downloads before opening; if marking fails,
 they are shown in the file manager instead.
-Message links open web pages (`http` and `https`) and email addresses (`mailto`);
+Mattermost message permalinks on your signed-in server open in mtc, including
+older messages, replies in their threads, and messages in other joined teams. Channel
+links open joined channels. If a message cannot be opened, a notification offers
+**Open in browser**; unknown channel links open in the browser.
+Other message links open web pages (`http` and `https`) and email addresses (`mailto`);
 other link types show a notification and are not sent to system handlers.
 
 Search a conversation's messages with ⌘F, or all channels in the current team with ⌘⇧F.

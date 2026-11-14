@@ -132,6 +132,7 @@ pub struct Workspace {
     /// The window is too narrow for both, so the thread or search is shown
     /// in the place of the channel or the Threads list.
     side_replaces_content: bool,
+    _link_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -175,6 +176,7 @@ impl Workspace {
             }),
             cx.subscribe_in(&session, window, |this, session, event, window, cx| {
                 if let SessionEvent::SignedOut = event {
+                    this._link_task = None;
                     cx.emit(WorkspaceEvent::SignedOut);
                     return;
                 }
@@ -221,6 +223,7 @@ impl Workspace {
             thread_list_width_rem: None,
             drag_origin: Vec::new(),
             side_replaces_content: false,
+            _link_task: None,
             _subscriptions: subscriptions,
         }
     }
@@ -422,6 +425,7 @@ impl Workspace {
                 let channel = view.read(cx).kind().channel().clone();
                 self.open_thread(channel, root.clone(), window, cx);
             }
+            TimelineViewEvent::OpenLink(url) => self.open_link(url, window, cx),
             TimelineViewEvent::OpenChannel(id) => self.open_channel(id, window, cx),
             TimelineViewEvent::Close => self.close_thread(window, cx),
         }
@@ -592,6 +596,112 @@ impl Workspace {
             SearchEvent::Open(post) => self.show_result(post, window, cx),
             SearchEvent::Close => self.close_search(window, cx),
         }
+    }
+
+    /// Resolve server links before changing the visible conversation.
+    fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::links::{Destination, destination};
+        self._link_task = None;
+        let mut revision = self.session.read(cx).team_revision();
+        let client = self.client(cx);
+        let Some(target) = destination(client.server(), url) else {
+            crate::post_row::open_external_link(url, window, cx);
+            return;
+        };
+        let channel_link = matches!(target, Destination::Channel { .. });
+        let url = url.to_owned();
+        let session = self.session.clone();
+        self._link_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<()> = async {
+                let (post, channel) = match target {
+                    Destination::Post(id) => {
+                        let post = client.post_by_id(&id.into()).await?;
+                        let channel = client.channel(&post.channel_id).await?;
+                        (Some(post), channel)
+                    }
+                    Destination::Channel { team, name } => {
+                        let team = session
+                            .read_with(cx, |s, _| {
+                                s.teams()
+                                    .iter()
+                                    .find(|t| t.name == team)
+                                    .map(|t| t.id.clone())
+                            })
+                            .ok_or_else(|| anyhow::anyhow!("Team unavailable"))?;
+                        let channel = client
+                            .my_channels(&team)
+                            .await?
+                            .into_iter()
+                            .find(|c| c.name == name && c.team_id == team && c.delete_at == 0)
+                            .ok_or_else(|| anyhow::anyhow!("Channel unavailable"))?;
+                        (None, channel)
+                    }
+                };
+                // Verify membership before switching teams or opening anything.
+                client.my_channel_member(&channel.id).await?;
+                let task = session.update(cx, |s, cx| -> anyhow::Result<_> {
+                    anyhow::ensure!(s.team_revision() == revision, "Team changed");
+                    if !channel.team_id.as_str().is_empty() {
+                        anyhow::ensure!(
+                            s.teams().iter().any(|t| t.id == channel.team_id),
+                            "Team unavailable"
+                        );
+                        s.select_team(channel.team_id.clone(), cx);
+                    }
+                    revision = s.team_revision();
+                    Ok(s.ensure_channel(&channel.id, cx))
+                })?;
+                if let Err(error) = task.await {
+                    // A team snapshot can finish while hydration is in flight.
+                    // Retry against that snapshot, but respect a newer team choice.
+                    let retry = session.update(cx, |s, cx| {
+                        anyhow::ensure!(s.team_revision() == revision, "Team changed");
+                        Ok::<_, anyhow::Error>(s.ensure_channel(&channel.id, cx))
+                    })?;
+                    retry.await.map_err(|_| error)?;
+                }
+                this.update_in(cx, |this, window, cx| {
+                    // Validate again at the visible commit, including DMs/GM channels.
+                    if this.session.read(cx).team_revision() != revision {
+                        return;
+                    }
+                    this.search_open = false;
+                    this.close_thread(window, cx);
+                    this.open_channel(&channel.id, window, cx);
+                    if let Some(post) = post {
+                        this.show_result(&post, window, cx);
+                    }
+                })?;
+                Ok(())
+            }
+            .await;
+            if result.is_err() {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    // Superseded work is cancellation, not an inaccessible destination.
+                    if this.session.read(cx).team_revision() != revision {
+                        return;
+                    }
+                    if channel_link {
+                        crate::post_row::open_external_link(&url, window, cx);
+                        return;
+                    }
+                    use gpui_kit::component::{button::Button, notification::Notification};
+                    window.push_notification(
+                        Notification::new()
+                            .message("This link couldn’t be opened in mtc.")
+                            .action(move |_, _, _| {
+                                let url = url.clone();
+                                Button::new("open-link-in-browser")
+                                    .label("Open in browser")
+                                    .on_click(move |_, window, cx| {
+                                        crate::post_row::open_external_link(&url, window, cx);
+                                    })
+                            }),
+                        cx,
+                    );
+                });
+            }
+        }));
     }
 
     /// Show a search result where it was written: a reply in its thread,
@@ -2284,5 +2394,333 @@ mod tests {
                 json!({"mark_unread":"all"})
             ]
         );
+    }
+
+    fn permalink_route(request: &Request) -> Reply {
+        if request.method() != "GET" {
+            return route(request);
+        }
+        let path = request.path().split('?').next().unwrap();
+        match path {
+            "/api/v4/users/me/teams" => Reply::json(json!([
+                {"id":"team", "name":"team"}, {"id":"other", "name":"other"}
+            ])),
+            "/api/v4/posts/denied" => Reply::json(json!({"message":"Forbidden"})).status(403),
+            "/api/v4/posts/root" | "/api/v4/posts/reply" | "/api/v4/posts/away" => {
+                let id = path.rsplit('/').next().unwrap();
+                Reply::json(
+                    json!({"id":id, "channel_id":if id == "away" {"remote"} else {"town"},
+                    "root_id":if id == "reply" {"root"} else {""}, "create_at":10, "message":"hello"}),
+                )
+            }
+            "/api/v4/channels/town" => Reply::json(
+                json!({"id":"town", "team_id":"team", "type":"O", "name":"town-square"}),
+            ),
+            "/api/v4/channels/remote" => {
+                Reply::json(json!({"id":"remote", "team_id":"other", "type":"O", "name":"remote"}))
+            }
+            "/api/v4/channels/town/members/me" | "/api/v4/channels/remote/members/me" => {
+                Reply::json(json!({"user_id":"me"}))
+            }
+            "/api/v4/users/me/teams/other/channels"
+            | "/api/v4/users/me/teams/other/channels/members" => Reply::json(json!([])),
+            "/api/v4/channels/town/posts" | "/api/v4/channels/remote/posts" => {
+                if request.path().contains("before=") {
+                    Reply::json(json!({"order":["root", "away"], "posts":{
+                        "root":{"id":"root", "channel_id":"town", "message":"old", "create_at":10},
+                        "away":{"id":"away", "channel_id":"remote", "message":"old", "create_at":10}
+                    }}))
+                } else {
+                    let posts: serde_json::Map<String, serde_json::Value> = (60..120).map(|i| {
+                        (format!("n{i}"), json!({"id":format!("n{i}"), "channel_id":if path.contains("remote") {"remote"} else {"town"}, "message":"recent", "create_at":100+i}))
+                    }).collect();
+                    Reply::json(
+                        json!({"order":(60..120).map(|i| format!("n{i}")).collect::<Vec<_>>(), "posts":posts}),
+                    )
+                }
+            }
+            _ => route(request),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn permalinks_open_posts_threads_and_other_joined_teams(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), permalink_route);
+        let (window, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| w.session.read(cx).is_loaded())
+        });
+        let url = format!("{}/team/channels/town-square", server.url());
+        cx.update_window(window, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_link(&url, window, cx))
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, _| {
+                w.active.as_ref().is_some_and(|c| c.as_str() == "town")
+            })
+        });
+        for (id, channel, root) in [
+            ("root", "town", None),
+            ("reply", "town", Some("root")),
+            ("away", "remote", None),
+        ] {
+            let url = format!("{}/team/pl/{id}", server.url());
+            cx.update_window(window, |_, window, cx| {
+                workspace.update(cx, |w, cx| w.open_link(&url, window, cx))
+            })
+            .unwrap();
+            wait_until(cx, |cx| {
+                workspace.read_with(cx, |w, cx| {
+                    w.active.as_ref().is_some_and(|c| c.as_str() == channel)
+                        && match root {
+                            Some(root) => w.thread.as_ref().is_some_and(|(t, _)| {
+                                t.read(cx)
+                                    .kind()
+                                    .root()
+                                    .is_some_and(|id| id.as_str() == root)
+                            }),
+                            None => w.thread.is_none(),
+                        }
+                        && match root {
+                            Some(_) => w.thread.as_ref().is_some_and(|(t, _)| {
+                                t.read(cx).flashed_post().is_some_and(|p| p.as_str() == id)
+                            }),
+                            None => w.active_view().is_some_and(|t| {
+                                t.read(cx).flashed_post().is_some_and(|p| p.as_str() == id)
+                            }),
+                        }
+                })
+            });
+        }
+        assert!(server.requests().iter().any(|r| r.method() == "GET"
+            && r.path().starts_with("/api/v4/channels/town/posts?")
+            && r.path().contains("before=")));
+        assert!(server.requests().iter().any(|r| r.method() == "GET"
+            && r.path().starts_with("/api/v4/channels/remote/posts?")
+            && r.path().contains("before=")));
+        assert_eq!(
+            workspace.read_with(cx, |w, cx| w
+                .session
+                .read(cx)
+                .team()
+                .unwrap()
+                .id
+                .to_string()),
+            "other"
+        );
+        assert!(cx.opened_url().is_none());
+    }
+
+    fn click_test_link(
+        window: AnyWindowHandle,
+        workspace: &Entity<Workspace>,
+        server: &SlowServer,
+        path: &str,
+        cx: &mut TestAppContext,
+    ) {
+        let url = format!("{}{path}", server.url());
+        cx.update_window(window, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_link(&url, window, cx))
+        })
+        .unwrap();
+    }
+
+    fn no_link_feedback(window: AnyWindowHandle, cx: &mut TestAppContext) {
+        assert!(cx.opened_url().is_none());
+        cx.update_window(window, |_, window, cx| {
+            assert!(window.notifications(cx).is_empty())
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_newer_click_supersedes_a_delayed_permalink(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(30)), permalink_route);
+        let (window, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| {
+                w.session.read(cx).is_loaded() && w.session.read(cx).teams_loaded()
+            })
+        });
+        click_test_link(window, &workspace, &server, "/other/pl/away", cx);
+        wait_until(cx, |_| {
+            server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "GET" && r.path() == "/api/v4/posts/away")
+        });
+        click_test_link(window, &workspace, &server, "/team/pl/root", cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| {
+                w.active_view().is_some_and(|t| {
+                    t.read(cx)
+                        .flashed_post()
+                        .is_some_and(|p| p.as_str() == "root")
+                })
+            })
+        });
+        workspace.read_with(cx, |w, cx| {
+            assert_eq!(w.session.read(cx).team().unwrap().id.as_str(), "team");
+            assert_eq!(w.active.as_ref().unwrap().as_str(), "town");
+            assert!(w.thread.is_none());
+        });
+        no_link_feedback(window, cx);
+    }
+
+    fn dm_route(request: &Request) -> Reply {
+        match (request.method(), request.path()) {
+            ("GET", "/api/v4/posts/dm-post") => Reply::json(
+                json!({"id":"dm-post", "channel_id":"dm", "message":"DM", "create_at":10}),
+            ),
+            ("GET", "/api/v4/channels/dm") => {
+                Reply::json(json!({"id":"dm", "team_id":"", "type":"D", "name":"me__ann"}))
+            }
+            ("GET", "/api/v4/channels/dm/members/me") => Reply::json(json!({"user_id":"me"})),
+            _ => permalink_route(request),
+        }
+    }
+
+    fn cancel_during_dm_hydration(cx: &mut TestAppContext, return_to_team: bool, sign_out: bool) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(30)), dm_route);
+        let (window, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| {
+                w.session.read(cx).is_loaded() && w.session.read(cx).teams_loaded()
+            })
+        });
+        let session = workspace.read_with(cx, |w, _| w.session.clone());
+        // Keep a thread and search open: stale work must not close either.
+        cx.update_window(window, |_, window, cx| {
+            workspace.update(cx, |w, cx| {
+                w.open_channel(&"town".into(), window, cx);
+                w.search_conversation(&SearchConversation, window, cx);
+                w.open_thread("town".into(), "root".into(), window, cx);
+            })
+        })
+        .unwrap();
+        click_test_link(window, &workspace, &server, "/team/pl/dm-post", cx);
+        wait_until(cx, |_| {
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.method() == "GET" && r.path() == "/api/v4/channels/dm")
+                .count()
+                == 2
+        });
+        if sign_out {
+            session.update(cx, |_, cx| cx.emit(SessionEvent::SignedOut));
+        } else {
+            session.update(cx, |s, cx| {
+                s.select_team("other".into(), cx);
+                if return_to_team {
+                    s.select_team("team".into(), cx);
+                }
+            });
+        }
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, _| {
+                w._link_task.as_ref().is_none_or(|t| t.is_ready())
+            })
+        });
+        workspace.read_with(cx, |w, cx| {
+            assert!(w.active.as_ref().is_none_or(|id| id.as_str() != "dm"));
+            assert!(w.session.read(cx).channel(&"dm".into()).is_none());
+            // A->B->A retains the same team panes; only stale navigation could close them.
+            if return_to_team || sign_out {
+                assert!(w.thread.is_some());
+                assert!(w.search_open);
+            }
+        });
+        no_link_feedback(window, cx);
+    }
+
+    #[gpui_kit::test]
+    fn manual_team_switch_cancels_teamless_hydration_silently(cx: &mut TestAppContext) {
+        cancel_during_dm_hydration(cx, false, false);
+    }
+
+    #[gpui_kit::test]
+    fn a_team_round_trip_still_cancels_teamless_hydration(cx: &mut TestAppContext) {
+        cancel_during_dm_hydration(cx, true, false);
+    }
+
+    #[gpui_kit::test]
+    fn sign_out_cancels_pending_link_navigation(cx: &mut TestAppContext) {
+        cancel_during_dm_hydration(cx, false, true);
+    }
+
+    #[gpui_kit::test]
+    fn membership_denial_after_post_lookup_offers_browser(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |r| {
+            if r.method() == "GET" && r.path() == "/api/v4/channels/dm/members/me" {
+                Reply::json(json!({"message":"Forbidden"})).status(403)
+            } else {
+                dm_route(r)
+            }
+        });
+        let (window, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| {
+                w.session.read(cx).is_loaded() && w.session.read(cx).teams_loaded()
+            })
+        });
+        click_test_link(window, &workspace, &server, "/team/pl/dm-post", cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, _| {
+                w._link_task.as_ref().is_some_and(|t| t.is_ready())
+            })
+        });
+        assert!(
+            server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "GET" && r.path() == "/api/v4/posts/dm-post")
+        );
+        workspace.read_with(cx, |w, _| {
+            assert!(w.active.as_ref().is_none_or(|id| id.as_str() != "dm"))
+        });
+        assert!(cx.opened_url().is_none());
+        cx.update_window(window, |_, window, cx| {
+            assert_eq!(window.notifications(cx).len(), 1)
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn inaccessible_permalink_offers_browser_and_unknown_channel_falls_back(
+        cx: &mut TestAppContext,
+    ) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), permalink_route);
+        let (window, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| w.session.read(cx).is_loaded())
+        });
+        let url = format!("{}/team/pl/denied", server.url());
+        cx.update_window(window, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_link(&url, window, cx))
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            cx.update_window(window, |_, window, cx| !window.notifications(cx).is_empty())
+                .unwrap()
+        });
+        assert!(cx.opened_url().is_none());
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("open-link-in-browser", cx);
+        })
+        .unwrap();
+        assert_eq!(cx.opened_url().as_deref(), Some(url.as_str()));
+        let url = format!("{}/team/channels/missing", server.url());
+        cx.update_window(window, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_link(&url, window, cx))
+        })
+        .unwrap();
+        wait_until(cx, |cx| cx.opened_url().as_deref() == Some(url.as_str()));
     }
 }

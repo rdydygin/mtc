@@ -279,6 +279,11 @@ impl Client {
             .await
     }
 
+    /// Fetch a message by its permalink id.
+    pub async fn post_by_id(&self, post: &PostId) -> Result<Post> {
+        self.get(format!("posts/{post}")).await
+    }
+
     pub async fn channel(&self, channel: &ChannelId) -> Result<Channel> {
         self.get(format!("channels/{channel}")).await
     }
