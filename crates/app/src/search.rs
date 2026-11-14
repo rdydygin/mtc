@@ -774,13 +774,18 @@ mod tests {
     }
 
     fn route(request: &Request) -> Reply {
-        match request.path().split('?').next().unwrap_or_default() {
-            "/api/v4/users/me/teams" => Reply::json(json!([{ "id": "team", "name": "team" }])),
-            "/api/v4/users/me/teams/team/channels" => Reply::json(json!([
+        match (
+            request.method(),
+            request.path().split('?').next().unwrap_or_default(),
+        ) {
+            ("GET", "/api/v4/users/me/teams") => {
+                Reply::json(json!([{ "id": "team", "name": "team" }]))
+            }
+            ("GET", "/api/v4/users/me/teams/team/channels") => Reply::json(json!([
                 { "id": "town", "team_id": "team", "type": "O", "name": "town-square",
                   "display_name": "Town Square" },
             ])),
-            "/api/v4/teams/team/posts/search" => Reply::json(json!({
+            ("POST", "/api/v4/teams/team/posts/search") => Reply::json(json!({
                 "order": ["new", "old"],
                 "posts": {
                     "new": { "id": "new", "channel_id": "town", "user_id": "ann",
@@ -790,19 +795,22 @@ mod tests {
                 },
                 "matches": { "new": ["hello"], "old": ["hello"] },
             })),
-            "/api/v4/users/me/teams/team/channels/members"
-            | "/api/v4/users/me/preferences/favorite_channel"
-            | "/api/v4/emoji"
-            | "/api/v4/users/ids"
-            | "/api/v4/users/status/ids" => Reply::json(json!([])),
+            ("GET", "/api/v4/users/me/teams/team/channels/members")
+            | ("GET", "/api/v4/users/me/preferences/favorite_channel")
+            | ("GET", "/api/v4/emoji")
+            | ("POST", "/api/v4/users/ids")
+            | ("POST", "/api/v4/users/status/ids") => Reply::json(json!([])),
             _ => Reply::not_found(),
         }
     }
 
     /// The same, with another page of results always waiting.
     fn paged_route(request: &Request) -> Reply {
-        match request.path().split('?').next().unwrap_or_default() {
-            "/api/v4/teams/team/posts/search" => Reply::json(json!({
+        match (
+            request.method(),
+            request.path().split('?').next().unwrap_or_default(),
+        ) {
+            ("POST", "/api/v4/teams/team/posts/search") => Reply::json(json!({
                 "order": ["new"],
                 "posts": {
                     "new": { "id": "new", "channel_id": "town", "user_id": "ann",
@@ -825,7 +833,9 @@ mod tests {
         let mut me = User::default();
         me.id = "me".into();
         let session = cx.new(|cx| Session::new(client, me, Some(TeamId::from("team")), cx));
-        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.is_loaded() && s.team().is_some())
+        });
         let (window, view) = cx.update(|cx| {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -917,11 +927,9 @@ mod tests {
         // in between.
         type_keys(cx, |window, cx| window.input("!", cx));
         type_keys(cx, |window, cx| window.press("backspace", cx));
-        for _ in 0..10 {
-            cx.executor().advance_clock(DEBOUNCE);
-            std::thread::sleep(Duration::from_millis(5));
-            cx.run_until_parked();
-        }
+        view.read_with(cx, |v, _| assert!(v._search.is_none()));
+        cx.executor().advance_clock(DEBOUNCE);
+        cx.run_until_parked();
         assert_eq!(searches(&server), 1);
         view.read_with(cx, |v, _| assert!(matches!(v.status, Status::Done)));
 
@@ -978,7 +986,8 @@ mod tests {
     fn an_unavailable_page_still_allows_loading_more_results(cx: &mut TestAppContext) {
         let searches = std::sync::atomic::AtomicUsize::new(0);
         let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
-            if request.path() == "/api/v4/teams/team/posts/search"
+            if request.method() == "POST"
+                && request.path() == "/api/v4/teams/team/posts/search"
                 && searches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
             {
                 Reply::json(json!({

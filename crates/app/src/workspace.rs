@@ -1192,13 +1192,16 @@ mod tests {
     #[gpui_kit::test]
     fn team_search_shortcut_opens_other_channels_and_their_threads(cx: &mut TestAppContext) {
         let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
-            match request.path().split('?').next().unwrap_or_default() {
-                "/api/v4/users/me/teams" => Reply::json(json!([
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("GET", "/api/v4/users/me/teams") => Reply::json(json!([
                     { "id": "team", "name": "team" }, { "id": "next", "name": "next" }
                 ])),
-                "/api/v4/users/me/teams/next/channels"
-                | "/api/v4/users/me/teams/next/channels/members" => Reply::json(json!([])),
-                "/api/v4/teams/team/posts/search" => Reply::json(json!({
+                ("GET", "/api/v4/users/me/teams/next/channels")
+                | ("GET", "/api/v4/users/me/teams/next/channels/members") => Reply::json(json!([])),
+                ("POST", "/api/v4/teams/team/posts/search") => Reply::json(json!({
                     "has_next": true, "order": ["remote", "reply"], "posts": {
                         "remote": { "id": "remote", "channel_id": "other", "user_id": "ann",
                                     "message": "hello", "create_at": 40 },
@@ -1206,13 +1209,13 @@ mod tests {
                                    "root_id": "root", "message": "hello reply", "create_at": 30 }
                     }
                 })),
-                "/api/v4/channels/other" => Reply::json(json!({
+                ("GET", "/api/v4/channels/other") => Reply::json(json!({
                     "id": "other", "team_id": "team", "type": "O", "name": "other", "display_name": "Other"
                 })),
-                "/api/v4/channels/other/members/me" => Reply::json(json!({
+                ("GET", "/api/v4/channels/other/members/me") => Reply::json(json!({
                     "channel_id": "other", "user_id": "me"
                 })),
-                "/api/v4/channels/other/posts" => Reply::json(json!({
+                ("GET", "/api/v4/channels/other/posts") => Reply::json(json!({
                     "order": ["remote"], "posts": {"remote": {
                         "id": "remote", "channel_id": "other", "user_id": "ann",
                         "message": "hello", "create_at": 40
@@ -1223,7 +1226,9 @@ mod tests {
         });
         let (handle, workspace) = open_workspace(&server, cx);
         wait_until(cx, |cx| {
-            workspace.read_with(cx, |w, cx| w.session.read(cx).team().is_some())
+            workspace.read_with(cx, |w, cx| {
+                w.session.read(cx).team().is_some() && w.session.read(cx).is_loaded()
+            })
         });
         cx.update_window(handle, |_, window, cx| {
             workspace.update(cx, |w, cx| w.open_channel(&"town".into(), window, cx));
@@ -1247,7 +1252,7 @@ mod tests {
             server
                 .requests()
                 .iter()
-                .any(|r| r.path() == "/api/v4/channels/other")
+                .any(|r| r.method() == "GET" && r.path() == "/api/v4/channels/other")
         });
         // Wait for the result rows to arrive, then use the keyboard to open one.
         wait_until(cx, |cx| {
@@ -1323,7 +1328,8 @@ mod tests {
     #[gpui_kit::test]
     fn do_not_disturb_silences_mentions_and_direct_messages(cx: &mut TestAppContext) {
         let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
-            if request.path() == "/api/v4/users/me/teams/team/channels" {
+            if request.method() == "GET" && request.path() == "/api/v4/users/me/teams/team/channels"
+            {
                 Reply::json(json!([
                     { "id": "town", "team_id": "team", "type": "O", "name": "town-square" },
                     { "id": "dm", "type": "D", "name": "me__ann" }

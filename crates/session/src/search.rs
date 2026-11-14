@@ -178,12 +178,17 @@ mod tests {
         }
 
         fn route(request: &Request) -> Reply {
-            match request.path().split('?').next().unwrap_or_default() {
-                "/api/v4/users/me/teams" => Reply::json(json!([{ "id": "team", "name": "team" }])),
-                "/api/v4/users/me/teams/team/channels" => Reply::json(json!([
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("GET", "/api/v4/users/me/teams") => {
+                    Reply::json(json!([{ "id": "team", "name": "team" }]))
+                }
+                ("GET", "/api/v4/users/me/teams/team/channels") => Reply::json(json!([
                     { "id": "town", "team_id": "team", "type": "O", "name": "town-square" },
                 ])),
-                "/api/v4/teams/team/posts/search" => Reply::json(json!({
+                ("POST", "/api/v4/teams/team/posts/search") => Reply::json(json!({
                     "order": ["here", "elsewhere"],
                     "posts": {
                         "here": { "id": "here", "channel_id": "town", "user_id": "ann",
@@ -192,18 +197,20 @@ mod tests {
                                        "user_id": "bob", "message": "hello", "create_at": 1 },
                     },
                 })),
-                "/api/v4/channels/other" => Reply::json(json!({
+                ("GET", "/api/v4/channels/other") => Reply::json(json!({
                     "id": "other", "team_id": "team", "name": "other", "type": "O", "last_post_at": 20
                 })),
-                "/api/v4/channels/other/members/me" => Reply::json(json!({
+                ("GET", "/api/v4/channels/other/members/me") => Reply::json(json!({
                     "channel_id": "other", "user_id": "me", "last_viewed_at": 10,
                     "mention_count": 2, "notify_props": { "mark_unread": "mention" }
                 })),
-                "/api/v4/users/ids" => Reply::json(json!([{ "id": "ann", "username": "ann" }])),
-                "/api/v4/users/me/teams/team/channels/members"
-                | "/api/v4/users/me/preferences/favorite_channel"
-                | "/api/v4/emoji"
-                | "/api/v4/users/status/ids" => Reply::json(json!([])),
+                ("POST", "/api/v4/users/ids") => {
+                    Reply::json(json!([{ "id": "ann", "username": "ann" }]))
+                }
+                ("GET", "/api/v4/users/me/teams/team/channels/members")
+                | ("GET", "/api/v4/users/me/preferences/favorite_channel")
+                | ("GET", "/api/v4/emoji")
+                | ("POST", "/api/v4/users/status/ids") => Reply::json(json!([])),
                 _ => Reply::not_found(),
             }
         }
@@ -230,7 +237,9 @@ mod tests {
             let mut me = User::default();
             me.id = "me".into();
             let session = cx.new(|cx| Session::new(client, me, Some(TeamId::from("team")), cx));
-            wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+            wait_until(cx, |cx| {
+                session.read_with(cx, |s, _| s.is_loaded() && s.team().is_some())
+            });
 
             let found = Rc::new(RefCell::new(None));
             let task = session.update(cx, |s, cx| {
@@ -304,7 +313,7 @@ mod tests {
                 ("/api/v4/channels/other/members/me", 503),
             ] {
                 let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
-                    if request.path() == path {
+                    if request.method() == "GET" && request.path() == path {
                         Reply::json(json!({ "message": "Unavailable" })).status(status)
                     } else {
                         route(request)
