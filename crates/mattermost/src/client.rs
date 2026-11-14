@@ -9,9 +9,9 @@ use url::Url;
 use crate::{
     runtime,
     types::{
-        Channel, ChannelId, ChannelMember, CustomStatus, Emoji, EmojiId, FileInfo, Millis, Post,
-        PostId, PostList, PostSearch, Preference, Status, Team, TeamId, User, UserAutocomplete,
-        UserId, UserStatus, UserThread, UserThreads,
+        Channel, ChannelId, ChannelMember, ChannelUnreadAt, CustomStatus, Emoji, EmojiId, FileInfo,
+        Millis, Post, PostId, PostList, PostSearch, Preference, Status, Team, TeamId, User,
+        UserAutocomplete, UserId, UserStatus, UserThread, UserThreads,
     },
 };
 
@@ -285,6 +285,30 @@ impl Client {
 
     pub async fn my_channel_member(&self, channel: &ChannelId) -> Result<ChannelMember> {
         self.get(format!("channels/{channel}/members/me")).await
+    }
+
+    /// Mark a root post and everything after it unread for this user.
+    pub async fn mark_post_unread(&self, user: &UserId, post: &PostId) -> Result<ChannelUnreadAt> {
+        self.post(
+            format!("users/{user}/posts/{post}/set_unread"),
+            json!({ "collapsed_threads_supported": true }),
+        )
+        .await
+    }
+
+    /// Update only the supplied channel notification properties.
+    pub async fn set_channel_muted(
+        &self,
+        channel: &ChannelId,
+        user: &UserId,
+        muted: bool,
+    ) -> Result<ChannelMember> {
+        self.request(
+            Method::PUT,
+            format!("channels/{channel}/members/{user}/notify_props"),
+            Some(json!({ "mark_unread": if muted { "mention" } else { "all" } })),
+        )
+        .await
     }
 
     /// The newest `per_page` posts of a channel.
@@ -979,6 +1003,44 @@ mod tests {
     }
 
     #[test]
+    fn me_loads_account_desktop_notification_preferences() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (request.method(), request.path()) {
+                ("GET", "/api/v4/users/me") => Reply::json(json!({
+                    "id": "me", "notify_props": {"desktop":"none"}
+                })),
+                _ => Reply::not_found(),
+            }
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let me = block_on(client.me()).unwrap();
+        assert_eq!(me.notify_props["desktop"], "none");
+        let older_profile: User = serde_json::from_value(json!({"id":"me"})).unwrap();
+        assert!(older_profile.notify_props.is_empty());
+    }
+
+    #[test]
+    fn viewing_a_channel_declares_collapsed_thread_support() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |_| {
+            Reply::json(json!({ "status": "OK" }))
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        block_on(client.view_channel(&ChannelId::from("channel"))).unwrap();
+        let requests = server.requests();
+        let request = requests
+            .iter()
+            .find(|r| r.method() == "POST" && r.path() == "/api/v4/channels/members/me/view")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "channel_id": "channel", "collapsed_threads_supported": true,
+            })
+        );
+    }
+
+    #[test]
     fn images_with_an_excessive_content_length_fail_before_reading() {
         let server = SlowServer::start(Network::new(Duration::ZERO), |_| {
             Reply::bytes(vec![0; MAX_IMAGE_BYTES + 1]).stall_after(0)
@@ -1011,27 +1073,6 @@ mod tests {
         assert_eq!(fetched.status, 201);
         assert_eq!(fetched.content_type.as_deref(), Some("image/png"));
         assert_eq!(fetched.body, [1, 2, 3]);
-    }
-
-    #[test]
-    fn viewing_a_channel_declares_collapsed_thread_support() {
-        let server = SlowServer::start(Network::new(Duration::ZERO), |_| {
-            Reply::json(json!({ "status": "OK" }))
-        });
-        let client = Client::new_unverified(&server.url(), "token").unwrap();
-        block_on(client.view_channel(&ChannelId::from("channel"))).unwrap();
-        let requests = server.requests();
-        let request = requests
-            .iter()
-            .find(|r| r.method() == "POST" && r.path() == "/api/v4/channels/members/me/view")
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
-        assert_eq!(
-            body,
-            json!({
-                "channel_id": "channel", "collapsed_threads_supported": true,
-            })
-        );
     }
 
     #[test]

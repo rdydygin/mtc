@@ -340,6 +340,11 @@ impl TimelineView {
 
     fn find_unread(&self, cx: &App) -> Option<usize> {
         let timeline = self.timeline.read(cx);
+        if let Some(post) = timeline.unread_post()
+            && let Some(ix) = timeline.position(post)
+        {
+            return Some(ix);
+        }
         let after = timeline.unread_after()?;
         let me = &self.session.read(cx).me().id;
         let entries = timeline.entries();
@@ -508,6 +513,10 @@ impl TimelineView {
             PostAction::ToggleReaction(name) => {
                 self.session
                     .update(cx, |s, cx| s.toggle_reaction(&post, &name, cx));
+            }
+            PostAction::MarkUnread => {
+                self.session
+                    .update(cx, |s, cx| s.mark_post_unread(&post, cx));
             }
             PostAction::CopyText => {
                 cx.write_to_clipboard(ClipboardItem::new_string(post.message.clone()));
@@ -1322,6 +1331,46 @@ mod tests {
                 v.scroller.read(cx).item_count(),
                 v.timeline.read(cx).entries().len()
             );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn marking_a_post_unread_moves_the_timeline_divider(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (request.method(), request.path()) {
+                ("GET", "/api/v4/users/me/teams/team/channels/members") => {
+                    Reply::json(json!([{"channel_id":"town", "user_id":"me"}]))
+                }
+                ("GET", "/api/v4/channels/town/members/me")
+                | ("POST", "/api/v4/users/me/posts/n90/set_unread") => Reply::json(json!({
+                    "channel_id":"town", "user_id":"me", "last_viewed_at":90, "mention_count":1
+                })),
+                ("GET", path) if path.starts_with("/api/v4/channels/town/posts?") => {
+                    let mut page = posts(60..120);
+                    // Explicit marking must include the user's own posts too.
+                    page["posts"]["n90"]["user_id"] = json!("me");
+                    Reply::json(page)
+                }
+                _ => route(request),
+            }
+        });
+        let (view, _) = open_channel(&server, cx);
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, cx| v.session.read(cx).is_loaded())
+        });
+        let handle = cx.update(|cx| cx.windows()[0]);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.handle_post_action(&"n90".into(), PostAction::MarkUnread, window, cx)
+            });
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, cx| v.timeline.read(cx).unread_after() == Some(90))
+        });
+        view.read_with(cx, |v, cx| {
+            let ix = v.find_unread(cx).unwrap();
+            assert_eq!(v.timeline.read(cx).entries()[ix].id().as_str(), "n90");
         });
     }
 
