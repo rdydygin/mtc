@@ -73,7 +73,17 @@ pub fn forward_to_running(urls: &[String]) -> ForwardOutcome {
 }
 
 fn forward_from(path: &Path, urls: &[String]) -> ForwardOutcome {
-    match try_forward(path, urls) {
+    forward_from_using(path, urls, |addr| {
+        TcpStream::connect_timeout(addr, IO_TIMEOUT)
+    })
+}
+
+fn forward_from_using(
+    path: &Path,
+    urls: &[String],
+    connect: impl FnOnce(&SocketAddr) -> io::Result<TcpStream>,
+) -> ForwardOutcome {
+    match try_forward(path, urls, connect) {
         Ok(ForwardOutcome::Incompatible) => {
             log::error!(
                 "The running mtc uses a different sign-in protocol. Quit it, reopen mtc, \
@@ -92,7 +102,11 @@ fn forward_from(path: &Path, urls: &[String]) -> ForwardOutcome {
     }
 }
 
-fn try_forward(path: &Path, urls: &[String]) -> Result<ForwardOutcome> {
+fn try_forward(
+    path: &Path,
+    urls: &[String],
+    connect: impl FnOnce(&SocketAddr) -> io::Result<TcpStream>,
+) -> Result<ForwardOutcome> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(ForwardOutcome::Absent),
@@ -103,7 +117,7 @@ fn try_forward(path: &Path, urls: &[String]) -> Result<ForwardOutcome> {
         .split_once(' ')
         .context("malformed instance file")?;
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port.parse::<u16>()?));
-    let stream = match TcpStream::connect_timeout(&addr, IO_TIMEOUT) {
+    let stream = match connect(&addr) {
         Ok(stream) => stream,
         Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
             return Ok(ForwardOutcome::Absent);
@@ -466,11 +480,10 @@ mod tests {
     #[test]
     fn hands_links_to_the_listener() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server =
-            std::thread::spawn(move || receive(listener.accept().unwrap().0, "s3cret").unwrap());
+        let (client, stream) = connected_peer(&listener);
+        let server = std::thread::spawn(move || receive(stream, "s3cret").unwrap());
         forward(
-            TcpStream::connect(addr).unwrap(),
+            client,
             "s3cret",
             &[
                 "mmauth://callback?MMAUTHTOKEN=t".into(),
@@ -491,16 +504,9 @@ mod tests {
     #[test]
     fn rejects_a_wrong_secret() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || receive(listener.accept().unwrap().0, "s3cret"));
-        assert!(
-            forward(
-                TcpStream::connect(addr).unwrap(),
-                "guess",
-                &["mmauth://callback?MMAUTHTOKEN=t".into()]
-            )
-            .is_err()
-        );
+        let (client, stream) = connected_peer(&listener);
+        let server = std::thread::spawn(move || receive(stream, "s3cret"));
+        assert!(forward(client, "guess", &["mmauth://callback?MMAUTHTOKEN=t".into()]).is_err());
         assert!(server.join().unwrap().is_err());
     }
 
@@ -521,10 +527,12 @@ mod tests {
             ),
         ] {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let contents = format!("{} secret\n", listener.local_addr().unwrap().port());
+            let addr = listener.local_addr().unwrap();
+            let contents = format!("{} secret\n", addr.port());
             fs::write(&path, &contents).unwrap();
+            let (client, stream) = connected_peer(&listener);
             let server = std::thread::spawn(move || {
-                let mut reader = BufReader::new(listener.accept().unwrap().0);
+                let mut reader = BufReader::new(stream);
                 read_line(&mut reader).unwrap();
                 read_line(&mut reader).unwrap();
                 reader.get_mut().write_all(reply.as_bytes()).unwrap();
@@ -532,7 +540,14 @@ mod tests {
                 reader.read_to_string(&mut rest).unwrap();
                 rest
             });
-            let outcome = forward_from(&path, &["mmauth://callback?MMAUTHTOKEN=private".into()]);
+            let outcome = forward_from_using(
+                &path,
+                &["mmauth://callback?MMAUTHTOKEN=private".into()],
+                |requested| {
+                    assert_eq!(*requested, addr);
+                    Ok(client)
+                },
+            );
             assert_eq!(outcome, expected);
             assert!(
                 outcome.should_exit(),
@@ -542,13 +557,15 @@ mod tests {
             assert!(server.join().unwrap().is_empty());
         }
         let stale = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        fs::write(
-            &path,
-            format!("{} secret\n", stale.local_addr().unwrap().port()),
-        )
-        .unwrap();
-        drop(stale);
-        assert_eq!(forward_from(&path, &[]), ForwardOutcome::Absent);
+        let addr = stale.local_addr().unwrap();
+        fs::write(&path, format!("{} secret\n", addr.port())).unwrap();
+        assert_eq!(
+            forward_from_using(&path, &[], |requested| {
+                assert_eq!(*requested, addr);
+                Err(io::ErrorKind::ConnectionRefused.into())
+            }),
+            ForwardOutcome::Absent
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -589,6 +606,12 @@ mod tests {
                 return stream;
             }
         }
+    }
+
+    fn connected_peer(listener: &TcpListener) -> (TcpStream, TcpStream) {
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream = accept_peer(listener, client.local_addr().unwrap());
+        (client, stream)
     }
 
     #[test]
@@ -666,10 +689,9 @@ mod tests {
     fn listener_rejects_tampered_callbacks_and_reflected_proofs() {
         for reflect in [false, true] {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let addr = listener.local_addr().unwrap();
-            let server =
-                std::thread::spawn(move || receive(listener.accept().unwrap().0, "secret"));
-            let mut reader = BufReader::new(TcpStream::connect(addr).unwrap());
+            let (client, stream) = connected_peer(&listener);
+            let server = std::thread::spawn(move || receive(stream, "secret"));
+            let mut reader = BufReader::new(client);
             reader
                 .get_mut()
                 .write_all(format!("{GREETING}\nnonce\n").as_bytes())
@@ -705,9 +727,8 @@ mod tests {
             "mtc-deep-link 2\nchallenge\n0000000000000000000000000000000000000000000000000000000000000000\n",
         ] {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let addr = listener.local_addr().unwrap();
+            let (client, mut stream) = connected_peer(&listener);
             let impostor = std::thread::spawn(move || {
-                let mut stream = listener.accept().unwrap().0;
                 stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let greeting = read_line(&mut reader).unwrap();
@@ -718,7 +739,7 @@ mod tests {
                 (greeting, nonce, remaining)
             });
             let outcome = forward(
-                TcpStream::connect(addr).unwrap(),
+                client,
                 "s3cret",
                 &["mmauth://callback?MMAUTHTOKEN=private-token".into()],
             );
