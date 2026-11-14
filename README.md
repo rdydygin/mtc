@@ -152,6 +152,14 @@ the same commands are available by right-clicking. Closing the detail pane retur
 focus to the selected thread. Reading a
 thread anywhere, including beside its channel or on another device, clears it here too.
 
+Type in ⌘K to find joined conversations instantly and search people on the server.
+Choose a person to open a direct message. **New group message** in ⌘K lets you pick
+2–7 people: Enter adds or removes a person, and **Open group message** starts the
+conversation. Selected people stay visible while you search for others.
+**Browse channels** lists public channels in the current team you haven't joined;
+type to search, then Enter joins and opens the selected channel. **Load more channels**
+continues the list on larger teams. Esc clears the search, then closes the palette.
+
 Star a conversation from the star in its header, by right-clicking it in the sidebar, or
 with "Add to favorites" in ⌘K. Favorites sit in their own section at the top of the
 sidebar and sync with your other Mattermost apps.
@@ -161,8 +169,9 @@ Mute or unmute a conversation by right-clicking it in the sidebar, or with
 muting syncs with your other Mattermost apps and silences desktop notifications.
 
 Leave a channel by right-clicking it in the sidebar, or with "Leave channel" in ⌘K.
-mtc asks first, because it has no way to find and rejoin channels. Town Square and
-direct messages can't be left.
+mtc asks first. Rejoin public channels with **Browse channels** in ⌘K; for private
+channels, ask someone in the channel to add you back. Town Square and direct messages
+can't be left.
 
 The server's custom emoji show up inline in messages, in reactions, and in custom statuses,
 next to the standard ones. The emoji on screen are looked up by name as they appear, so
