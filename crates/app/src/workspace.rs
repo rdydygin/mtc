@@ -4,6 +4,8 @@
 //! Recently opened channel views stay alive, so switching back is instant
 //! and keeps scroll position, parsed Markdown, and the unsent draft.
 
+use gpui_kit::component::button::Button;
+
 use std::{collections::HashMap, ops::Range, rc::Rc, sync::Arc};
 
 use gpui_kit::base::{ResizeHandleContext, ResizeHandleRenderer, ResizeHandleState};
@@ -417,7 +419,7 @@ impl Workspace {
             Some((view, _)) => view.clone(),
             None => {
                 let session = self.session.clone();
-                let view = cx.new(|cx| ThreadsView::new(session, cx));
+                let view = cx.new(|cx| ThreadsView::new(session, window, cx));
                 let subscription = cx.subscribe_in(&view, window, Self::on_threads_view_event);
                 self.threads = Some((view.clone(), subscription));
                 view
@@ -503,6 +505,11 @@ impl Workspace {
             self.save_draft(&thread, cx);
             self.session.update(cx, |s, cx| s.set_open_thread(None, cx));
             match &self.search {
+                _ if self.showing_threads => {
+                    if let Some((list, _)) = &self.threads {
+                        list.update(cx, |list, cx| list.focus_selected(window, cx));
+                    }
+                }
                 Some((search, _)) if self.search_open => {
                     search.update(cx, |search, cx| search.focus(window, cx))
                 }
@@ -722,6 +729,9 @@ impl Workspace {
             let theme = cx.theme();
             let zoom = [ZOOM_IN_KEY, ZOOM_OUT_KEY, RESET_ZOOM_KEY].map(shortcut_label);
             let fixed = [
+                ("Select a thread", "↑ / ↓ / Home / End".to_string()),
+                ("Open selected thread", "Enter".to_string()),
+                ("Thread actions", "Tab to More actions, Enter".to_string()),
                 ("Send", "Enter".to_string()),
                 ("New line", "Shift-Enter".to_string()),
                 ("Edit your last message (empty field)", "Up".to_string()),
@@ -944,8 +954,26 @@ impl Render for Workspace {
                 Some(view) => view.into_any_element(),
                 // A conversation is about to reopen: show its shape, not the
                 // empty state.
-                None if !self.session.read(cx).is_loaded()
-                    && persist::read_with(|s| s.last_channel.is_some()) =>
+                None if matches!(
+                    self.session.read(cx).channels_state(),
+                    session::LoadState::Failed(_)
+                ) =>
+                {
+                    crate::recovery::inline_failure(
+                        "Couldn’t load conversations. Check your connection and try again.",
+                        Button::new("retry-workspace-conversations").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.session.update(cx, |s, cx| s.retry_channels(cx));
+                            },
+                        )),
+                        cx,
+                    )
+                    .into_any_element()
+                }
+                None if matches!(
+                    self.session.read(cx).channels_state(),
+                    session::LoadState::NotLoaded | session::LoadState::Loading
+                ) && persist::read_with(|s| s.last_channel.is_some()) =>
                 {
                     skeleton::conversation(cx).into_any_element()
                 }
@@ -1443,6 +1471,17 @@ mod tests {
             assert!(thread.left() > row.right(), "{row:?} {thread:?}");
         })
         .unwrap();
+
+        cx.update_window(handle, |_, window, cx| window.click("close-thread", cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("thread-root").focused(), Some(true));
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
 
         // A channel takes the pane's place; the thread belongs to it, so it stays.
         cx.update_window(handle, |_, window, cx| {

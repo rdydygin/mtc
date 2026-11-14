@@ -314,7 +314,8 @@ impl Composer {
                         }
                         Err(err) => {
                             file.status = AttachmentStatus::Failed;
-                            file.error = Some(format!("{err:#}").into());
+                            log::warn!("uploading attachment: {err:#}");
+                            file.error = Some("Couldn’t upload this file.".into());
                         }
                     }
                     cx.notify();
@@ -340,7 +341,7 @@ impl Composer {
                 .gap_2()
                 .px_2()
                 .pt_2()
-                .children(self.files.iter().map(|file| render_file(file, &entity))),
+                .children(self.files.iter().map(|file| render_file(file, &entity, cx))),
         )
     }
 
@@ -683,7 +684,11 @@ impl Render for Composer {
     }
 }
 
-fn render_file(file: &PendingFile, entity: &WeakEntity<Composer>) -> impl IntoElement + use<> {
+fn render_file(
+    file: &PendingFile,
+    entity: &WeakEntity<Composer>,
+    cx: &gpui_kit::App,
+) -> impl IntoElement + use<> {
     let local_id = file.local_id;
     let media = match (&file.source, file.is_image) {
         (FileSource::Pasted(image), _) => {
@@ -692,27 +697,35 @@ fn render_file(file: &PendingFile, entity: &WeakEntity<Composer>) -> impl IntoEl
         (FileSource::Path(path), true) => AttachmentMedia::new().src(path.clone()),
         (FileSource::Path(_), false) => AttachmentMedia::new().child(Icon::new(IconName::File)),
     };
-    let description = match &file.error {
-        Some(error) => error.clone(),
-        None => format_size(file.size).into(),
-    };
+    let description: SharedString = format_size(file.size).into();
     let remove = entity.clone();
     let retry = entity.clone();
-    Attachment::new()
-        .id(SharedString::from(format!("upload-{local_id}")))
-        .status(file.status)
-        .media(media)
-        .content(
-            AttachmentContent::new()
-                .title(AttachmentTitle::new(file.name.clone()))
-                .description(AttachmentDescription::new(description)),
+    v_flex()
+        .child(
+            Attachment::new()
+                .id(SharedString::from(format!("upload-{local_id}")))
+                .status(file.status)
+                .media(media)
+                .content(
+                    AttachmentContent::new()
+                        .title(AttachmentTitle::new(file.name.clone()))
+                        .description(AttachmentDescription::new(description)),
+                )
+                .tooltip(file.name.clone())
+                .on_remove(move |_, _, cx| {
+                    let _ = remove.update(cx, |this, cx| this.remove_file(local_id, cx));
+                }),
         )
-        .tooltip(file.name.clone())
-        .on_remove(move |_, _, cx| {
-            let _ = remove.update(cx, |this, cx| this.remove_file(local_id, cx));
-        })
-        .on_retry(move |_, _, cx| {
-            let _ = retry.update(cx, |this, cx| this.upload(local_id, cx));
+        .when_some(file.error.clone(), |this, message| {
+            this.child(crate::recovery::inline_failure(
+                message,
+                Button::new(SharedString::from(format!("retry-upload-{local_id}"))).on_click(
+                    move |_, _, cx| {
+                        let _ = retry.update(cx, |this, cx| this.upload(local_id, cx));
+                    },
+                ),
+                cx,
+            ))
         })
 }
 

@@ -90,6 +90,7 @@ pub fn shortcut_label(keystroke: &'static str) -> String {
 pub const WORKSPACE_CONTEXT: &str = "Workspace";
 
 pub fn init(cx: &mut App) {
+    crate::threads_view::init(cx);
     // Bind before building the menu bar: the menus read the keymap once.
     cx.bind_keys([
         KeyBinding::new(primary!("q"), Quit, None),

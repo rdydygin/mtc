@@ -207,7 +207,7 @@ impl TimelineView {
                 return;
             }
         }
-        if timeline.is_loading_older() {
+        if timeline.is_loading_older() || timeline.older_failed() {
             return;
         }
         let passed = timeline
@@ -333,7 +333,11 @@ impl TimelineView {
         // screen with no way to scroll up to it.
         let near_top = scroller.fits() || scroller.logical_scroll_top().item_ix < PREFETCH_ROWS;
         let timeline = self.timeline.read(cx);
-        if near_top && timeline.has_older() && !timeline.is_loading_older() {
+        if near_top
+            && timeline.has_older()
+            && !timeline.is_loading_older()
+            && !timeline.older_failed()
+        {
             self.timeline.update(cx, |t, cx| t.load_older(cx));
         }
     }
@@ -866,10 +870,21 @@ impl TimelineView {
             _ => {
                 let view = cx.entity().downgrade();
                 let loading_older = timeline.is_loading_older();
-                div()
+                v_flex()
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .when(timeline.older_failed(), |this| {
+                        this.child(crate::recovery::inline_failure(
+                            "Couldn’t load older messages.",
+                            Button::new("retry-older-messages").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.timeline.update(cx, |t, cx| t.load_older(cx));
+                                },
+                            )),
+                            cx,
+                        ))
+                    })
                     .child(PostScroller::new(
                         "posts",
                         self.scroller.clone(),

@@ -65,6 +65,7 @@ pub struct SearchView {
     /// The page to ask for next, while the server has more.
     next_page: Option<usize>,
     loading_more: bool,
+    more_failed: bool,
     selected: Option<usize>,
     scroll: ScrollHandle,
     _search: Option<Task<()>>,
@@ -119,6 +120,7 @@ impl SearchView {
             status: Status::Idle,
             next_page: None,
             loading_more: false,
+            more_failed: false,
             selected: None,
             scroll: ScrollHandle::new(),
             _search: None,
@@ -214,6 +216,7 @@ impl SearchView {
                 this.status = Status::Searching;
                 this._more = None;
                 this.loading_more = false;
+                this.more_failed = false;
                 cx.notify();
                 this.session
                     .update(cx, |s, cx| s.search_messages(&scope, &query, 0, cx))
@@ -235,6 +238,7 @@ impl SearchView {
             return;
         }
         self.loading_more = true;
+        self.more_failed = false;
         cx.notify();
         let query = self.query.clone();
         let scope = self.scope.clone();
@@ -285,9 +289,12 @@ impl SearchView {
             }
             // A later page that fails leaves the results there, and the
             // button to try it again.
-            Err(_) if page > 0 => {}
+            Err(_) if page > 0 => self.more_failed = true,
             Err(err) => {
-                self.status = Status::Failed(format!("Couldn’t search. {err:#}").into());
+                log::warn!("searching messages: {err:#}");
+                self.status = Status::Failed(
+                    "Couldn’t search messages. Check your connection and try again.".into(),
+                );
             }
         }
         cx.notify();
@@ -441,7 +448,15 @@ impl SearchView {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
                     .children(rows)
-                    .when(self.next_page.is_some(), |this| {
+                    .when(self.more_failed, |this| {
+                        this.child(crate::recovery::inline_failure(
+                            "Couldn’t load more search results.",
+                            Button::new("retry-search-results")
+                                .on_click(cx.listener(|this, _, _, cx| this.load_more(cx))),
+                            cx,
+                        ))
+                    })
+                    .when(self.next_page.is_some() && !self.more_failed, |this| {
                         this.child(
                             div().flex_none().p_3().child(
                                 Button::new("more-results")
@@ -891,6 +906,53 @@ mod tests {
             cx.executor().advance_clock(Duration::from_millis(50));
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[gpui_kit::test]
+    fn failed_pagination_retains_results_and_retries_the_same_page(cx: &mut TestAppContext) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let fail = Arc::new(AtomicBool::new(true));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let fail = fail.clone();
+            move |request| {
+                if request.method() == "POST" && request.path() == "/api/v4/teams/team/posts/search"
+                {
+                    let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                    if body["page"] == 1 {
+                        return if fail.load(Ordering::SeqCst) {
+                            Reply::not_found()
+                        } else {
+                            route(request)
+                        };
+                    }
+                }
+                paged_route(request)
+            }
+        });
+        let (handle, view) = open_search(&server, cx);
+        cx.update_window(handle, |_, window, cx| window.input("hello", cx))
+            .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 1));
+        cx.update_window(handle, |_, window, cx| window.click("more-results", cx))
+            .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.more_failed));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).results.len(), 1);
+            assert_eq!(view.read(cx).next_page, Some(1));
+            assert_eq!(window.find("retry-search-results").label(), Some("Retry"));
+            fail.store(false, Ordering::SeqCst);
+            window.click("retry-search-results", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 2));
+        view.read_with(cx, |v, _| {
+            assert!(!v.more_failed);
+            assert!(v.next_page.is_none());
+        });
     }
 
     #[gpui_kit::test]

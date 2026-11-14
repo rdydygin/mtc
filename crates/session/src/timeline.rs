@@ -214,6 +214,9 @@ pub struct Timeline {
     state: LoadState,
     has_older: bool,
     loading_older: bool,
+    older_failed: bool,
+    /// Invalidates pagination responses when their snapshot or cursor disappears.
+    pagination_generation: u64,
     unread_after: Option<Millis>,
     _load_task: Option<Task<()>>,
 }
@@ -248,6 +251,8 @@ impl Timeline {
             state: LoadState::NotLoaded,
             has_older: true,
             loading_older: false,
+            older_failed: false,
+            pagination_generation: 0,
             unread_after: None,
             _load_task: None,
         }
@@ -267,6 +272,10 @@ impl Timeline {
 
     pub fn has_older(&self) -> bool {
         self.has_older
+    }
+
+    pub fn older_failed(&self) -> bool {
+        self.older_failed
     }
 
     pub fn is_loading_older(&self) -> bool {
@@ -303,6 +312,7 @@ impl Timeline {
         if self.state == LoadState::Loading {
             return;
         }
+        self.reset_pagination();
         self.begin_request();
         self.state = LoadState::Loading;
         cx.notify();
@@ -345,6 +355,7 @@ impl Timeline {
         revision: u64,
         cx: &mut Context<Self>,
     ) {
+        self.reset_pagination();
         self.has_older = matches!(self.kind, TimelineKind::Channel(_)) && fetched >= PAGE_SIZE;
         let entries = self.adopt(prepared);
         let ids: HashSet<_> = entries.iter().map(|e| e.id().clone()).collect();
@@ -373,6 +384,12 @@ impl Timeline {
         entries
     }
 
+    fn reset_pagination(&mut self) {
+        self.pagination_generation += 1;
+        self.loading_older = false;
+        self.older_failed = false;
+    }
+
     /// Fetch the page before the oldest loaded post.
     pub fn load_older(&mut self, cx: &mut Context<Self>) {
         let TimelineKind::Channel(channel) = &self.kind else {
@@ -382,12 +399,17 @@ impl Timeline {
             return;
         }
         let Some(oldest) = self.entries.iter().find(|e| e.delivery == Delivery::Sent) else {
+            self.reset_pagination();
+            self.has_older = false;
+            cx.notify();
             return;
         };
         let before = oldest.id().clone();
         let channel = channel.clone();
         self.begin_request();
         self.loading_older = true;
+        self.older_failed = false;
+        let generation = self.pagination_generation;
         cx.notify();
         let client = self.client.clone();
         let kind = self.kind.clone();
@@ -403,6 +425,10 @@ impl Timeline {
                 Err(err) => Err(err),
             };
             let _ = this.update(cx, |this, cx| {
+                if generation != this.pagination_generation {
+                    this.finish_request();
+                    return;
+                }
                 this.loading_older = false;
                 match result {
                     Ok((fetched, prepared)) => {
@@ -422,7 +448,10 @@ impl Timeline {
                             new_count: count,
                         });
                     }
-                    Err(err) => log::warn!("loading older posts: {err:#}"),
+                    Err(err) => {
+                        this.older_failed = true;
+                        log::warn!("loading older posts: {err:#}");
+                    }
                 }
                 this.finish_request();
                 cx.notify();
@@ -613,6 +642,14 @@ impl Timeline {
     pub fn remove(&mut self, id: &PostId, cx: &mut Context<Self>) {
         if let Some(ix) = self.position(id) {
             self.entries.remove(ix);
+            if !self
+                .entries
+                .iter()
+                .any(|entry| entry.delivery == Delivery::Sent)
+            {
+                self.reset_pagination();
+                self.has_older = false;
+            }
             cx.emit(TimelineEvent::Spliced {
                 old: ix..ix + 1,
                 new_count: 0,
@@ -792,6 +829,119 @@ mod tests {
                 .collect(),
             custom_emoji: CustomEmojis::default(),
         }
+    }
+
+    fn wait_for_pagination(cx: &mut TestAppContext, timeline: &Entity<Timeline>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if timeline.read_with(cx, |t, _| t.requests_in_flight == 0) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pagination did not finish"
+            );
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn reload_and_cursor_removal_clear_obsolete_pagination_failures(cx: &mut TestAppContext) {
+        use mattermost::testing::{Network, Reply, SlowServer};
+        use serde_json::json;
+        cx.executor().allow_parking();
+        for count in [0, 1] {
+            let server = SlowServer::start(
+                Network::new(std::time::Duration::ZERO),
+                move |request| {
+                    if request.method() == "GET"
+                        && request.path().starts_with("/api/v4/channels/c/posts?")
+                    {
+                        if request.path().contains("before=") {
+                            return Reply::not_found();
+                        }
+                        return Reply::json(if count == 0 {
+                            json!({"order": [], "posts": {}})
+                        } else {
+                            json!({"order": ["new"], "posts": {"new": {"id": "new", "channel_id": "c", "create_at": 200}}})
+                        });
+                    }
+                    Reply::not_found()
+                },
+            );
+            let client = Client::new_unverified(&server.url(), "token").unwrap();
+            let (timeline, _) = timeline_with_client(client, cx);
+            timeline.update(cx, |t, cx| {
+                t.replace_all(PAGE_SIZE, snapshot(vec![post("seed", 100)]), t.revision, cx);
+                t.load_older(cx);
+            });
+            wait_for_pagination(cx, &timeline);
+            timeline.update(cx, |t, cx| {
+                assert!(t.older_failed());
+                t.reload(cx);
+            });
+            wait_for_pagination(cx, &timeline);
+            timeline.read_with(cx, |t, _| {
+                assert_eq!(t.state(), &LoadState::Loaded);
+                assert_eq!(t.entries().len(), count);
+                assert!(!t.has_older());
+                assert!(!t.older_failed());
+                assert!(!t.is_loading_older());
+            });
+            timeline.update(cx, |t, cx| {
+                t.replace_all(PAGE_SIZE, snapshot(vec![post("seed", 100)]), t.revision, cx);
+                t.load_older(cx);
+            });
+            wait_for_pagination(cx, &timeline);
+            timeline.update(cx, |t, cx| {
+                assert!(t.older_failed());
+                t.insert_pending(post("draft", 300), cx);
+                t.delete(&post("seed", 100), cx);
+                assert!(!t.older_failed());
+                assert!(!t.has_older());
+                t.load_older(cx);
+                assert!(!t.is_loading_older());
+                // A full server page can also leave no confirmed cursor after filtering.
+                t.replace_all(PAGE_SIZE, snapshot(vec![]), t.revision, cx);
+                t.load_older(cx);
+                assert!(!t.has_older());
+                assert!(!t.older_failed());
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn superseded_pagination_failure_cannot_change_a_new_snapshot(cx: &mut TestAppContext) {
+        use mattermost::testing::{Network, Reply, SlowServer};
+        cx.executor().allow_parking();
+        let server = SlowServer::start(Network::new(std::time::Duration::ZERO), |request| {
+            if request.method() == "GET"
+                && request.path().starts_with("/api/v4/channels/c/posts?")
+                && request.path().contains("before=")
+            {
+                return Reply::not_found();
+            }
+            Reply::json(serde_json::json!([]))
+        });
+        let (timeline, _) =
+            timeline_with_client(Client::new_unverified(&server.url(), "token").unwrap(), cx);
+        timeline.update(cx, |t, cx| {
+            t.replace_all(PAGE_SIZE, snapshot(vec![post("seed", 100)]), t.revision, cx);
+            t.load_older(cx);
+            // The replacement completes before the old page's response is applied.
+            t.replace_all(0, snapshot(vec![]), t.revision, cx);
+        });
+        wait_for_pagination(cx, &timeline);
+        timeline.read_with(cx, |t, _| {
+            assert!(!t.older_failed());
+            assert!(!t.is_loading_older());
+            assert!(!t.has_older());
+            assert!(t.entries().is_empty());
+            assert!(t.deleted.is_empty());
+        });
     }
 
     #[gpui_kit::test]

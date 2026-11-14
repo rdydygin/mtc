@@ -128,7 +128,8 @@ pub struct Session {
     channel_list_generation: u64,
     /// Channels hydrated since the pending list request started.
     hydrated_channels: HashSet<ChannelId>,
-    channels_loaded: bool,
+    channels_state: LoadState,
+    teams_state: LoadState,
     teams_loaded: bool,
     /// Favorite channels in every team; the server keeps them as
     /// preferences, synced across the user's devices.
@@ -157,6 +158,7 @@ pub struct Session {
     stream: EventStream,
     _event_task: Task<()>,
     _channels_task: Option<Task<()>>,
+    _teams_task: Option<Task<()>>,
     _typing_expiry: Option<Task<()>>,
     _emoji_subscription: Subscription,
     _threads_subscription: Subscription,
@@ -213,7 +215,8 @@ impl Session {
             channels: HashMap::new(),
             channel_list_generation: 0,
             hydrated_channels: HashSet::new(),
-            channels_loaded: false,
+            channels_state: LoadState::NotLoaded,
+            teams_state: LoadState::NotLoaded,
             teams_loaded: false,
             favorites: HashSet::new(),
             group_members: HashMap::new(),
@@ -233,6 +236,7 @@ impl Session {
             stream,
             _event_task,
             _channels_task: None,
+            _teams_task: None,
             _typing_expiry: None,
             _emoji_subscription,
             _threads_subscription,
@@ -280,7 +284,7 @@ impl Session {
 
     /// Whether the current team's channels have arrived.
     pub fn is_loaded(&self) -> bool {
-        self.channels_loaded
+        self.channels_state == LoadState::Loaded
     }
 
     /// Whether the team list has arrived. At startup the remembered team's
@@ -347,7 +351,32 @@ impl Session {
 
     // ----- Loading ---------------------------------------------------------
 
+    /// Includes startup team discovery, which can fail before channels are known.
+    pub fn channels_state(&self) -> &LoadState {
+        if matches!(self.teams_state, LoadState::Failed(_)) {
+            &self.teams_state
+        } else {
+            &self.channels_state
+        }
+    }
+
+    pub fn retry_channels(&mut self, cx: &mut Context<Self>) {
+        if !self.teams_loaded || matches!(self.teams_state, LoadState::Failed(_)) {
+            if self.teams_state != LoadState::Loading {
+                self.load_teams(cx);
+            }
+        } else if self.channels_state != LoadState::Loading {
+            self.load_channels(cx);
+        }
+    }
+
     fn load_teams(&mut self, cx: &mut Context<Self>) {
+        if self.teams_state == LoadState::Loading {
+            return;
+        }
+        self.teams_state = LoadState::Loading;
+        self.channels_state = LoadState::Loading;
+        cx.notify();
         // The remembered team is almost always still ours, so its channels
         // load alongside the team list rather than after it: the sidebar
         // fills one round trip sooner. The list corrects a stale guess.
@@ -356,12 +385,13 @@ impl Session {
             self.load_channels(cx);
         }
         let client = self.client.clone();
-        cx.spawn(async move |this, cx| {
+        self._teams_task = Some(cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
             let result = retry(&executor, || client.my_teams()).await;
             let _ = this.update(cx, |this, cx| match result {
                 Ok(teams) => {
                     this.teams_loaded = true;
+                    this.teams_state = LoadState::Loaded;
                     this.teams = teams.into_iter().filter(|t| t.delete_at == 0).collect();
                     this.teams.sort_by_key(|t| t.display_name.to_lowercase());
                     let keep = this
@@ -373,15 +403,20 @@ impl Session {
                     }
                     if this.team != guess || guess.is_none() {
                         this.channels.clear();
-                        this.channels_loaded = false;
+                        this.channels_state = LoadState::NotLoaded;
                         this.load_channels(cx);
                     }
                     cx.notify();
                 }
-                Err(err) => this.handle_error(err, cx),
+                Err(err) => {
+                    this.teams_state = LoadState::Failed(
+                        "Couldn’t load conversations. Check your connection and try again.".into(),
+                    );
+                    this.handle_error(err, cx);
+                    cx.notify();
+                }
             });
-        })
-        .detach();
+        }));
     }
 
     /// Switch the sidebar to another team.
@@ -392,17 +427,20 @@ impl Session {
         self.team = Some(team);
         self.channels.clear();
         self.channel_list_generation += 1;
-        self.channels_loaded = false;
+        self.channels_state = LoadState::NotLoaded;
         self.load_channels(cx);
         cx.notify();
     }
 
     fn load_channels(&mut self, cx: &mut Context<Self>) {
+        self._channels_task = None;
+        self.channels_state = LoadState::Loading;
+        cx.notify();
         self.hydrated_channels.clear();
         let team = self.team.clone();
         self.threads.update(cx, |t, cx| t.set_team(team, cx));
         let Some(team) = self.team.clone() else {
-            self.channels_loaded = true;
+            self.channels_state = LoadState::Loaded;
             cx.notify();
             return;
         };
@@ -438,7 +476,7 @@ impl Session {
                     // from, takes its threads with it.
                     let lost = this.channels.keys().any(|id| !channels.contains_key(id));
                     this.channels = channels;
-                    this.channels_loaded = true;
+                    this.channels_state = LoadState::Loaded;
                     if lost {
                         let channels = &this.channels;
                         this.threads.update(cx, |t, cx| {
@@ -454,7 +492,13 @@ impl Session {
                     this.load_group_members(cx);
                     cx.notify();
                 }
-                (Err(err), _) | (_, Err(err)) => this.handle_error(err, cx),
+                (Err(err), _) | (_, Err(err)) => {
+                    this.channels_state = LoadState::Failed(
+                        "Couldn’t load conversations. Check your connection and try again.".into(),
+                    );
+                    this.handle_error(err, cx);
+                    cx.notify();
+                }
             });
         }));
     }

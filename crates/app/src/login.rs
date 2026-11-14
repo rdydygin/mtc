@@ -6,12 +6,13 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     form::{Field, Form},
     input::{Input, InputContentType, InputEvent, InputState},
+    scroll::ScrollableElement as _,
     switch::Switch,
     v_flex,
 };
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, Focusable as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div,
+    AppContext as _, Context, Entity, EventEmitter, Focusable as _, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div,
     prelude::FluentBuilder as _,
 };
 use mattermost::{Client, User};
@@ -197,119 +198,129 @@ impl Render for LoginView {
         // password sign-in, the password form steps aside.
         let password = !self.use_token && sso.allows_password() && !sso.is_waiting();
         let can_submit = self.use_token || password;
-        div()
+        let form = v_flex()
+            .my_auto()
+            .flex_none()
             .relative()
-            .flex_1()
-            .flex()
-            .items_center()
-            .justify_center()
-            .p_6()
-            .child(div().absolute().inset_0().child(self.backdrop.clone()))
+            .w(gpui_kit::rems(28.))
+            .max_w_full()
+            .p_8()
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .gap_6()
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(theme.muted_foreground)
+                    .child("mtc / Mattermost"),
+            )
             .child(
                 v_flex()
-                    .relative()
-                    .w(gpui_kit::rems(28.))
-                    .max_w_full()
-                    .p_8()
-                    .rounded(theme.radius_lg)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
-                    .gap_6()
+                    .gap_1()
+                    .child(div().text_xl().font_semibold().child("Your team, in reach"))
                     .child(
                         div()
                             .text_sm()
-                            .font_semibold()
                             .text_color(theme.muted_foreground)
-                            .child("mtc / Mattermost"),
+                            .child("Sign in with your Mattermost server and account."),
+                    ),
+            )
+            .when_some(self.error.clone(), |this, error| {
+                this.child(Alert::error("login-error", error))
+            })
+            .child(
+                Form::new()
+                    .child(
+                        Field::new().label("Server").child(
+                            Input::new(&self.server)
+                                .id("login-server")
+                                .disabled(submitting),
+                        ),
                     )
                     .child(
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_xl().font_semibold().child("Your team, in reach"))
+                        Field::new()
+                            .label_indent(false)
+                            .visible(!self.use_token)
+                            .child(self.sso.clone()),
+                    )
+                    .child(
+                        Field::new()
+                            .label("Email or username")
+                            .visible(password)
+                            .child(Input::new(&self.login).disabled(submitting)),
+                    )
+                    .child(
+                        Field::new().label("Password").visible(password).child(
+                            Input::new(&self.password)
+                                .content_type(InputContentType::Password)
+                                .mask_toggle()
+                                .disabled(submitting),
+                        ),
+                    )
+                    .child(
+                        Field::new()
+                            .label("Authentication code")
+                            .visible(password && self.needs_mfa)
+                            .child(Input::new(&self.mfa).disabled(submitting)),
+                    )
+                    .child(
+                        Field::new()
+                            .label("Personal access token")
+                            .description("Create one under Profile › Security in Mattermost.")
+                            .visible(self.use_token)
                             .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Sign in with your Mattermost server and account."),
+                                Input::new(&self.token)
+                                    .content_type(InputContentType::Password)
+                                    .mask_toggle()
+                                    .disabled(submitting),
                             ),
                     )
-                    .when_some(self.error.clone(), |this, error| {
-                        this.child(Alert::error("login-error", error))
-                    })
                     .child(
-                        Form::new()
-                            .child(
-                                Field::new().label("Server").child(
-                                    Input::new(&self.server)
-                                        .id("login-server")
-                                        .disabled(submitting),
+                        Field::new().label_indent(false).child(
+                            Switch::new("use-token")
+                                .label("Use an access token")
+                                .small()
+                                .checked(self.use_token)
+                                .disabled(submitting)
+                                .on_change(cx.listener(|this, value, window, cx| {
+                                    this.set_use_token(*value, window, cx)
+                                })),
+                        ),
+                    )
+                    .when(can_submit, |form| {
+                        form.footer(
+                            Button::new("sign-in")
+                                .primary()
+                                .label("Sign in")
+                                .w_full()
+                                .loading(submitting)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.submit(window, cx)),
                                 ),
-                            )
-                            .child(
-                                Field::new()
-                                    .label_indent(false)
-                                    .visible(!self.use_token)
-                                    .child(self.sso.clone()),
-                            )
-                            .child(
-                                Field::new()
-                                    .label("Email or username")
-                                    .visible(password)
-                                    .child(Input::new(&self.login).disabled(submitting)),
-                            )
-                            .child(
-                                Field::new().label("Password").visible(password).child(
-                                    Input::new(&self.password)
-                                        .content_type(InputContentType::Password)
-                                        .mask_toggle()
-                                        .disabled(submitting),
-                                ),
-                            )
-                            .child(
-                                Field::new()
-                                    .label("Authentication code")
-                                    .visible(password && self.needs_mfa)
-                                    .child(Input::new(&self.mfa).disabled(submitting)),
-                            )
-                            .child(
-                                Field::new()
-                                    .label("Personal access token")
-                                    .description(
-                                        "Create one under Profile › Security in Mattermost.",
-                                    )
-                                    .visible(self.use_token)
-                                    .child(
-                                        Input::new(&self.token)
-                                            .content_type(InputContentType::Password)
-                                            .mask_toggle()
-                                            .disabled(submitting),
-                                    ),
-                            )
-                            .child(
-                                Field::new().label_indent(false).child(
-                                    Switch::new("use-token")
-                                        .label("Use an access token")
-                                        .small()
-                                        .checked(self.use_token)
-                                        .disabled(submitting)
-                                        .on_change(cx.listener(|this, value, window, cx| {
-                                            this.set_use_token(*value, window, cx)
-                                        })),
-                                ),
-                            )
-                            .when(can_submit, |form| {
-                                form.footer(
-                                    Button::new("sign-in")
-                                        .primary()
-                                        .label("Sign in")
-                                        .w_full()
-                                        .loading(submitting)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.submit(window, cx)
-                                        })),
-                                )
-                            }),
+                        )
+                    }),
+            );
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .child(div().absolute().inset_0().child(self.backdrop.clone()))
+            .child(
+                v_flex()
+                    .id("login-scroll")
+                    .size_full()
+                    .overflow_y_scrollbar()
+                    .child(
+                        v_flex()
+                            .min_h_full()
+                            .flex_none()
+                            .items_center()
+                            .p_6()
+                            .child(form),
                     ),
             )
     }
