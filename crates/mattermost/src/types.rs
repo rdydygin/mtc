@@ -95,6 +95,8 @@ pub struct User {
     pub nickname: String,
     pub email: String,
     pub position: String,
+    /// Account notification defaults from users/me.
+    pub notify_props: HashMap<String, String>,
     pub is_bot: bool,
     pub delete_at: Millis,
     pub last_picture_update: Millis,
@@ -275,6 +277,21 @@ pub struct ChannelMember {
     pub mention_count: i64,
     pub mention_count_root: i64,
     pub notify_props: HashMap<String, String>,
+}
+
+/// Read counters returned by set_unread and broadcast by post_unread.
+/// Message counts are the number already read, not the unread delta.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct ChannelUnreadAt {
+    pub channel_id: ChannelId,
+    pub user_id: UserId,
+    pub last_viewed_at: Millis,
+    pub msg_count: i64,
+    pub msg_count_root: i64,
+    pub mention_count: i64,
+    pub mention_count_root: i64,
 }
 
 impl ChannelMember {

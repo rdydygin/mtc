@@ -72,6 +72,22 @@ impl ChannelEntry {
         self.member.as_ref().map_or(0, |m| m.last_viewed_at)
     }
 
+    /// Channel override; `default` inherits the account's desktop setting.
+    pub fn desktop_notifications(&self) -> &str {
+        self.member
+            .as_ref()
+            .and_then(|m| m.notify_props.get("desktop"))
+            .map(String::as_str)
+            .unwrap_or("default")
+    }
+
+    pub fn ignore_channel_mentions(&self) -> Option<&str> {
+        self.member
+            .as_ref()
+            .and_then(|m| m.notify_props.get("ignore_channel_mentions"))
+            .map(String::as_str)
+    }
+
     /// The most recent activity, for recency ordering.
     pub fn last_activity(&self) -> Millis {
         self.channel.last_post_at
@@ -112,6 +128,29 @@ pub enum SessionEvent {
     },
 }
 
+enum ReadIntent {
+    Viewed { explicit: bool },
+    Unread { post: PostId, at: Millis },
+}
+
+/// One in-flight operation and one replaceable latest intent per channel.
+#[derive(Default)]
+struct ChannelSync {
+    pending: Option<ReadIntent>,
+    refresh: bool,
+    fetching: bool,
+    writing: bool,
+    unread_hint: bool,
+    running: bool,
+    _task: Option<Task<()>>,
+}
+
+impl ChannelSync {
+    fn has_deferred_passive_view(&self) -> bool {
+        self.unread_hint && matches!(self.pending, Some(ReadIntent::Viewed { explicit: false }))
+    }
+}
+
 /// The signed-in session: teams, channels, read state, live timelines, and
 /// the real-time connection that keeps them current.
 ///
@@ -140,6 +179,10 @@ pub struct Session {
     /// The latest snapshot of [`Self::emoji`], shared with timelines.
     custom_emoji: CustomEmojis,
     active_channel: Option<ChannelId>,
+    /// Explicitly unread active channel, protected from passive read updates.
+    unread_channel: Option<ChannelId>,
+    channel_sync: HashMap<ChannelId, ChannelSync>,
+    mute_pending: HashSet<ChannelId>,
     /// The thread on screen, kept read while the window is active.
     open_thread: Option<PostId>,
     /// The threads the user follows in the current team.
@@ -224,6 +267,9 @@ impl Session {
             custom_emoji: CustomEmojis::default(),
             active_channel: None,
             open_thread: None,
+            unread_channel: None,
+            channel_sync: HashMap::new(),
+            mute_pending: HashSet::new(),
             threads,
             window_active: true,
             timelines: HashMap::new(),
@@ -477,6 +523,17 @@ impl Session {
                     let lost = this.channels.keys().any(|id| !channels.contains_key(id));
                     this.channels = channels;
                     this.channels_state = LoadState::Loaded;
+                    if let Some(id) = this.unread_channel.as_ref()
+                        && !this.channel_sync.get(id).is_some_and(|sync| sync.running)
+                        && this
+                            .channel(id)
+                            .is_some_and(|entry| !entry.is_unread() && entry.mention_count() == 0)
+                    {
+                        let id = this.unread_channel.take().unwrap();
+                        if let Some(timeline) = this.live_timeline(&TimelineKind::Channel(id)) {
+                            timeline.update(cx, |t, cx| t.set_unread_after(None, cx));
+                        }
+                    }
                     if lost {
                         let channels = &this.channels;
                         this.threads.update(cx, |t, cx| {
@@ -688,6 +745,10 @@ impl Session {
         channel: &ChannelId,
         cx: &mut Context<Self>,
     ) -> Entity<Timeline> {
+        let entered = self.active_channel.as_ref() != Some(channel);
+        if entered {
+            self.unread_channel = None;
+        }
         self.active_channel = Some(channel.clone());
         let timeline = self.timeline(TimelineKind::Channel(channel.clone()), cx);
         let unread_after = self
@@ -696,7 +757,11 @@ impl Session {
             .filter(|e| e.is_unread())
             .map(ChannelEntry::last_viewed_at);
         timeline.update(cx, |t, cx| t.set_unread_after(unread_after, cx));
-        self.mark_viewed(channel, cx);
+        if entered {
+            self.request_view(channel, true, cx);
+        } else {
+            self.auto_mark_viewed(channel, cx);
+        }
         cx.notify();
         timeline
     }
@@ -704,15 +769,31 @@ impl Session {
     /// Stop tracking the closed conversation as visible.
     pub fn close_channel(&mut self, cx: &mut Context<Self>) {
         self.active_channel = None;
+        self.unread_channel = None;
         cx.notify();
     }
 
-    /// Record that the user has seen everything in `channel`.
+    /// Explicit read commands (Esc, /read, sending) release local suppression.
     pub fn mark_viewed(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        if self.unread_channel.as_ref() == Some(channel) {
+            self.unread_channel = None;
+            if let Some(timeline) = self.live_timeline(&TimelineKind::Channel(channel.clone())) {
+                timeline.update(cx, |t, cx| t.set_unread_after(None, cx));
+            }
+        }
+        self.request_view(channel, true, cx);
+    }
+
+    fn auto_mark_viewed(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        if self.unread_channel.as_ref() != Some(channel) {
+            self.request_view(channel, false, cx);
+        }
+    }
+
+    fn request_view(&mut self, channel: &ChannelId, explicit: bool, cx: &mut Context<Self>) {
         let Some(entry) = self.channels.get_mut(channel) else {
             return;
         };
-        let was_unread = entry.is_unread() || entry.mention_count() > 0;
         if let Some(member) = entry.member.as_mut() {
             member.last_viewed_at = now_millis().max(entry.channel.last_post_at);
             member.mention_count = 0;
@@ -720,17 +801,289 @@ impl Session {
             member.msg_count = entry.channel.total_msg_count;
             member.msg_count_root = entry.channel.total_msg_count_root;
         }
-        if was_unread {
-            cx.notify();
+        self.hydrated_channels.insert(channel.clone());
+        cx.notify();
+        let sync = self.channel_sync.entry(channel.clone()).or_default();
+        if explicit
+            || sync.pending.is_none()
+            || matches!(sync.pending, Some(ReadIntent::Viewed { explicit: false }))
+        {
+            sync.pending = Some(ReadIntent::Viewed { explicit });
         }
-        let client = self.client.clone();
+        self.sync_channel(channel, cx);
+    }
+
+    /// Only sent root posts have channel-level unread state.
+    pub fn mark_post_unread(&mut self, post: &Post, cx: &mut Context<Self>) {
+        if post.is_reply()
+            || (!post.pending_post_id.is_empty() && post.id.as_str() == post.pending_post_id)
+            || !self.channels.contains_key(&post.channel_id)
+        {
+            return;
+        }
+        if self.active_channel.as_ref() == Some(&post.channel_id) {
+            self.unread_channel = Some(post.channel_id.clone());
+        }
+        self.channel_sync
+            .entry(post.channel_id.clone())
+            .or_default()
+            .pending = Some(ReadIntent::Unread {
+            post: post.id.clone(),
+            at: post.create_at - 1,
+        });
+        self.sync_channel(&post.channel_id, cx);
+    }
+
+    fn refresh_channel_member(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        self.channel_sync
+            .entry(channel.clone())
+            .or_default()
+            .refresh = true;
+        self.sync_channel(channel, cx);
+    }
+
+    fn dirty_member_snapshot(&mut self, channel: &ChannelId) {
+        if let Some(sync) = self.channel_sync.get_mut(channel)
+            && sync.fetching
+        {
+            sync.refresh = true;
+        }
+    }
+
+    /// Writes are serialized, passive views collapse to one pending intent, and
+    /// every settled write (including errors) is reconciled with server truth.
+    fn sync_channel(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        let sync = self.channel_sync.entry(channel.clone()).or_default();
+        if sync.running {
+            return;
+        }
+        sync.running = true;
         let channel = channel.clone();
-        cx.background_spawn(async move {
-            if let Err(err) = client.view_channel(&channel).await {
-                log::warn!("marking channel read: {err:#}");
+        let client = self.client.clone();
+        let user = self.me.id.clone();
+        let id = channel.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let mut marker = None;
+            loop {
+                let step = this.update(cx, |this, _| {
+                    let sync = this.channel_sync.get_mut(&id)?;
+                    if sync.pending.is_none() && !sync.refresh {
+                        sync.running = false;
+                        return None;
+                    }
+                    // Confirm a remote unread hint before allowing a passive
+                    // view to erase it. Explicit intents retain priority.
+                    let intent = if sync.has_deferred_passive_view() {
+                        None
+                    } else {
+                        sync.pending.take()
+                    };
+                    sync.writing = intent.is_some();
+                    Some(intent)
+                });
+                let Ok(Some(intent)) = step else {
+                    break;
+                };
+                let result = match intent {
+                    Some(ReadIntent::Viewed { .. }) => {
+                        marker = None;
+                        client.view_channel(&id).await
+                    }
+                    Some(ReadIntent::Unread { post, at }) => {
+                        let result = client.mark_post_unread(&user, &post).await.map(|_| ());
+                        marker = Some((post, at));
+                        result
+                    }
+                    None => {
+                        // Coalesce WS bursts before starting a standalone refetch.
+                        cx.background_executor()
+                            .timer(Duration::from_millis(25))
+                            .await;
+                        Ok(())
+                    }
+                };
+                if let Err(err) = result {
+                    let _ = this.update(cx, |this, cx| {
+                        if marker.is_some() {
+                            cx.emit(SessionEvent::SendFailed {
+                                message: format!("Couldn’t mark the message unread. {err:#}")
+                                    .into(),
+                            });
+                        }
+                        this.handle_error(err, cx);
+                    });
+                }
+                // Events received while writing/debouncing are covered by this GET;
+                // events received during the GET request one further refetch.
+                if this
+                    .update(cx, |this, _| {
+                        let sync = this.channel_sync.get_mut(&id).unwrap();
+                        sync.writing = false;
+                        sync.refresh = false;
+                        sync.fetching = true;
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                let result = client.my_channel_member(&id).await;
+                let _ = this.update(cx, |this, cx| {
+                    let sync = this.channel_sync.get_mut(&id).unwrap();
+                    sync.fetching = false;
+                    // Events received after this GET started make the snapshot
+                    // stale. Keep their state and let the worker refetch it.
+                    if sync.refresh {
+                        return;
+                    }
+                    match result {
+                        Ok(member) => this.apply_channel_member(member, marker.take(), cx),
+                        Err(err) => {
+                            // A failed confirmation cannot authorize a passive
+                            // read. Explicit intents remain queued for execution.
+                            let sync = this.channel_sync.get_mut(&id).unwrap();
+                            if sync.has_deferred_passive_view() {
+                                sync.pending = None;
+                            }
+                            this.handle_error(err, cx);
+                        }
+                    }
+                });
             }
+        });
+        self.channel_sync.get_mut(&channel).unwrap()._task = Some(task);
+    }
+
+    fn apply_channel_member(
+        &mut self,
+        member: ChannelMember,
+        marker: Option<(PostId, Millis)>,
+        cx: &mut Context<Self>,
+    ) {
+        if member.user_id != self.me.id {
+            return;
+        }
+        let channel = member.channel_id.clone();
+        let queued = self.channel_sync.get(&channel).is_some_and(|sync| {
+            sync.writing || (sync.pending.is_some() && !sync.has_deferred_passive_view())
+        });
+        let Some(entry) = self.channels.get_mut(&channel) else {
+            return;
+        };
+        // Preserve the latest optimistic local intent until its write settles.
+        if queued {
+            if let Some(current) = entry.member.as_mut() {
+                current.notify_props = member.notify_props;
+            }
+        } else {
+            entry.member = Some(member);
+            let unread = entry.is_unread() || entry.mention_count() > 0;
+            let at = unread.then(|| entry.last_viewed_at());
+            if let Some(sync) = self.channel_sync.get_mut(&channel) {
+                if unread && sync.has_deferred_passive_view() {
+                    sync.pending = None;
+                }
+                if unread && sync.unread_hint && self.active_channel.as_ref() == Some(&channel) {
+                    self.unread_channel = Some(channel.clone());
+                }
+                sync.unread_hint = false;
+            }
+            let clear_mark = !unread && self.unread_channel.as_ref() == Some(&channel);
+            if clear_mark {
+                self.unread_channel = None;
+            }
+            // Ordinary reads retain the opening boundary; an authoritative read
+            // that releases explicit suppression clears its marked boundary.
+            if (unread || clear_mark)
+                && let Some(timeline) = self.live_timeline(&TimelineKind::Channel(channel.clone()))
+            {
+                timeline.update(cx, |t, cx| match marker {
+                    Some((post, marked_at)) if at == Some(marked_at) => {
+                        t.set_unread_post(post, marked_at, cx)
+                    }
+                    _ => t.set_unread_after(at, cx),
+                });
+            }
+        }
+        self.hydrated_channels.insert(channel);
+        cx.notify();
+    }
+
+    pub fn is_mute_pending(&self, channel: &ChannelId) -> bool {
+        self.mute_pending.contains(channel)
+    }
+
+    /// Optimistically update only mark_unread, then refetch after every outcome.
+    pub fn set_channel_muted(&mut self, channel: &ChannelId, muted: bool, cx: &mut Context<Self>) {
+        if self.mute_pending.contains(channel) {
+            return;
+        }
+        self.dirty_member_snapshot(channel);
+        let Some(member) = self
+            .channels
+            .get_mut(channel)
+            .and_then(|e| e.member.as_mut())
+        else {
+            return;
+        };
+        let previous = member.notify_props.get("mark_unread").cloned();
+        member.notify_props.insert(
+            "mark_unread".into(),
+            if muted { "mention" } else { "all" }.into(),
+        );
+        self.mute_pending.insert(channel.clone());
+        self.hydrated_channels.insert(channel.clone());
+        cx.notify();
+        let client = self.client.clone();
+        let user = self.me.id.clone();
+        let channel = channel.clone();
+        cx.spawn(async move |this, cx| {
+            if let Err(err) = client.set_channel_muted(&channel, &user, muted).await {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(member) = this
+                        .channels
+                        .get_mut(&channel)
+                        .and_then(|e| e.member.as_mut())
+                    {
+                        match previous {
+                            Some(value) => {
+                                member.notify_props.insert("mark_unread".into(), value);
+                            }
+                            None => {
+                                member.notify_props.remove("mark_unread");
+                            }
+                        }
+                    }
+                    cx.emit(SessionEvent::SendFailed {
+                        message: format!("Couldn’t change channel mute state. {err:#}").into(),
+                    });
+                    this.handle_error(err, cx);
+                    cx.notify();
+                });
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.mute_pending.remove(&channel);
+                this.refresh_channel_member(&channel, cx);
+                cx.notify();
+            });
         })
         .detach();
+    }
+
+    /// Membership broadcasts refresh preferences without overwriting read counters.
+    fn apply_notify_props(&mut self, member: ChannelMember, cx: &mut Context<Self>) {
+        if member.user_id == self.me.id {
+            self.dirty_member_snapshot(&member.channel_id);
+        }
+        if member.user_id == self.me.id
+            && let Some(current) = self
+                .channels
+                .get_mut(&member.channel_id)
+                .and_then(|e| e.member.as_mut())
+        {
+            self.hydrated_channels.insert(member.channel_id);
+            current.notify_props = member.notify_props;
+            cx.notify();
+        }
     }
 
     pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -741,7 +1094,7 @@ impl Session {
                 .get(&channel)
                 .is_some_and(ChannelEntry::is_unread);
             if unread {
-                self.mark_viewed(&channel, cx);
+                self.auto_mark_viewed(&channel, cx);
             }
         }
         if active && let Some(root) = self.open_thread.clone() {
@@ -793,6 +1146,7 @@ impl Session {
         if message.trim().is_empty() && files.is_empty() {
             return;
         }
+        self.mark_viewed(kind.channel(), cx);
         let now = now_millis();
         let pending_id = format!("{}:{}", self.me.id, now);
         let mut post = Post::default();
@@ -1215,6 +1569,16 @@ impl Session {
                 self.schedule_typing_expiry(cx);
                 cx.notify();
             }
+            Event::PostUnread { state, .. } => {
+                if state.user_id.is_empty() || state.user_id == self.me.id {
+                    self.channel_sync
+                        .entry(state.channel_id.clone())
+                        .or_default()
+                        .unread_hint = true;
+                    self.refresh_channel_member(&state.channel_id, cx);
+                }
+            }
+            Event::ChannelMemberUpdated(member) => self.apply_notify_props(member, cx),
             Event::ChannelViewed(channel) => {
                 self.note_viewed_elsewhere(&[(channel, now_millis())], cx)
             }
@@ -1223,7 +1587,15 @@ impl Session {
                 self.directory
                     .update(cx, |d, cx| d.set_status(user_id, status, cx));
             }
-            Event::UserUpdated(user) => {
+            Event::UserUpdated(mut user) => {
+                if user.id == self.me.id {
+                    // Broadcast profiles are sanitized; users/me owns account defaults.
+                    if user.notify_props.is_empty() {
+                        user.notify_props = self.me.notify_props.clone();
+                    }
+                    self.me = Arc::new(user.clone());
+                    cx.notify();
+                }
                 self.directory.update(cx, |d, cx| d.insert([user], cx));
             }
             Event::ChannelsChanged => self.load_channels(cx),
@@ -1306,6 +1678,12 @@ impl Session {
     fn note_viewed_elsewhere(&mut self, channels: &[(ChannelId, Millis)], cx: &mut Context<Self>) {
         let mut changed = false;
         for (channel, at) in channels {
+            // A read elsewhere may release local suppression, but an old view
+            // echo cannot decide that: refetch after our queued writes settle.
+            if self.unread_channel.as_ref() == Some(channel) {
+                self.refresh_channel_member(channel, cx);
+                continue;
+            }
             if let Some(entry) = self.channels.get_mut(channel)
                 && let Some(member) = entry.member.as_mut()
                 && *at > member.last_viewed_at
@@ -1324,6 +1702,7 @@ impl Session {
 
     /// Update unread state for a new post.
     fn note_activity(&mut self, post: &Post, mentions_me: bool, cx: &mut Context<Self>) {
+        self.dirty_member_snapshot(&post.channel_id);
         let Some(entry) = self.channels.get_mut(&post.channel_id) else {
             // A channel we don't know yet (new DM, just added).
             self.load_channels(cx);
@@ -1338,9 +1717,13 @@ impl Session {
         let from_me = post.user_id == self.me.id;
         let is_visible =
             self.window_active && self.active_channel.as_ref() == Some(&post.channel_id);
-        if from_me || is_visible {
+        if from_me || (is_visible && self.unread_channel.as_ref() != Some(&post.channel_id)) {
             let channel = post.channel_id.clone();
-            self.mark_viewed(&channel, cx);
+            if from_me {
+                self.mark_viewed(&channel, cx);
+            } else {
+                self.auto_mark_viewed(&channel, cx);
+            }
         } else if (mentions_me || entry.channel.kind == ChannelType::Direct)
             && let Some(member) = entry.member.as_mut()
         {
@@ -1720,6 +2103,659 @@ mod slow_network_tests {
             timeline.read_with(cx, |t, _| *t.state() == LoadState::Loaded)
         });
         timeline.read_with(cx, |t, _| assert!(t.position(&post.id).is_some()));
+    }
+
+    #[gpui_kit::test]
+    fn sanitized_self_updates_preserve_account_notification_defaults(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let session = start(&server, cx);
+        session.update(cx, |s, cx| {
+            let mut user = s.me().as_ref().clone();
+            user.notify_props.insert("desktop".into(), "none".into());
+            s.me = Arc::new(user.clone());
+            user.notify_props.clear();
+            user.last_picture_update = 12;
+            s.handle_event(mattermost::Event::UserUpdated(user), cx);
+            assert_eq!(s.me().notify_props["desktop"], "none");
+            assert_eq!(s.me().last_picture_update, 12);
+            let directory_me = s.directory.read(cx).user(&s.me().id).unwrap();
+            assert_eq!(directory_me.notify_props["desktop"], "none");
+        });
+    }
+
+    fn state_member() -> Arc<std::sync::Mutex<mattermost::ChannelMember>> {
+        Arc::new(std::sync::Mutex::new(
+            serde_json::from_value(json!({
+                "channel_id":"town", "user_id":"me", "last_viewed_at":1000
+            }))
+            .unwrap(),
+        ))
+    }
+
+    fn state_route(
+        request: &Request,
+        state: &std::sync::Mutex<mattermost::ChannelMember>,
+    ) -> Reply {
+        let mut member = state.lock().unwrap();
+        match (request.method(), request.path()) {
+            ("POST", "/api/v4/channels/members/me/view") => {
+                member.last_viewed_at = 1000;
+                member.mention_count = 0;
+                member.mention_count_root = 0;
+                Reply::json(json!({}))
+            }
+            ("POST", "/api/v4/users/me/posts/p1/set_unread") => {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(request.body()).unwrap(),
+                    json!({"collapsed_threads_supported":true})
+                );
+                member.last_viewed_at = 0;
+                member.msg_count = 7;
+                member.msg_count_root = 4;
+                member.mention_count = 2;
+                member.mention_count_root = 1;
+                Reply::json(serde_json::to_value(&*member).unwrap())
+            }
+            ("GET", "/api/v4/channels/town/members/me") => {
+                Reply::json(serde_json::to_value(&*member).unwrap())
+            }
+            ("GET", "/api/v4/users/me/teams/team/channels/members") => {
+                Reply::json(json!([&*member]))
+            }
+            ("GET", "/api/v4/users/me/teams/team/channels") => Reply::json(json!([
+                {"id":"town", "team_id":"team", "name":"town-square", "type":"O", "last_post_at":1}
+            ])),
+            ("PUT", "/api/v4/channels/town/members/me/notify_props") => {
+                let props: std::collections::HashMap<String, String> =
+                    serde_json::from_slice(request.body()).unwrap();
+                member.notify_props.extend(props);
+                Reply::json(serde_json::to_value(&*member).unwrap())
+            }
+            _ => route(request),
+        }
+    }
+
+    fn unread_post() -> mattermost::Post {
+        let mut post = mattermost::Post::default();
+        post.id = "p1".into();
+        post.channel_id = "town".into();
+        post.user_id = "ann".into();
+        post.create_at = 1;
+        post
+    }
+
+    fn unread_event() -> mattermost::Event {
+        // Deliberately stale: the payload must never overwrite a fetched member.
+        let state = serde_json::from_value(
+            json!({"channel_id":"town", "user_id":"me", "last_viewed_at":-10, "mention_count":99}),
+        )
+        .unwrap();
+        mattermost::Event::PostUnread {
+            state,
+            post_id: "p1".into(),
+        }
+    }
+
+    fn finish_sync(session: &Entity<Session>, cx: &mut TestAppContext) {
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| {
+                s.channel_sync.values().all(|sync| !sync.running) && s.mute_pending.is_empty()
+            })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn delayed_member_get_retries_instead_of_overwriting_newer_events(cx: &mut TestAppContext) {
+        for activity in [true, false] {
+            let state = state_member();
+            {
+                let mut member = state.lock().unwrap();
+                member.last_viewed_at = 0;
+                member.mention_count = 2;
+                member.notify_props.insert("desktop".into(), "all".into());
+            }
+            let gets = Arc::new(AtomicUsize::new(0));
+            let server = SlowServer::start(Network::new(Duration::ZERO), {
+                let state = state.clone();
+                let gets = gets.clone();
+                move |request| {
+                    let reply = state_route(request, &state);
+                    if request.method() == "GET"
+                        && request.path() == "/api/v4/channels/town/members/me"
+                    {
+                        // Count only after the response snapshot has been captured.
+                        gets.fetch_add(1, Ordering::SeqCst);
+                        reply.delay(Duration::from_millis(100))
+                    } else {
+                        reply
+                    }
+                }
+            });
+            let session = start(&server, cx);
+            wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+            session.update(cx, |s, cx| {
+                s.active_channel = Some("town".into());
+                s.unread_channel = Some("town".into());
+                s.refresh_channel_member(&"town".into(), cx);
+            });
+            wait_until(cx, |_| gets.load(Ordering::SeqCst) == 1);
+            if activity {
+                state.lock().unwrap().mention_count = 3;
+                session.update(cx, |s, cx| {
+                    let mut post = unread_post();
+                    post.id = "new-mention".into();
+                    post.create_at = 2;
+                    s.handle_event(
+                        mattermost::Event::Posted {
+                            post,
+                            mentions: vec!["me".into()],
+                            team_id: "team".into(),
+                        },
+                        cx,
+                    );
+                });
+            } else {
+                let member = {
+                    let mut member = state.lock().unwrap();
+                    member.notify_props.insert("desktop".into(), "none".into());
+                    member
+                        .notify_props
+                        .insert("mark_unread".into(), "mention".into());
+                    member.clone()
+                };
+                session.update(cx, |s, cx| {
+                    s.handle_event(mattermost::Event::ChannelMemberUpdated(member), cx)
+                });
+            }
+            // The old response has completed, while the replacement GET waits.
+            wait_until(cx, |_| gets.load(Ordering::SeqCst) == 2);
+            session.read_with(cx, |s, _| {
+                let entry = s.channel(&"town".into()).unwrap();
+                if activity {
+                    assert_eq!(entry.mention_count(), 3);
+                } else {
+                    assert_eq!(entry.desktop_notifications(), "none");
+                    assert!(entry.is_muted());
+                }
+            });
+            finish_sync(&session, cx);
+            assert_eq!(gets.load(Ordering::SeqCst), 2);
+            session.read_with(cx, |s, _| {
+                let entry = s.channel(&"town".into()).unwrap();
+                if activity {
+                    assert_eq!(entry.mention_count(), 3);
+                } else {
+                    assert_eq!(entry.desktop_notifications(), "none");
+                    assert!(entry.is_muted());
+                }
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn mute_reconciliation_cannot_clear_an_unread_intent_or_schedule_a_passive_read(
+        cx: &mut TestAppContext,
+    ) {
+        let state = state_member();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let state = state.clone();
+            let gets = gets.clone();
+            move |request| {
+                let reply = state_route(request, &state);
+                if request.method() == "GET" && request.path() == "/api/v4/channels/town/members/me"
+                {
+                    gets.fetch_add(1, Ordering::SeqCst);
+                    reply.delay(Duration::from_millis(100))
+                } else if request.method() == "POST"
+                    && request.path() == "/api/v4/users/me/posts/p1/set_unread"
+                {
+                    reply.delay(Duration::from_millis(100))
+                } else {
+                    reply
+                }
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        session.update(cx, |s, cx| {
+            s.active_channel = Some("town".into());
+            s.set_channel_muted(&"town".into(), true, cx);
+        });
+        wait_until(cx, |_| gets.load(Ordering::SeqCst) == 1);
+        session.update(cx, |s, cx| s.mark_post_unread(&unread_post(), cx));
+        wait_until(cx, |_| {
+            server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "POST" && r.path() == "/api/v4/users/me/posts/p1/set_unread")
+        });
+        // The old mute snapshot returned before the unread write could start.
+        session.update(cx, |s, cx| {
+            assert!(s.unread_channel.is_some());
+            let mut post = unread_post();
+            post.id = "visible".into();
+            post.create_at = 2;
+            state.lock().unwrap().mention_count = 3;
+            s.handle_event(
+                mattermost::Event::Posted {
+                    post,
+                    mentions: vec!["me".into()],
+                    team_id: "team".into(),
+                },
+                cx,
+            );
+            assert!(s.unread_channel.is_some());
+        });
+        finish_sync(&session, cx);
+        session.read_with(cx, |s, _| {
+            assert!(s.unread_channel.is_some());
+            assert!(s.channel(&"town".into()).unwrap().is_unread());
+            assert_eq!(s.channel(&"town".into()).unwrap().mention_count(), 3);
+        });
+        let requests = server.requests();
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.method() == "POST" && r.path() == "/api/v4/channels/members/me/view")
+        );
+        let mute_get = requests
+            .iter()
+            .find(|r| r.method() == "GET" && r.path() == "/api/v4/channels/town/members/me")
+            .unwrap();
+        let unread = requests
+            .iter()
+            .find(|r| r.method() == "POST" && r.path() == "/api/v4/users/me/posts/p1/set_unread")
+            .unwrap();
+        assert!(unread.at() >= mute_get.at() + Duration::from_millis(100));
+    }
+
+    #[gpui_kit::test]
+    fn remote_unread_is_preserved_but_a_stale_hint_cannot_undo_esc(cx: &mut TestAppContext) {
+        let state = state_member();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let state = state.clone();
+            let gets = gets.clone();
+            move |request| {
+                let reply = state_route(request, &state);
+                if request.method() == "GET" && request.path() == "/api/v4/channels/town/members/me"
+                {
+                    gets.fetch_add(1, Ordering::SeqCst);
+                    reply.delay(Duration::from_millis(100))
+                } else {
+                    reply
+                }
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        {
+            let mut member = state.lock().unwrap();
+            member.last_viewed_at = 0;
+            member.mention_count = 2;
+        }
+        session.update(cx, |s, cx| {
+            s.active_channel = Some("town".into());
+            s.handle_event(unread_event(), cx);
+        });
+        // The post lands after the first GET captured unread, before it returns.
+        // Its passive view must wait for a clean confirmation of the hint.
+        wait_until(cx, |_| gets.load(Ordering::SeqCst) == 1);
+        session.update(cx, |s, cx| {
+            assert!(s.unread_channel.is_none());
+            state.lock().unwrap().mention_count = 3;
+            let mut post = unread_post();
+            post.id = "while-unread".into();
+            post.create_at = 2;
+            s.handle_event(
+                mattermost::Event::Posted {
+                    post,
+                    mentions: vec!["me".into()],
+                    team_id: "team".into(),
+                },
+                cx,
+            );
+        });
+        finish_sync(&session, cx);
+        session.update(cx, |s, cx| {
+            assert!(s.unread_channel.is_some());
+            assert_eq!(s.channel(&"town".into()).unwrap().mention_count(), 3);
+            s.set_window_active(false, cx);
+            s.set_window_active(true, cx);
+            state.lock().unwrap().mention_count = 4;
+            let mut post = unread_post();
+            post.id = "after-confirmation".into();
+            post.create_at = 3;
+            s.note_activity(&post, true, cx);
+            assert_eq!(s.channel(&"town".into()).unwrap().mention_count(), 4);
+        });
+        finish_sync(&session, cx);
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "POST" && r.path() == "/api/v4/channels/members/me/view")
+        );
+        let next_get = gets.load(Ordering::SeqCst) + 1;
+        session.update(cx, |s, cx| s.handle_event(unread_event(), cx));
+        wait_until(cx, |_| gets.load(Ordering::SeqCst) == next_get);
+        // This GET captured unread before Esc. It must not re-arm suppression.
+        session.update(cx, |s, cx| s.mark_viewed(&"town".into(), cx));
+        finish_sync(&session, cx);
+        session.read_with(cx, |s, _| {
+            assert!(s.unread_channel.is_none());
+            assert!(!s.channel(&"town".into()).unwrap().is_unread());
+        });
+        // Even a hint received after Esc is confirmed against read server state.
+        session.update(cx, |s, cx| s.handle_event(unread_event(), cx));
+        finish_sync(&session, cx);
+        session.read_with(cx, |s, _| assert!(s.unread_channel.is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn reading_a_channel_retains_its_opening_unread_divider(cx: &mut TestAppContext) {
+        let state = state_member();
+        state.lock().unwrap().last_viewed_at = 0;
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            state_route(request, &state)
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        let timeline = session.update(cx, |s, cx| s.open_channel(&"town".into(), cx));
+        finish_sync(&session, cx);
+        session.read_with(cx, |s, cx| {
+            assert!(!s.channel(&"town".into()).unwrap().is_unread());
+            assert_eq!(timeline.read(cx).unread_after(), Some(0));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn http_only_unread_and_reconnect_follow_authoritative_members(cx: &mut TestAppContext) {
+        let state = state_member();
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let state = state.clone();
+            move |request| state_route(request, &state)
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        let timeline = session.update(cx, |s, cx| {
+            s.active_channel = Some("town".into());
+            let timeline = s.timeline(TimelineKind::Channel("town".into()), cx);
+            s.mark_post_unread(&unread_post(), cx);
+            timeline
+        });
+        finish_sync(&session, cx);
+        session.read_with(cx, |s, cx| {
+            let entry = s.channel(&"town".into()).unwrap();
+            assert_eq!(entry.mention_count(), 2);
+            let member = entry.member.as_ref().unwrap();
+            assert_eq!(
+                (
+                    member.msg_count,
+                    member.msg_count_root,
+                    member.mention_count_root
+                ),
+                (7, 4, 1)
+            );
+            assert!(s.unread_channel.is_some());
+            assert_eq!(timeline.read(cx).unread_post(), Some(&PostId::from("p1")));
+        });
+        {
+            let mut member = state.lock().unwrap();
+            member.last_viewed_at = 1000;
+            member.mention_count = 0;
+            member
+                .notify_props
+                .insert("mark_unread".into(), "mention".into());
+        }
+        session.update(cx, |s, cx| {
+            s.has_connected = true;
+            s.handle_event(mattermost::Event::Connected, cx);
+        });
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| {
+                s.channel(&"town".into()).unwrap().is_muted() && s.unread_channel.is_none()
+            })
+        });
+        // A later remote unread of the same post is not swallowed by an echo record.
+        state.lock().unwrap().last_viewed_at = 0;
+        session.update(cx, |s, cx| s.handle_event(unread_event(), cx));
+        finish_sync(&session, cx);
+        session.read_with(cx, |s, _| {
+            assert_eq!(s.channel(&"town".into()).unwrap().last_viewed_at(), 0)
+        });
+    }
+
+    #[gpui_kit::test]
+    fn websocket_success_and_http_error_refetch_truth_in_both_orders(cx: &mut TestAppContext) {
+        for (ws_first, committed) in [(true, true), (false, true), (true, false), (false, false)] {
+            let state = state_member();
+            let server = SlowServer::start(Network::new(Duration::ZERO), {
+                let state = state.clone();
+                move |request| {
+                    let unread = request.method() == "POST"
+                        && request.path() == "/api/v4/users/me/posts/p1/set_unread";
+                    let reply = if unread && !committed {
+                        Reply::json(json!({}))
+                    } else {
+                        state_route(request, &state)
+                    };
+                    if request.method() == "POST"
+                        && request.path() == "/api/v4/users/me/posts/p1/set_unread"
+                    {
+                        // The write took effect, but its response was lost/rejected.
+                        return reply.status(500).delay(if ws_first {
+                            Duration::from_millis(100)
+                        } else {
+                            Duration::ZERO
+                        });
+                    }
+                    reply
+                }
+            });
+            let session = start(&server, cx);
+            wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+            session.update(cx, |s, cx| {
+                s.active_channel = Some("town".into());
+                s.mark_post_unread(&unread_post(), cx);
+            });
+            wait_until(cx, |_| {
+                server.requests().iter().any(|r| {
+                    r.method() == "POST" && r.path() == "/api/v4/users/me/posts/p1/set_unread"
+                })
+            });
+            if !ws_first {
+                finish_sync(&session, cx);
+            }
+            session.update(cx, |s, cx| s.handle_event(unread_event(), cx));
+            finish_sync(&session, cx);
+            session.read_with(cx, |s, _| {
+                assert_eq!(
+                    s.channel(&"town".into()).unwrap().mention_count(),
+                    if committed { 2 } else { 0 }
+                );
+                assert_eq!(s.unread_channel.is_some(), committed);
+            });
+            // Esc/send/navigation issue a read; even a late unread echo refetches read truth.
+            session.update(cx, |s, cx| {
+                s.mark_viewed(&"town".into(), cx);
+                s.handle_event(unread_event(), cx);
+            });
+            finish_sync(&session, cx);
+            session.read_with(cx, |s, _| {
+                assert!(!s.channel(&"town".into()).unwrap().is_unread());
+                assert!(s.unread_channel.is_none());
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn passive_views_and_unread_events_are_bounded_for_a_hundred_posts(cx: &mut TestAppContext) {
+        let state = state_member();
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            let reply = state_route(request, &state);
+            if request.method() == "POST" && request.path() == "/api/v4/channels/members/me/view" {
+                reply.delay(Duration::from_millis(100))
+            } else {
+                reply
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        session.update(cx, |s, cx| {
+            s.open_channel(&"town".into(), cx);
+        });
+        wait_until(cx, |_| {
+            server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "POST" && r.path() == "/api/v4/channels/members/me/view")
+        });
+        session.update(cx, |s, cx| {
+            for ix in 0..100 {
+                let mut post = unread_post();
+                post.id = format!("burst-{ix}").into();
+                post.create_at = ix + 2;
+                s.note_activity(&post, true, cx);
+                s.handle_event(unread_event(), cx);
+            }
+        });
+        finish_sync(&session, cx);
+        let requests = server.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.method() == "POST" && r.path() == "/api/v4/channels/members/me/view")
+                .count(),
+            2
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|r| r.method() == "GET" && r.path() == "/api/v4/channels/town/members/me")
+                .count()
+                <= 3
+        );
+    }
+
+    #[gpui_kit::test]
+    fn read_unread_barriers_serialize_and_replace_pending_passive_views(cx: &mut TestAppContext) {
+        for read_first in [true, false] {
+            let state = state_member();
+            let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+                let reply = state_route(request, &state);
+                if request.method() == "POST" {
+                    reply.delay(Duration::from_millis(80))
+                } else {
+                    reply
+                }
+            });
+            let session = start(&server, cx);
+            wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+            session.update(cx, |s, cx| {
+                s.active_channel = Some("town".into());
+                if read_first {
+                    s.auto_mark_viewed(&"town".into(), cx);
+                } else {
+                    s.mark_post_unread(&unread_post(), cx);
+                }
+            });
+            let first = if read_first {
+                "/api/v4/channels/members/me/view"
+            } else {
+                "/api/v4/users/me/posts/p1/set_unread"
+            };
+            wait_until(cx, |_| {
+                server
+                    .requests()
+                    .iter()
+                    .any(|r| r.method() == "POST" && r.path() == first)
+            });
+            session.update(cx, |s, cx| {
+                if read_first {
+                    for _ in 0..10 {
+                        s.auto_mark_viewed(&"town".into(), cx);
+                    }
+                    s.mark_post_unread(&unread_post(), cx);
+                } else {
+                    s.mark_viewed(&"town".into(), cx);
+                }
+            });
+            finish_sync(&session, cx);
+            session.read_with(cx, |s, _| {
+                assert_eq!(s.channel(&"town".into()).unwrap().is_unread(), read_first)
+            });
+            let writes: Vec<_> = server
+                .requests()
+                .into_iter()
+                .filter(|r| {
+                    r.method() == "POST"
+                        && (r.path() == first
+                            || r.path() == "/api/v4/channels/members/me/view"
+                            || r.path() == "/api/v4/users/me/posts/p1/set_unread")
+                })
+                .collect();
+            assert_eq!(writes.len(), 2);
+            let read = writes
+                .iter()
+                .find(|r| r.path() == "/api/v4/channels/members/me/view")
+                .unwrap();
+            let unread = writes
+                .iter()
+                .find(|r| r.path() == "/api/v4/users/me/posts/p1/set_unread")
+                .unwrap();
+            assert!(read.at().abs_diff(unread.at()) >= Duration::from_millis(80));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn mute_ignores_stale_put_results_and_refetches_after_success_or_error(
+        cx: &mut TestAppContext,
+    ) {
+        for reject in [true, false] {
+            let state = state_member();
+            let server = SlowServer::start(Network::new(Duration::ZERO), {
+                let state = state.clone();
+                move |request| {
+                    let reply = state_route(request, &state);
+                    if request.method() == "PUT"
+                        && request.path() == "/api/v4/channels/town/members/me/notify_props"
+                    {
+                        reply
+                            .status(if reject { 500 } else { 200 })
+                            .delay(Duration::from_millis(100))
+                    } else {
+                        reply
+                    }
+                }
+            });
+            let session = start(&server, cx);
+            wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+            session.update(cx, |s, cx| {
+                s.set_channel_muted(&"town".into(), true, cx);
+                assert!(s.channel(&"town".into()).unwrap().is_muted());
+            });
+            wait_until(cx, |_| {
+                server.requests().iter().any(|r| {
+                    r.method() == "PUT"
+                        && r.path() == "/api/v4/channels/town/members/me/notify_props"
+                })
+            });
+            {
+                let mut member = state.lock().unwrap();
+                member
+                    .notify_props
+                    .insert("mark_unread".into(), "all".into());
+                member.notify_props.insert("desktop".into(), "none".into());
+            }
+            finish_sync(&session, cx);
+            session.read_with(cx, |s, _| {
+                let entry = s.channel(&"town".into()).unwrap();
+                assert!(!entry.is_muted());
+                assert_eq!(entry.desktop_notifications(), "none");
+            });
+        }
     }
 
     #[gpui_kit::test]
