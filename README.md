@@ -88,11 +88,11 @@ On Linux and Windows, use Ctrl where the table says ⌘, Alt for ⌥, and Shift 
 | ⌘⇧T | Threads you follow |
 | ⌥↑ / ⌥↓ | Previous / next channel |
 | ⌥⇧↑ / ⌥⇧↓ | Previous / next unread channel |
-| Enter / ⇧Enter | Send / new line |
+| Enter / ⇧Enter | Accept a visible suggestion or send / new line |
 | ↑ in an empty field | Edit your last message |
-| ↑ / ↓ in slash suggestions | Select a command |
-| Tab | Complete the selected slash command |
-| Esc | Dismiss slash suggestions, cancel an edit, close the panel, or mark the channel read |
+| ↑ / ↓ in composer suggestions | Select a command, person, or channel |
+| Tab / Enter in composer suggestions | Complete the selected suggestion |
+| Esc | Dismiss composer suggestions, cancel an edit, close the panel, or mark the channel read |
 | ⌘L | Focus the visible conversation’s message field (reveals the channel if search replaces it) |
 | ⌘W | Close the conversation (keeps its draft) |
 | ⌘= / ⌘- / ⌘0 | Zoom in / out / actual size |
@@ -120,6 +120,14 @@ opens one. A message scrolls into view in the conversation and is marked for a m
 (older messages load as needed); a reply opens in its thread, with a button back to the
 results. Mattermost's search syntax works, such as `"exact phrase"`, `from:username`,
 and `-word`. The last word you type also matches longer words that start with it.
+
+Type `@` at a word start to suggest people and `@here`, `@channel`, or `@all`.
+Known people appear immediately; server matches put current-channel members first,
+then other team members. Type `~` to suggest joined channels in the current team,
+or `/` at the beginning for commands. ↑/↓ selects a row; Tab or Enter inserts it
+at the caret without sending. Enter sends when no suggestions are visible; Esc
+hides the list without changing your text. Suggestions stay out of code spans and
+fences and leave IME composition keys alone.
 
 Editing keeps your unsent text and attachments; saving or canceling restores them.
 
@@ -252,7 +260,7 @@ notifications) is itself registered as the `Core` extension.
   Up to 100 drafts of 64 KiB each are saved (UTF-8-safe truncation); the oldest changed
   drafts are dropped first. Attachments are not persisted. While editing an older
   message, the unsent draft is saved rather than the edit in progress.
-- Not implemented yet: @mention autocomplete, multiple servers.
+- Not implemented yet: multiple servers.
 
 ## Development
 

@@ -31,6 +31,27 @@ where
         .context("Mattermost I/O task was cancelled")?
 }
 
+/// Run a disposable read on the I/O runtime, aborting it if its caller goes
+/// away. Ordinary requests retain [`run`]'s detached-on-drop semantics so
+/// cancelling a UI task cannot interrupt an in-progress write.
+pub(crate) async fn run_cancellable<F, T>(future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    struct AbortOnDrop(tokio::task::AbortHandle);
+
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    let task = RUNTIME.spawn(future);
+    let _abort_on_drop = AbortOnDrop(task.abort_handle());
+    task.await.context("Mattermost I/O task was cancelled")?
+}
+
 /// Start `future` on the I/O runtime without awaiting it.
 pub fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where

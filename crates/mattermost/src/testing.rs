@@ -161,6 +161,7 @@ type Route = dyn Fn(&Request) -> Reply + Send + Sync;
 pub struct SlowServer {
     addr: SocketAddr,
     requests: Arc<Mutex<Vec<Request>>>,
+    closed_stalled_requests: Arc<Mutex<Vec<Request>>>,
     task: JoinHandle<()>,
 }
 
@@ -183,22 +184,26 @@ impl SlowServer {
             .expect("make the listener non-blocking");
         let addr = std_listener.local_addr().expect("read the server address");
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let closed_stalled_requests = Arc::new(Mutex::new(Vec::new()));
         let route: Arc<Route> = Arc::new(route);
         let log = requests.clone();
+        let closed = closed_stalled_requests.clone();
         let started = Instant::now();
         let task = runtime::spawn(async move {
             let listener = TcpListener::from_std(std_listener).expect("adopt the listener");
             while let Ok((stream, _)) = listener.accept().await {
                 let route = route.clone();
                 let log = log.clone();
+                let closed = closed.clone();
                 tokio::spawn(async move {
-                    let _ = serve(stream, network, started, &*route, &log).await;
+                    let _ = serve(stream, network, started, &*route, &log, &closed).await;
                 });
             }
         });
         Self {
             addr,
             requests,
+            closed_stalled_requests,
             task,
         }
     }
@@ -212,6 +217,12 @@ impl SlowServer {
     pub fn requests(&self) -> Vec<Request> {
         self.requests.lock().unwrap().clone()
     }
+
+    /// Stalled responses whose client connection has closed. Select by method
+    /// and path, just as with [`Self::requests`], to ignore unrelated traffic.
+    pub fn closed_stalled_requests(&self) -> Vec<Request> {
+        self.closed_stalled_requests.lock().unwrap().clone()
+    }
 }
 
 /// Answer requests on one connection until the client closes it.
@@ -221,6 +232,7 @@ async fn serve(
     started: Instant,
     route: &Route,
     log: &Mutex<Vec<Request>>,
+    closed: &Mutex<Vec<Request>>,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let mut buffer = Vec::new();
@@ -280,8 +292,12 @@ async fn serve(
         }
         stream.flush().await?;
         if reply.stall_after.is_some() {
-            // Hold the connection open and say nothing more.
-            std::future::pending::<()>().await;
+            // Say nothing more, but notice when cancellation closes the
+            // client's connection instead of leaving this task alive forever.
+            let mut ignored = [0; 1];
+            while stream.read(&mut ignored).await.unwrap_or(0) != 0 {}
+            closed.lock().unwrap().push(request);
+            return Ok(());
         }
     }
 }
