@@ -51,6 +51,7 @@ pub struct Request {
     method: String,
     path: String,
     headers: Vec<(String, String)>,
+    body: Vec<u8>,
     /// When it arrived, from the server's start.
     at: Duration,
 }
@@ -71,6 +72,11 @@ impl Request {
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The request body after it has been read in full.
+    pub fn body(&self) -> &[u8] {
+        &self.body
     }
 
     /// When the request arrived, measured from the server's start.
@@ -194,12 +200,12 @@ async fn serve(
     stream.set_nodelay(true)?;
     let mut buffer = Vec::new();
     loop {
-        let Some((request, body_len, consumed)) =
+        let Some((mut request, body_len, consumed)) =
             read_head(&mut stream, &mut buffer, started).await?
         else {
             return Ok(());
         };
-        // Drain the request body; the stand-in never needs it.
+        // Read the body in full before routing or recording the request.
         while buffer.len() < consumed + body_len {
             let mut chunk = [0u8; 8192];
             let n = stream.read(&mut chunk).await?;
@@ -208,6 +214,7 @@ async fn serve(
             }
             buffer.extend_from_slice(&chunk[..n]);
         }
+        request.body = buffer[consumed..consumed + body_len].to_vec();
         buffer.drain(..consumed + body_len);
         log.lock().unwrap().push(request.clone());
 
@@ -277,6 +284,7 @@ async fn read_head(
                 method,
                 path,
                 headers,
+                body: Vec::new(),
                 at: started.elapsed(),
             };
             return Ok(Some((request, body_len, end + 4)));

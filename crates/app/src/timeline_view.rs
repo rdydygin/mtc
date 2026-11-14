@@ -1149,6 +1149,114 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn catch_up_keeps_scroll_position_for_unchanged_posts_and_edits(cx: &mut TestAppContext) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let edited = Arc::new(AtomicBool::new(false));
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), {
+            let edited = edited.clone();
+            move |request| {
+                if request.path().contains("since=") {
+                    let mut response = posts(119..120);
+                    if edited.load(Ordering::SeqCst) {
+                        response["posts"]["n119"]["message"] = json!("edited message");
+                        response["posts"]["n119"]["edit_at"] = json!(200);
+                    }
+                    return Reply::json(response);
+                }
+                route(request)
+            }
+        });
+        let (view, _) = open_channel(&server, cx);
+        let (timeline, scroller) =
+            view.read_with(cx, |v, _| (v.timeline.clone(), v.scroller.clone()));
+        scroller.update(cx, |s, cx| s.scroll_to_item(10, cx));
+        cx.run_until_parked();
+        let before = scroller.read_with(cx, |s, _| {
+            assert!(!s.is_following_tail());
+            s.logical_scroll_top()
+        });
+        let events = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&timeline, move |_, event: &TimelineEvent, _| {
+                events.borrow_mut().push(event.clone())
+            })
+            .detach();
+        });
+        timeline.update(cx, |t, cx| t.catch_up(cx));
+        // There is no event to await for an unchanged response. Give network I/O
+        // time to finish while continuing to process deferred GPUI events.
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(events.borrow().is_empty());
+        scroller.read_with(cx, |s, _| {
+            let after = s.logical_scroll_top();
+            assert_eq!(after.item_ix, before.item_ix);
+            assert_eq!(after.offset_in_item, before.offset_in_item);
+            assert!(!s.is_following_tail());
+        });
+        edited.store(true, Ordering::SeqCst);
+        timeline.update(cx, |t, cx| t.catch_up(cx));
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| t.entries().last().unwrap().post().edit_at == 200)
+        });
+        assert_eq!(*events.borrow(), [TimelineEvent::Updated(59)]);
+        scroller.read_with(cx, |s, _| {
+            let after = s.logical_scroll_top();
+            assert_eq!(after.item_ix, before.item_ix);
+            assert_eq!(after.offset_in_item, before.offset_in_item);
+            assert!(!s.is_following_tail());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn catch_up_keeps_the_scroller_count_after_a_pending_post_moves(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(100)), |request| {
+            if request.path().starts_with("/api/v4/channels/town/posts?")
+                && request.path().contains("since=")
+            {
+                return Reply::json(json!({
+                    "order": ["confirmed", "later"],
+                    "posts": {
+                        "confirmed": { "id": "confirmed", "channel_id": "town", "create_at": 10,
+                                       "pending_post_id": "pending" },
+                        "later": { "id": "later", "channel_id": "town", "create_at": 130 },
+                    },
+                }));
+            }
+            route(request)
+        });
+        let (view, _) = open_channel(&server, cx);
+        let timeline = view.read_with(cx, |v, _| v.timeline.clone());
+        timeline.update(cx, |t, cx| {
+            let mut pending = mattermost::Post::default();
+            pending.id = "pending".into();
+            pending.pending_post_id = "pending".into();
+            pending.channel_id = "town".into();
+            pending.create_at = 1_000;
+            t.insert_pending(pending, cx);
+        });
+        cx.run_until_parked();
+        timeline.update(cx, |t, cx| t.catch_up(cx));
+        wait_until(cx, |cx| {
+            timeline.read_with(cx, |t, _| t.position(&"later".into()).is_some())
+        });
+        view.read_with(cx, |v, cx| {
+            assert_eq!(
+                v.scroller.read(cx).item_count(),
+                v.timeline.read(cx).entries().len()
+            );
+        });
+    }
+
+    #[gpui_kit::test]
     fn posts_that_dont_fill_the_window_bring_older_ones(cx: &mut TestAppContext) {
         let server = SlowServer::start(Network::new(Duration::ZERO), route);
         // Tall enough to show the newest page with room to spare.

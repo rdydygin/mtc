@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Range, sync::Arc, time::SystemTime};
+use std::{borrow::Cow, collections::HashSet, ops::Range, sync::Arc, time::SystemTime};
 
 use gpui_kit::{Context, Entity, EventEmitter, SharedString, Task};
 use mattermost::{ChannelId, Client, Millis, Post, PostId, PostList, Reaction, UserId};
@@ -99,12 +99,29 @@ fn prepare(post: &Post, custom: &CustomEmojis) -> PreparedMessage {
     }
 }
 
+/// Apply a reaction once per user and emoji, including removal echoes.
+fn set_reaction(post: &mut Post, reaction: &Reaction, added: bool) -> bool {
+    let reactions = &mut post.metadata.reactions;
+    let existing = reactions
+        .iter()
+        .position(|r| r.user_id == reaction.user_id && r.emoji_name == reaction.emoji_name);
+    match (added, existing) {
+        (true, None) => reactions.push(reaction.clone()),
+        (false, Some(ix)) => {
+            reactions.remove(ix);
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// One post as the UI shows it.
 #[derive(Clone, Debug)]
 pub struct Entry {
     post: Arc<Post>,
     message: PreparedMessage,
     delivery: Delivery,
+    revision: u64,
 }
 
 impl Entry {
@@ -114,6 +131,7 @@ impl Entry {
             post: Arc::new(post),
             message,
             delivery,
+            revision: 0,
         }
     }
 
@@ -189,6 +207,10 @@ pub struct Timeline {
     emoji: Entity<EmojiStore>,
     custom_emoji: CustomEmojis,
     entries: Vec<Entry>,
+    revision: u64,
+    /// Confirmed deletes stay hidden until outstanding requests settle.
+    deleted: HashSet<PostId>,
+    requests_in_flight: usize,
     state: LoadState,
     has_older: bool,
     loading_older: bool,
@@ -220,6 +242,9 @@ impl Timeline {
             emoji,
             custom_emoji,
             entries: Vec::new(),
+            revision: 0,
+            deleted: HashSet::new(),
+            requests_in_flight: 0,
             state: LoadState::NotLoaded,
             has_older: true,
             loading_older: false,
@@ -275,11 +300,16 @@ impl Timeline {
 
     /// Replace the contents with the newest page from the server.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        if self.state == LoadState::Loading {
+            return;
+        }
+        self.begin_request();
         self.state = LoadState::Loading;
         cx.notify();
         let client = self.client.clone();
         let kind = self.kind.clone();
         let custom = self.custom_emoji.clone();
+        let revision = self.revision;
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
             let result = retry(&executor, || async {
@@ -293,28 +323,38 @@ impl Timeline {
                 Ok(list) => Ok(prepare_off_thread(&executor, list, &kind, custom).await),
                 Err(err) => Err(err),
             };
-            let _ = this.update(cx, |this, cx| match result {
-                Ok((count, entries)) => this.replace_all(count, entries, cx),
-                Err(err) => {
-                    // Keep showing what we had; surface the failure.
-                    this.state = LoadState::Failed(format!("{err:#}").into());
-                    cx.notify();
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok((count, entries)) => this.replace_all(count, entries, revision, cx),
+                    Err(err) => {
+                        // Keep showing what we had; surface the failure.
+                        this.state = LoadState::Failed(format!("{err:#}").into());
+                        cx.notify();
+                    }
                 }
+                this.finish_request();
             });
         }));
     }
 
     /// `fetched` is how many posts the server returned, before filtering.
-    fn replace_all(&mut self, fetched: usize, prepared: Prepared, cx: &mut Context<Self>) {
+    fn replace_all(
+        &mut self,
+        fetched: usize,
+        prepared: Prepared,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) {
         self.has_older = matches!(self.kind, TimelineKind::Channel(_)) && fetched >= PAGE_SIZE;
-        // Optimistic posts survive a reload until the server answers.
-        let pending: Vec<Entry> = self
-            .entries
-            .drain(..)
-            .filter(|e| e.delivery != Delivery::Sent)
-            .collect();
-        self.entries = self.adopt(prepared);
-        self.entries.extend(pending);
+        let entries = self.adopt(prepared);
+        let ids: HashSet<_> = entries.iter().map(|e| e.id().clone()).collect();
+        // Keep optimistic posts and changes made while the request was in flight.
+        self.entries.retain(|e| {
+            e.delivery != Delivery::Sent || e.revision > revision || ids.contains(e.id())
+        });
+        for entry in entries {
+            self.merge(entry, Some(revision));
+        }
         self.state = LoadState::Loaded;
         self.request_missing(0..self.entries.len(), cx);
         cx.emit(TimelineEvent::Reset);
@@ -344,11 +384,12 @@ impl Timeline {
         let Some(oldest) = self.entries.iter().find(|e| e.delivery == Delivery::Sent) else {
             return;
         };
+        let before = oldest.id().clone();
+        let channel = channel.clone();
+        self.begin_request();
         self.loading_older = true;
         cx.notify();
         let client = self.client.clone();
-        let channel = channel.clone();
-        let before = oldest.id().clone();
         let kind = self.kind.clone();
         let custom = self.custom_emoji.clone();
         cx.spawn(async move |this, cx| {
@@ -358,19 +399,21 @@ impl Timeline {
             })
             .await;
             let result = match result {
-                Ok(list) => Ok(prepare_off_thread(&executor, list, &kind, custom).await.1),
+                Ok(list) => Ok(prepare_off_thread(&executor, list, &kind, custom).await),
                 Err(err) => Err(err),
             };
             let _ = this.update(cx, |this, cx| {
                 this.loading_older = false;
                 match result {
-                    Ok(prepared) => {
+                    Ok((fetched, prepared)) => {
                         let posts: Vec<Entry> = this
                             .adopt(prepared)
                             .into_iter()
-                            .filter(|e| this.position(e.id()).is_none())
+                            .filter(|e| {
+                                this.position(e.id()).is_none() && !this.deleted.contains(e.id())
+                            })
                             .collect();
-                        this.has_older = posts.len() >= PAGE_SIZE / 2;
+                        this.has_older = fetched >= PAGE_SIZE;
                         let count = posts.len();
                         this.entries.splice(0..0, posts);
                         this.request_missing(0..count, cx);
@@ -381,6 +424,7 @@ impl Timeline {
                     }
                     Err(err) => log::warn!("loading older posts: {err:#}"),
                 }
+                this.finish_request();
                 cx.notify();
             });
         })
@@ -401,72 +445,171 @@ impl Timeline {
             self.reload(cx);
             return;
         };
-        let Some(since) = self.entries.iter().map(Entry::changed_at).max() else {
+        let Some(since) = self.confirmed_since() else {
             self.reload(cx);
             return;
         };
         let client = self.client.clone();
         let channel = channel.clone();
+        let revision = self.revision;
+        self.begin_request();
         cx.spawn(async move |this, cx| {
-            let Ok(list) = client.posts_since(&channel, since).await else {
-                return;
-            };
+            let result = client.posts_since(&channel, since).await;
             let _ = this.update(cx, |this, cx| {
-                for post in list.into_chronological() {
-                    if post.delete_at > 0 {
-                        this.remove(&post.id, cx);
-                    } else {
-                        this.upsert(post, cx);
+                if let Ok(list) = result {
+                    let mut events = Vec::new();
+                    for post in list.into_chronological() {
+                        if this.kind.accepts(&post) {
+                            let entry = Entry::new(post, Delivery::Sent, &this.custom_emoji);
+                            if let Some(event) = this.merge(entry, Some(revision)) {
+                                events.push(event);
+                            }
+                        }
+                    }
+                    if !events.is_empty() {
+                        this.request_missing(0..this.entries.len(), cx);
+                        // A reset reads the final length, so it must stand alone.
+                        if events.contains(&TimelineEvent::Reset) {
+                            cx.emit(TimelineEvent::Reset);
+                        } else {
+                            for event in events {
+                                cx.emit(event);
+                            }
+                        }
+                        cx.notify();
                     }
                 }
+                this.finish_request();
             });
         })
         .detach();
     }
 
-    fn accepts(&self, post: &Post) -> bool {
-        self.kind.accepts(post)
+    /// Overlap the last confirmed change so timestamp boundaries are harmless.
+    fn confirmed_since(&self) -> Option<Millis> {
+        self.entries
+            .iter()
+            .filter(|e| e.delivery == Delivery::Sent)
+            .map(Entry::changed_at)
+            .max()
+            .map(|at| at.saturating_sub(1_000).max(0))
     }
 
     /// Insert a new post or replace a known one, keeping chronological order.
     /// A post echoing an optimistic entry's `pending_post_id` replaces it.
     pub fn upsert(&mut self, post: Post, cx: &mut Context<Self>) {
-        if !self.accepts(&post) {
+        self.upsert_from(post, None, cx);
+    }
+
+    fn upsert_from(&mut self, post: Post, revision: Option<u64>, cx: &mut Context<Self>) {
+        if !self.kind.accepts(&post) {
             return;
         }
-        self.request_emoji([&post], cx);
-        if let Some(ix) = self.position(&post.id) {
-            self.entries[ix] = Entry::new(post, Delivery::Sent, &self.custom_emoji);
-            cx.emit(TimelineEvent::Updated(ix));
+        let entry = Entry::new(post, Delivery::Sent, &self.custom_emoji);
+        if let Some(event) = self.merge(entry, revision) {
+            let range = match &event {
+                TimelineEvent::Updated(ix) => *ix..ix + 1,
+                TimelineEvent::Spliced { old, new_count } => old.start..old.start + new_count,
+                TimelineEvent::Reset => 0..self.entries.len(),
+            };
+            self.request_missing(range, cx);
+            cx.emit(event);
             cx.notify();
-            return;
         }
-        if !post.pending_post_id.is_empty() {
-            let pending = PostId::from(post.pending_post_id.as_str());
-            if let Some(ix) = self.position(&pending) {
-                self.entries[ix] = Entry::new(post, Delivery::Sent, &self.custom_emoji);
-                cx.emit(TimelineEvent::Updated(ix));
-                cx.notify();
-                return;
+    }
+
+    /// Merge server state without undoing newer posts.
+    fn merge(&mut self, mut entry: Entry, revision: Option<u64>) -> Option<TimelineEvent> {
+        if entry.post.delete_at > 0 {
+            if self.requests_in_flight > 0 {
+                self.deleted.insert(entry.id().clone());
             }
+            return self.position(entry.id()).map(|ix| {
+                self.entries.remove(ix);
+                TimelineEvent::Spliced {
+                    old: ix..ix + 1,
+                    new_count: 0,
+                }
+            });
+        }
+        if self.deleted.contains(entry.id()) {
+            return None;
+        }
+        let pending = PostId::from(entry.post.pending_post_id.as_str());
+        let ix = self.position(entry.id()).or_else(|| {
+            (!pending.is_empty())
+                .then(|| self.position(&pending))
+                .flatten()
+        });
+        if let Some(ix) = ix {
+            let current = &self.entries[ix];
+            if current.delivery == Delivery::Sent {
+                if current.changed_at() > entry.changed_at() {
+                    return None;
+                }
+                if current.changed_at() == entry.changed_at()
+                    && revision.is_some_and(|at| current.revision > at)
+                {
+                    let reactions = entry.post.metadata.reactions.clone();
+                    entry.post = current.post.clone();
+                    entry.message = current.message.clone();
+                    Arc::make_mut(&mut entry.post).metadata.reactions = reactions;
+                }
+            }
+            if current.delivery == entry.delivery && current.post == entry.post {
+                return None;
+            }
+            let was_pending = current.delivery != Delivery::Sent;
+            let id = entry.id().clone();
+            self.revision += 1;
+            entry.revision = self.revision;
+            self.entries[ix] = entry;
+            if was_pending {
+                self.entries
+                    .sort_by_key(|e| (e.delivery != Delivery::Sent, e.post.create_at));
+                if self.position(&id) != Some(ix) {
+                    return Some(TimelineEvent::Reset);
+                }
+            }
+            return Some(TimelineEvent::Updated(ix));
         }
         // Pending entries stay at the tail, after every confirmed post.
         let ix = self
             .entries
             .iter()
-            .rposition(|e| e.delivery == Delivery::Sent && e.post.create_at <= post.create_at)
+            .rposition(|e| e.delivery == Delivery::Sent && e.post.create_at <= entry.post.create_at)
             .map_or(0, |ix| ix + 1);
-        self.directory
-            .update(cx, |d, cx| d.ensure([post.user_id.clone()], cx));
-        self.entries
-            .insert(ix, Entry::new(post, Delivery::Sent, &self.custom_emoji));
-        cx.emit(TimelineEvent::Spliced {
+        self.revision += 1;
+        entry.revision = self.revision;
+        self.entries.insert(ix, entry);
+        Some(TimelineEvent::Spliced {
             old: ix..ix,
             new_count: 1,
-        });
-        cx.notify();
+        })
     }
 
+    /// Remove a confirmed deletion from its conversation.
+    pub fn delete(&mut self, post: &Post, cx: &mut Context<Self>) {
+        if self.kind.accepts(post) {
+            if self.requests_in_flight > 0 {
+                self.deleted.insert(post.id.clone());
+            }
+            self.remove(&post.id, cx);
+        }
+    }
+
+    fn begin_request(&mut self) {
+        self.requests_in_flight += 1;
+    }
+
+    fn finish_request(&mut self) {
+        self.requests_in_flight -= 1;
+        if self.requests_in_flight == 0 {
+            self.deleted.clear();
+        }
+    }
+
+    /// Remove a row optimistically, allowing a later reload to restore it.
     pub fn remove(&mut self, id: &PostId, cx: &mut Context<Self>) {
         if let Some(ix) = self.position(id) {
             self.entries.remove(ix);
@@ -512,6 +655,8 @@ impl Timeline {
         let entry = &mut self.entries[ix];
         let post = Arc::make_mut(&mut entry.post);
         if change(post) {
+            self.revision += 1;
+            entry.revision = self.revision;
             cx.emit(TimelineEvent::Updated(ix));
             cx.notify();
         }
@@ -523,18 +668,7 @@ impl Timeline {
             self.emoji.update(cx, |emoji, cx| emoji.ensure([name], cx));
         }
         self.update_post(&reaction.post_id, cx, |post| {
-            let reactions = &mut post.metadata.reactions;
-            let existing = reactions
-                .iter()
-                .position(|r| r.user_id == reaction.user_id && r.emoji_name == reaction.emoji_name);
-            match (added, existing) {
-                (true, None) => reactions.push(reaction.clone()),
-                (false, Some(ix)) => {
-                    reactions.remove(ix);
-                }
-                _ => return false,
-            }
-            true
+            set_reaction(post, reaction, added)
         });
     }
 
@@ -613,6 +747,13 @@ mod tests {
 
     fn timeline(cx: &mut TestAppContext) -> (Entity<Timeline>, Rc<RefCell<Vec<TimelineEvent>>>) {
         let client = Client::new_unverified("http://localhost:1", "token").unwrap();
+        timeline_with_client(client, cx)
+    }
+
+    fn timeline_with_client(
+        client: Client,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Timeline>, Rc<RefCell<Vec<TimelineEvent>>>) {
         let mut me = User::default();
         me.id = "me".into();
         let emoji = cx.new(|_| EmojiStore::new(client.clone()));
@@ -641,6 +782,298 @@ mod tests {
         timeline.read_with(cx, |t, _| {
             t.entries().iter().map(|e| e.id().to_string()).collect()
         })
+    }
+
+    fn snapshot(posts: Vec<Post>) -> Prepared {
+        Prepared {
+            entries: posts
+                .into_iter()
+                .map(|p| Entry::new(p, Delivery::Sent, &CustomEmojis::default()))
+                .collect(),
+            custom_emoji: CustomEmojis::default(),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn tombstones_only_cover_matching_in_flight_requests(cx: &mut TestAppContext) {
+        let (timeline, _) = timeline(cx);
+        timeline.update(cx, |t, cx| {
+            t.upsert(post("a", 10), cx);
+            t.delete(&post("a", 10), cx);
+            assert!(t.deleted.is_empty());
+            t.begin_request();
+            t.begin_request();
+            let mut unrelated = post("elsewhere", 20);
+            unrelated.channel_id = "other".into();
+            t.delete(&unrelated, cx);
+            assert!(t.deleted.is_empty());
+            // A root not loaded yet may still be present in an outstanding page.
+            t.delete(&post("b", 20), cx);
+            assert_eq!(t.deleted.len(), 1);
+            t.finish_request();
+            t.upsert(post("b", 20), cx);
+            assert!(t.entries().is_empty());
+            t.finish_request();
+            assert!(t.deleted.is_empty());
+            assert_eq!(t.requests_in_flight, 0);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn failed_requests_release_tombstones(cx: &mut TestAppContext) {
+        use mattermost::testing::{Network, Reply, SlowServer};
+        use std::time::{Duration, Instant};
+
+        cx.executor().allow_parking();
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), |_| {
+            Reply::json(serde_json::json!({ "message": "Forbidden" })).status(403)
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let (timeline, _) = timeline_with_client(client, cx);
+        timeline.update(cx, |t, cx| {
+            t.reload(cx);
+            t.reload(cx);
+            assert_eq!(t.requests_in_flight, 1);
+            t.delete(&post("a", 10), cx);
+            assert_eq!(t.deleted.len(), 1);
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if timeline.read_with(cx, |t, _| matches!(t.state(), LoadState::Failed(_))) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for refusal");
+            cx.executor().advance_clock(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        timeline.read_with(cx, |t, _| {
+            assert!(t.deleted.is_empty());
+            assert_eq!(t.requests_in_flight, 0);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_full_page_of_deleted_posts_does_not_end_pagination(cx: &mut TestAppContext) {
+        use mattermost::testing::{Network, Reply, SlowServer};
+        use std::time::{Duration, Instant};
+
+        cx.executor().allow_parking();
+        let server = SlowServer::start(Network::new(Duration::from_millis(100)), |request| {
+            if request.path().contains("before=") {
+                let posts: serde_json::Map<_, _> = (0..PAGE_SIZE)
+                    .map(|ix| {
+                        let id = format!("old{ix}");
+                        (
+                            id.clone(),
+                            serde_json::json!({ "id": id, "channel_id": "c", "create_at": ix + 1 }),
+                        )
+                    })
+                    .collect();
+                let order: Vec<_> = posts.keys().cloned().collect();
+                return Reply::json(serde_json::json!({ "order": order, "posts": posts }));
+            }
+            Reply::not_found()
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let (timeline, _) = timeline_with_client(client, cx);
+        timeline.update(cx, |t, cx| {
+            t.replace_all(PAGE_SIZE, snapshot(vec![post("seed", 100)]), t.revision, cx);
+            t.load_older(cx);
+            for ix in 0..PAGE_SIZE {
+                t.delete(&post(&format!("old{ix}"), ix as Millis + 1), cx);
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if !timeline.read_with(cx, |t, _| t.is_loading_older()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for older posts"
+            );
+            cx.executor().advance_clock(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        timeline.read_with(cx, |t, _| {
+            assert!(t.has_older());
+            assert_eq!(t.entries().len(), 1);
+            assert!(t.deleted.is_empty());
+            assert_eq!(t.requests_in_flight, 0);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn catch_up_uses_only_confirmed_times_with_an_overlap(cx: &mut TestAppContext) {
+        let (timeline, _) = timeline(cx);
+        timeline.update(cx, |t, cx| {
+            t.insert_pending(post("failed", 900_000), cx);
+            t.set_delivery(&"failed".into(), Delivery::Failed, cx);
+            t.insert_pending(post("pending", 1_000_000), cx);
+            assert_eq!(t.confirmed_since(), None);
+            let mut confirmed = post("a", 2_000);
+            confirmed.update_at = 3_000;
+            confirmed.edit_at = 4_000;
+            t.upsert(confirmed, cx);
+            assert_eq!(t.confirmed_since(), Some(3_000));
+            t.upsert(post("b", 100), cx);
+            assert_eq!(t.confirmed_since(), Some(3_000));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn stale_posts_cannot_undo_edits_or_deletes(cx: &mut TestAppContext) {
+        let (timeline, _) = timeline(cx);
+        timeline.update(cx, |t, cx| {
+            let mut edited = post("a", 10);
+            edited.edit_at = 30;
+            edited.message = "new edit".into();
+            t.upsert(edited, cx);
+            t.upsert(post("a", 10), cx);
+            assert_eq!(t.entries()[0].post().message, "new edit");
+            let mut stale = post("a", 10);
+            stale.update_at = 20;
+            t.upsert(stale, cx);
+            assert_eq!(t.entries()[0].post().message, "new edit");
+            t.begin_request();
+            t.delete(&post("a", 10), cx);
+            t.upsert(post("a", 10), cx);
+            // Deletes that arrive before a post is loaded also leave a tombstone.
+            t.delete(&post("b", 20), cx);
+            t.upsert(post("b", 20), cx);
+            assert!(t.entries().is_empty());
+            t.finish_request();
+        });
+    }
+
+    #[gpui_kit::test]
+    fn reload_keeps_changes_made_while_the_snapshot_was_in_flight(cx: &mut TestAppContext) {
+        let (timeline, _) = timeline(cx);
+        timeline.update(cx, |t, cx| {
+            t.upsert(post("old-page", 1), cx);
+            t.upsert(post("edited", 10), cx);
+            t.upsert(post("deleted", 20), cx);
+            let revision = t.revision;
+            t.begin_request();
+            let mut edited = post("edited", 10);
+            edited.update_at = 40;
+            edited.message = "live edit".into();
+            t.upsert(edited, cx);
+            t.upsert(post("live", 30), cx);
+            t.delete(&post("deleted", 20), cx);
+            t.insert_pending(post("pending", 100), cx);
+            t.replace_all(
+                2,
+                snapshot(vec![post("edited", 10), post("deleted", 20)]),
+                revision,
+                cx,
+            );
+            assert_eq!(
+                t.entries()
+                    .iter()
+                    .map(|e| e.id().as_str())
+                    .collect::<Vec<_>>(),
+                ["edited", "live", "pending"]
+            );
+            assert_eq!(t.entries()[0].post().message, "live edit");
+            assert_eq!(t.entries()[2].delivery(), Delivery::Pending);
+            t.finish_request();
+        });
+    }
+
+    #[gpui_kit::test]
+    fn newer_rest_snapshots_replace_reactions_without_replaying_events(cx: &mut TestAppContext) {
+        let (timeline, _) = timeline(cx);
+        timeline.update(cx, |t, cx| {
+            t.upsert(post("a", 10), cx);
+            let revision = t.revision;
+            let mut reaction = Reaction::default();
+            reaction.post_id = "a".into();
+            reaction.user_id = "u".into();
+            reaction.emoji_name = "+1".into();
+            reaction.create_at = 20;
+            t.apply_reaction(&reaction, true, cx);
+            t.apply_reaction(&reaction, true, cx);
+            // The snapshot includes a later removal, even though its request began first.
+            let mut removed = post("a", 10);
+            removed.update_at = 30;
+            t.upsert_from(removed, Some(revision), cx);
+            assert!(t.entries()[0].post().metadata.reactions.is_empty());
+            // A reaction for an unloaded post is supplied by the authoritative snapshot.
+            reaction.post_id = "b".into();
+            t.apply_reaction(&reaction, true, cx);
+            let mut loaded = post("b", 15);
+            loaded.update_at = 40;
+            loaded.metadata.reactions.push(reaction);
+            let revision = t.revision;
+            t.replace_all(2, snapshot(vec![post("a", 10), loaded]), revision, cx);
+            assert_eq!(t.entries()[1].post().metadata.reactions.len(), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn reload_reconciles_a_failed_post_with_its_server_echo(cx: &mut TestAppContext) {
+        let (timeline, _) = timeline(cx);
+        timeline.update(cx, |t, cx| {
+            let mut pending = post("me:99", 99);
+            pending.pending_post_id = "me:99".into();
+            t.insert_pending(pending, cx);
+            t.set_delivery(&"me:99".into(), Delivery::Failed, cx);
+            t.upsert(post("later", 75), cx);
+            let revision = t.revision;
+            let mut confirmed = post("real", 50);
+            confirmed.pending_post_id = "me:99".into();
+            t.replace_all(
+                2,
+                snapshot(vec![confirmed.clone(), post("later", 75)]),
+                revision,
+                cx,
+            );
+            t.upsert(confirmed, cx);
+            assert_eq!(t.entries().len(), 2);
+            assert_eq!(t.entries()[0].id().as_str(), "real");
+            assert_eq!(t.entries()[1].id().as_str(), "later");
+            assert_eq!(t.entries()[0].delivery(), Delivery::Sent);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn identical_posts_do_not_emit_updates_or_advance_the_revision(cx: &mut TestAppContext) {
+        let (timeline, events) = timeline(cx);
+        let mut original = post("a", 10);
+        original
+            .props
+            .insert("override_username".into(), serde_json::json!("bot"));
+        original
+            .metadata
+            .embeds
+            .push(mattermost::PostEmbed::default());
+        original
+            .metadata
+            .files
+            .push(mattermost::FileInfo::default());
+        original.metadata.reactions.push(Reaction::default());
+        original
+            .metadata
+            .images
+            .insert("image".into(), mattermost::ImageSize::default());
+        timeline.update(cx, |t, cx| t.upsert(original.clone(), cx));
+        events.borrow_mut().clear();
+        timeline.update(cx, |t, cx| {
+            let revision = t.revision;
+            t.upsert_from(original.clone(), Some(revision), cx);
+            t.upsert(original.clone(), cx);
+            assert_eq!(t.revision, revision);
+        });
+        assert!(events.borrow().is_empty());
+        timeline.update(cx, |t, cx| {
+            let mut changed = original.clone();
+            changed.metadata.reactions.clear();
+            t.upsert(changed, cx);
+        });
+        assert_eq!(*events.borrow(), [TimelineEvent::Updated(0)]);
     }
 
     #[gpui_kit::test]

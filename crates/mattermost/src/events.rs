@@ -56,7 +56,7 @@ pub enum Event {
     /// The current user read a channel, possibly on another device.
     ChannelViewed(ChannelId),
     /// The current user read several channels at once.
-    ChannelsViewed(Vec<ChannelId>),
+    ChannelsViewed(Vec<(ChannelId, Millis)>),
     StatusChanged {
         user_id: UserId,
         status: Status,
@@ -281,8 +281,8 @@ pub(crate) fn parse_event(text: &str) -> Option<Event> {
                 .and_then(Value::as_object)
                 .map(|times| {
                     times
-                        .keys()
-                        .map(|id| ChannelId::from(id.as_str()))
+                        .iter()
+                        .filter_map(|(id, at)| Some((ChannelId::from(id.as_str()), at.as_i64()?)))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -377,6 +377,19 @@ mod tests {
         assert!(
             matches!(parse_event(text), Some(Event::EmojiAdded(emoji)) if emoji.name == "parrot")
         );
+    }
+
+    #[test]
+    fn keeps_server_times_for_viewed_channels() {
+        let text = r#"{"event":"multiple_channels_viewed","data":{"channel_times":{"c1":120,"c2":240}},"broadcast":{}}"#;
+        match parse_event(text) {
+            Some(Event::ChannelsViewed(channels)) => {
+                assert_eq!(channels, vec![("c1".into(), 120), ("c2".into(), 240)]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let text = r#"{"event":"channel_viewed","data":{"channel_id":"c1"},"broadcast":{}}"#;
+        assert!(matches!(parse_event(text), Some(Event::ChannelViewed(id)) if id.as_str() == "c1"));
     }
 
     #[test]

@@ -142,6 +142,16 @@ impl PostScrollerState {
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_following_tail(&self) -> bool {
+        self.list.is_following_tail()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn item_count(&self) -> usize {
+        self.list.item_count()
+    }
+
     fn contains(&self, range: &Range<usize>) -> bool {
         range.start <= range.end && range.end <= self.list.item_count()
     }
