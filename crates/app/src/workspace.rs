@@ -1245,6 +1245,257 @@ mod tests {
         }
     }
 
+    fn discovery_route(request: &Request) -> Reply {
+        match (
+            request.method(),
+            request.path().split('?').next().unwrap_or_default(),
+        ) {
+            ("POST", "/api/v4/users/search") => {
+                let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                if body["term"] == "ben" {
+                    Reply::json(
+                        json!([{ "id": "ben", "username": "ben", "first_name": "Ben", "last_name": "Example" }]),
+                    )
+                } else if body["term"] == "ann" {
+                    Reply::json(
+                        json!([{ "id": "ann", "username": "ann", "first_name": "Ann", "last_name": "Example" }]),
+                    )
+                } else {
+                    Reply::json(json!([]))
+                }
+            }
+            ("POST", "/api/v4/channels/direct") => {
+                Reply::json(json!({ "id": "dm", "name": "me__ann", "type": "D" }))
+            }
+            ("POST", "/api/v4/channels/group") => {
+                Reply::json(json!({ "id": "group", "display_name": "Ann, Ben", "type": "G" }))
+            }
+            ("GET", "/api/v4/channels/dm/members/me" | "/api/v4/channels/group/members/me") => {
+                Reply::json(json!({ "user_id": "me" }))
+            }
+            ("GET", "/api/v4/teams/team/channels") => Reply::json(json!([
+                { "id": "design", "team_id": "team", "type": "O", "name": "design", "display_name": "Design", "purpose": "Discuss design" },
+                { "id": "town", "team_id": "team", "type": "O", "name": "town-square" }
+            ])),
+            ("POST", "/api/v4/channels/design/members") => {
+                Reply::json(json!({ "channel_id": "design", "user_id": "me" }))
+            }
+            _ => route(request),
+        }
+    }
+
+    fn palette_type(handle: AnyWindowHandle, text: &str, cx: &mut TestAppContext) {
+        cx.update_window(handle, |_, window, cx| window.input(text, cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn palette_enter(handle: AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(handle, |_, window, cx| window.press("enter", cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn wait_for_label(handle: AnyWindowHandle, label: &str, cx: &mut TestAppContext) {
+        use gpui_kit::test::TestQueryExt as _;
+        wait_until(cx, |cx| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find_by_label(label).is_some()
+            })
+            .unwrap()
+        });
+    }
+
+    fn open_palette(handle: AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press(
+                if cfg!(target_os = "macos") {
+                    "cmd-k"
+                } else {
+                    "ctrl-k"
+                },
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn palette_keyboard_search_opens_person_and_browse_joins_channel(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(10)), discovery_route);
+        let (handle, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| w.session.read(cx).is_loaded())
+        });
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_channel(&"town".into(), window, cx));
+        })
+        .unwrap();
+        open_palette(handle, cx);
+        palette_type(handle, "ann", cx);
+        wait_for_label(handle, "Ann Example @ann", cx);
+        // Local matches stay first; use arrow keys to reach the appended person.
+        cx.update_window(handle, |_, window, cx| {
+            use gpui_kit::test::TestQueryExt as _;
+            for _ in 0..40 {
+                if window.find_by_label("Ann Example @ann").selected() == Some(true) {
+                    break;
+                }
+                window.press("down", cx);
+            }
+            assert_eq!(
+                window.find_by_label("Ann Example @ann").selected(),
+                Some(true)
+            );
+            window.press("enter", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, _| w.active == Some("dm".into()))
+        });
+        open_palette(handle, cx);
+        palette_type(handle, "Browse channels", cx);
+        palette_enter(handle, cx);
+        wait_for_label(handle, "Design · #design", cx);
+        palette_enter(handle, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, _| w.active == Some("design".into()))
+        });
+        workspace.read_with(cx, |w, cx| {
+            assert!(w.session.read(cx).channel(&"design".into()).is_some())
+        });
+        assert!(
+            server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "POST" && r.path() == "/api/v4/channels/design/members")
+        );
+        let person_searches = server
+            .requests()
+            .into_iter()
+            .filter(|r| {
+                r.method() == "POST"
+                    && r.path() == "/api/v4/users/search"
+                    && serde_json::from_slice::<serde_json::Value>(r.body()).unwrap()["term"]
+                        == "ann"
+            })
+            .count();
+        assert_eq!(
+            person_searches, 1,
+            "typing a name should debounce to one request"
+        );
+        open_palette(handle, cx);
+        palette_type(handle, "ann", cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.press("escape", cx);
+            assert!(window.has_active_dialog(cx));
+            window.press("escape", cx);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn palette_group_keeps_selection_while_searching_and_opens_group(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(10)), discovery_route);
+        let (handle, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| w.session.read(cx).is_loaded())
+        });
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_channel(&"town".into(), window, cx));
+        })
+        .unwrap();
+        open_palette(handle, cx);
+        palette_type(handle, "New group message", cx);
+        palette_enter(handle, cx);
+        for (query, label) in [("ann", "Ann Example @ann"), ("ben", "Ben Example @ben")] {
+            palette_type(handle, query, cx);
+            wait_for_label(handle, label, cx);
+            palette_enter(handle, cx);
+        }
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("selected-person-ann").visible());
+            assert!(window.find("selected-person-ben").visible());
+            // Traverse the palette's standard controls to the commit button.
+            for _ in 0..8 {
+                if window.find("open-group").focused() == Some(true) {
+                    break;
+                }
+                window.press("tab", cx);
+            }
+            assert_eq!(window.find("open-group").focused(), Some(true));
+            window.press("enter", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, _| w.active == Some("group".into()))
+        });
+        open_palette(handle, cx);
+        palette_type(handle, "New group message", cx);
+        palette_enter(handle, cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("shift-tab", cx);
+            assert!(
+                window
+                    .find_all("back")
+                    .iter()
+                    .any(|button| button.focused() == Some(true))
+            );
+            window.press("escape", cx);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn removing_a_focused_group_chip_returns_typing_to_search(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestQueryExt as _;
+        let server = SlowServer::start(Network::new(Duration::from_millis(10)), discovery_route);
+        let (handle, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| w.session.read(cx).is_loaded())
+        });
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_channel(&"town".into(), window, cx));
+        })
+        .unwrap();
+        open_palette(handle, cx);
+        palette_type(handle, "New group message", cx);
+        palette_enter(handle, cx);
+        palette_type(handle, "ann", cx);
+        wait_for_label(handle, "Ann Example @ann", cx);
+        palette_enter(handle, cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("shift-tab", cx);
+            assert_eq!(window.find("selected-person-ann").focused(), Some(true));
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("selected-person-ann").is_none());
+            window.input("ben", cx);
+        })
+        .unwrap();
+        wait_for_label(handle, "Ben Example @ben", cx);
+        cx.update_window(handle, |_, window, cx| {
+            assert!(window.find_by_label("Ben Example @ben").visible());
+            window.press("escape", cx);
+            assert!(window.has_active_dialog(cx));
+            window.press("escape", cx);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
+
     #[gpui_kit::test]
     fn text_drafts_survive_restart_and_clear_on_send_and_signout(cx: &mut TestAppContext) {
         let server = SlowServer::start(Network::new(Duration::ZERO), |request| {

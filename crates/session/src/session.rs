@@ -121,6 +121,8 @@ pub enum SessionEvent {
     Posted { post: Arc<Post>, mentions_me: bool },
     /// A send failed; the message is kept so the user can retry.
     SendFailed { message: SharedString },
+    /// Channel discovery may have changed on the server.
+    ChannelsChanged,
     /// A server event this crate does not model, for extensions.
     Raw {
         name: SharedString,
@@ -1450,6 +1452,13 @@ impl Session {
         user: UserId,
         cx: &mut Context<Self>,
     ) -> Task<Result<ChannelId>> {
+        if let Some(entry) = self
+            .channels
+            .values()
+            .find(|entry| entry.channel.direct_partner(&self.me.id).as_ref() == Some(&user))
+        {
+            return Task::ready(Ok(entry.id().clone()));
+        }
         let client = self.client.clone();
         let me = self.me.id.clone();
         cx.spawn(async move |this, cx| {
@@ -1460,9 +1469,140 @@ impl Session {
                 this.channels
                     .entry(id.clone())
                     .or_insert(ChannelEntry { channel, member });
+                this.hydrated_channels.insert(id.clone());
                 this.directory.update(cx, |d, cx| d.ensure([user], cx));
                 cx.notify();
             })?;
+            Ok(id)
+        })
+    }
+
+    /// Find active people and cache their identity for opening conversations.
+    pub fn search_people(&self, term: &str, cx: &mut Context<Self>) -> Task<Result<Vec<User>>> {
+        let client = self.client.clone();
+        let term = term.to_owned();
+        let directory = self.directory.clone();
+        cx.spawn(async move |_, cx| {
+            let users: Vec<User> = client
+                .search_users(&term, 50)
+                .await?
+                .into_iter()
+                .filter(|user| user.delete_at == 0)
+                .collect();
+            directory.update(cx, |d, cx| d.insert(users.clone(), cx));
+            Ok(users)
+        })
+    }
+
+    /// A page of public channels available to join. The view also checks
+    /// membership when displaying results because a live event can join one.
+    pub fn discover_channels(
+        &self,
+        term: &str,
+        page: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(Vec<Channel>, bool)>> {
+        let Some(team) = self.team.clone() else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "Choose a team to browse its channels."
+            )));
+        };
+        let client = self.client.clone();
+        let term = term.to_owned();
+        cx.background_spawn(async move {
+            let channels = if term.is_empty() {
+                client.public_channels(&team, page, 100).await?
+            } else {
+                client.search_public_channels(&team, &term).await?
+            };
+            let more = term.is_empty() && channels.len() == 100;
+            Ok((
+                channels
+                    .into_iter()
+                    .filter(|channel| {
+                        channel.team_id == team
+                            && channel.kind == ChannelType::Open
+                            && channel.delete_at == 0
+                    })
+                    .collect(),
+                more,
+            ))
+        })
+    }
+
+    /// Create or reuse a group with 2–7 other people. The server is the
+    /// authority for deduplication of an existing member set.
+    pub fn open_group_channel(
+        &mut self,
+        mut users: Vec<UserId>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ChannelId>> {
+        users.retain(|id| id != &self.me.id);
+        users.sort();
+        users.dedup();
+        if !(2..=7).contains(&users.len()) {
+            return Task::ready(Err(anyhow::anyhow!(
+                "Choose 2–7 people for a group message."
+            )));
+        }
+        let client = self.client.clone();
+        let mut members = users.clone();
+        members.push(self.me.id.clone());
+        cx.spawn(async move |this, cx| {
+            let channel = client.group_channel(&members).await?;
+            let member = client.my_channel_member(&channel.id).await.ok();
+            let id = channel.id.clone();
+            this.update(cx, |this, cx| {
+                this.channels
+                    .entry(id.clone())
+                    .or_insert(ChannelEntry { channel, member });
+                this.hydrated_channels.insert(id.clone());
+                this.group_members.insert(id.clone(), users.clone());
+                this.directory.update(cx, |d, cx| d.ensure(users, cx));
+                cx.notify();
+            })?;
+            Ok(id)
+        })
+    }
+
+    /// Join before publishing the channel to the sidebar. A denied join
+    /// leaves session membership unchanged.
+    pub fn join_public_channel(
+        &mut self,
+        channel: Channel,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ChannelId>> {
+        if channel.kind != ChannelType::Open
+            || channel.delete_at != 0
+            || Some(&channel.team_id) != self.team.as_ref()
+        {
+            return Task::ready(Err(anyhow::anyhow!(
+                "Choose a public channel in the current team."
+            )));
+        }
+        if self.channels.contains_key(&channel.id) {
+            return Task::ready(Ok(channel.id));
+        }
+        let client = self.client.clone();
+        let me = self.me.id.clone();
+        cx.spawn(async move |this, cx| {
+            let member = client.join_channel(&channel.id, &me).await?;
+            let id = channel.id.clone();
+            this.update(cx, |this, cx| -> Result<()> {
+                if Some(&channel.team_id) != this.team.as_ref() {
+                    anyhow::bail!("The team changed. Browse channels again.");
+                }
+                this.channels.insert(
+                    id.clone(),
+                    ChannelEntry {
+                        channel,
+                        member: Some(member),
+                    },
+                );
+                this.hydrated_channels.insert(id.clone());
+                cx.notify();
+                Ok(())
+            })??;
             Ok(id)
         })
     }
@@ -1598,7 +1738,28 @@ impl Session {
                 }
                 self.directory.update(cx, |d, cx| d.insert([user], cx));
             }
-            Event::ChannelsChanged => self.load_channels(cx),
+            Event::ChannelsChanged {
+                name,
+                team_id,
+                user_id,
+            } => {
+                self.load_channels(cx);
+                let in_team = team_id.is_empty() || self.team.as_ref() == Some(&team_id);
+                let discovery_changed = matches!(
+                    name.as_str(),
+                    "channel_created"
+                        | "channel_restored"
+                        | "channel_deleted"
+                        | "channel_converted"
+                ) || (user_id == self.me.id
+                    && matches!(
+                        name.as_str(),
+                        "user_added" | "user_removed" | "added_to_team" | "leave_team"
+                    ));
+                if in_team && discovery_changed {
+                    cx.emit(SessionEvent::ChannelsChanged);
+                }
+            }
             Event::EmojiAdded(emoji) => {
                 self.emoji
                     .update(cx, |store, cx| store.add(vec![emoji], cx));
@@ -1824,6 +1985,7 @@ impl Session {
 /// round trip, and what can overlap must.
 #[cfg(test)]
 mod slow_network_tests {
+    use mattermost::{ApiError, ChannelId, ChannelType};
     use std::{
         cell::RefCell,
         rc::Rc,
@@ -1907,6 +2069,179 @@ mod slow_network_tests {
             .requests()
             .iter()
             .any(|r| r.method() == method && r.path().split('?').next() == Some(path))
+    }
+
+    fn finish<T: 'static>(task: gpui_kit::Task<T>, cx: &mut TestAppContext) -> T {
+        let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = result.clone();
+        cx.spawn(async move |_| *slot.borrow_mut() = Some(task.await))
+            .detach();
+        wait_until(cx, |_| result.borrow().is_some());
+        result.borrow_mut().take().unwrap()
+    }
+
+    #[gpui_kit::test]
+    fn discovery_invalidations_ignore_unrelated_channel_events(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        let invalidations = Rc::new(std::cell::Cell::new(0));
+        let seen = invalidations.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&session, move |_, event, _| {
+                if matches!(event, SessionEvent::ChannelsChanged) {
+                    seen.set(seen.get() + 1);
+                }
+            })
+        });
+        for (name, team, user, expected) in [
+            ("channel_updated", "team", "", 0),
+            ("user_added", "team", "ann", 0),
+            ("user_removed", "team", "ben", 0),
+            ("channel_created", "other", "", 0),
+            ("user_added", "other", "me", 0),
+            ("direct_added", "", "me", 0),
+            ("channel_created", "team", "", 1),
+            ("user_added", "team", "me", 2),
+            ("user_removed", "team", "me", 3),
+            ("channel_deleted", "team", "", 4),
+        ] {
+            session.update(cx, |s, cx| {
+                s.handle_event(
+                    mattermost::Event::ChannelsChanged {
+                        name: name.into(),
+                        team_id: team.into(),
+                        user_id: user.into(),
+                    },
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            assert_eq!(invalidations.get(), expected, "{name} in {team} for {user}");
+        }
+    }
+
+    #[gpui_kit::test]
+    fn discovery_opens_searched_people_and_reuses_group_channels(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(10)), |request| {
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("POST", "/api/v4/users/search") => Reply::json(json!([
+                    { "id": "ann", "username": "ann", "first_name": "Ann" },
+                    { "id": "gone", "username": "gone", "delete_at": 1 }
+                ])),
+                ("POST", "/api/v4/channels/direct") => {
+                    Reply::json(json!({ "id": "dm", "type": "D", "name": "me__ann" }))
+                }
+                ("POST", "/api/v4/channels/group") => Reply::json(
+                    json!({ "id": "group", "type": "G", "display_name": "ann, ben, me" }),
+                ),
+                ("GET", "/api/v4/channels/dm/members/me" | "/api/v4/channels/group/members/me") => {
+                    Reply::json(json!({ "user_id": "me" }))
+                }
+                _ => route(request),
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        let users = session.update(cx, |s, cx| s.search_people("ann", cx));
+        let users = finish(users, cx).unwrap();
+        assert_eq!(users.len(), 1);
+        session.read_with(cx, |s, cx| {
+            assert!(s.directory.read(cx).user(&users[0].id).is_some())
+        });
+        for _ in 0..2 {
+            let task = session.update(cx, |s, cx| s.open_direct_channel(users[0].id.clone(), cx));
+            assert_eq!(finish(task, cx).unwrap(), ChannelId::from("dm"));
+            let task = session.update(cx, |s, cx| {
+                s.open_group_channel(
+                    vec!["ann".into(), "ben".into(), "ann".into(), "me".into()],
+                    cx,
+                )
+            });
+            assert_eq!(finish(task, cx).unwrap(), ChannelId::from("group"));
+        }
+        session.read_with(cx, |s, _| {
+            assert_eq!(
+                s.channels()
+                    .filter(|c| c.kind() == ChannelType::Direct)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                s.channels()
+                    .filter(|c| c.kind() == ChannelType::Group)
+                    .count(),
+                1
+            );
+            assert_eq!(s.group_members[&ChannelId::from("group")].len(), 2);
+        });
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.method() == "POST" && r.path() == "/api/v4/channels/direct")
+                .count(),
+            1
+        );
+        let invalid = session.update(cx, |s, cx| s.open_group_channel(vec!["ann".into()], cx));
+        assert!(finish(invalid, cx).is_err());
+    }
+
+    #[gpui_kit::test]
+    fn discovery_lists_joins_and_keeps_denied_channels_out_of_membership(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::from_millis(10)), |request| {
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("GET", "/api/v4/teams/team/channels")
+                | ("POST", "/api/v4/teams/team/channels/search") => Reply::json(json!([
+                    { "id": "public", "team_id": "team", "type": "O", "name": "design" },
+                    { "id": "denied", "team_id": "team", "type": "O", "name": "restricted" },
+                    { "id": "archived", "team_id": "team", "type": "O", "delete_at": 1 },
+                    { "id": "private", "team_id": "team", "type": "P" },
+                    { "id": "other", "team_id": "other", "type": "O" }
+                ])),
+                ("POST", "/api/v4/channels/public/members") => {
+                    Reply::json(json!({ "channel_id": "public", "user_id": "me" }))
+                }
+                ("POST", "/api/v4/channels/denied/members") => {
+                    Reply::json(json!({ "message": "No permission" })).status(403)
+                }
+                _ => route(request),
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        for term in ["", "design"] {
+            let task = session.update(cx, |s, cx| s.discover_channels(term, 0, cx));
+            let (channels, more) = finish(task, cx).unwrap();
+            assert!(!more);
+            assert_eq!(channels.len(), 2);
+            let join = session.update(cx, |s, cx| s.join_public_channel(channels[0].clone(), cx));
+            assert_eq!(finish(join, cx).unwrap(), ChannelId::from("public"));
+            let denied = session.update(cx, |s, cx| s.join_public_channel(channels[1].clone(), cx));
+            let error = finish(denied, cx).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ApiError>(),
+                Some(&ApiError::Status(403))
+            );
+        }
+        session.read_with(cx, |s, _| {
+            assert!(s.channel(&"public".into()).is_some());
+            assert!(s.channel(&"denied".into()).is_none());
+        });
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.method() == "POST" && r.path() == "/api/v4/channels/public/members")
+                .count(),
+            1
+        );
     }
 
     #[gpui_kit::test]
