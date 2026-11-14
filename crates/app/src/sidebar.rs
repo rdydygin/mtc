@@ -149,6 +149,7 @@ impl SidebarView {
         let theme = cx.theme();
         let unread = entry.is_unread() && !entry.is_muted();
         let mentions = entry.mention_count();
+        let muted = entry.is_muted();
         let active = session.active_channel() == Some(id);
         let mut presence = String::new();
         let mut custom_status = None;
@@ -226,8 +227,9 @@ impl SidebarView {
                 .px_2()
                 .selected(active)
                 .accessibility_label(format!(
-                    "{label}{presence}{}",
-                    if unread { ", unread" } else { "" }
+                    "{label}{presence}{}{}",
+                    if unread { ", unread" } else { "" },
+                    if muted { ", muted" } else { "" }
                 ))
                 .child(
                     h_flex()
@@ -249,6 +251,13 @@ impl SidebarView {
                                 .when(unread || mentions > 0, |this| this.font_semibold())
                                 .child(label),
                         )
+                        .when(muted, |this| {
+                            this.child(
+                                Icon::new(IconName::BellOff)
+                                    .small()
+                                    .text_color(theme.muted_foreground),
+                            )
+                        })
                         .when_some(custom_status, |this, status| {
                             this.child(
                                 div()
@@ -285,17 +294,32 @@ impl SidebarView {
                     move |menu, _, cx| {
                         let session_ref = session.read(cx);
                         let favorite = session_ref.is_favorite(&channel);
+                        let muted = session_ref
+                            .channel(&channel)
+                            .is_some_and(ChannelEntry::is_muted);
+                        let mute_pending = session_ref.is_mute_pending(&channel);
                         let can_leave = session_ref
                             .channel(&channel)
                             .is_some_and(ChannelEntry::can_leave);
                         let session = session.clone();
                         let channel = channel.clone();
                         let leave = (session.clone(), channel.clone());
+                        let mute = (session.clone(), channel.clone());
                         menu.item(PopupMenuItem::new(favorite_label(favorite)).on_click(
                             move |_, _, cx| {
                                 session.update(cx, |s, cx| s.set_favorite(&channel, !favorite, cx));
                             },
                         ))
+                        .item(
+                            PopupMenuItem::new(mute_label(muted))
+                                .disabled(mute_pending)
+                                .on_click(move |_, _, cx| {
+                                    let (session, channel) = &mute;
+                                    session.update(cx, |s, cx| {
+                                        s.set_channel_muted(channel, !muted, cx)
+                                    });
+                                }),
+                        )
                         .when(can_leave, move |menu| {
                             let (session, channel) = leave;
                             menu.separator()
@@ -1054,8 +1078,16 @@ impl Render for SidebarView {
     }
 }
 
-/// The command that adds a conversation to favorites or removes it, worded
-/// the same in every menu.
+/// The mute command, worded the same in every menu.
+pub fn mute_label(muted: bool) -> &'static str {
+    if muted {
+        "Unmute channel"
+    } else {
+        "Mute channel"
+    }
+}
+
+/// The favorite command, worded the same in every menu.
 pub fn favorite_label(favorite: bool) -> &'static str {
     if favorite {
         "Remove from favorites"

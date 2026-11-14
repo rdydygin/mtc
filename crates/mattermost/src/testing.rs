@@ -110,6 +110,7 @@ pub struct Reply {
     body: Vec<u8>,
     stall_after: Option<usize>,
     gate: Option<Gate>,
+    delay: Duration,
 }
 
 impl Reply {
@@ -124,6 +125,7 @@ impl Reply {
             body,
             stall_after: None,
             gate: None,
+            delay: Duration::ZERO,
         }
     }
 
@@ -144,6 +146,12 @@ impl Reply {
     /// Hold the entire response until `gate` opens, without blocking I/O workers.
     pub fn wait_for(mut self, gate: Gate) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    /// Add latency to this response independently of the other endpoints.
+    pub fn delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
         self
     }
 
@@ -260,7 +268,7 @@ async fn serve(
             let mut open = gate.0.subscribe();
             open.wait_for(|open| *open).await.expect("gate stays alive");
         }
-        tokio::time::sleep(network.latency).await;
+        tokio::time::sleep(network.latency + reply.delay).await;
         let mut head = format!(
             "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n",
             reply.status,
