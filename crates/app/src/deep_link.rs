@@ -72,6 +72,33 @@ pub fn forward_to_running(urls: &[String]) -> ForwardOutcome {
     forward_from(&path, urls)
 }
 
+/// The owner may have acquired its profile lock before publishing the listener.
+/// Retry only absence: authentication failures and protocol mismatches stay final.
+pub fn wait_for_running(urls: &[String]) -> ForwardOutcome {
+    let outcome = retry_absent(Duration::from_secs(3), || forward_to_running(urls));
+    if outcome == ForwardOutcome::Absent {
+        log::warn!(
+            "the mtc profile is locked but its listener is unavailable; exiting without starting another instance"
+        );
+    }
+    outcome
+}
+
+fn retry_absent(timeout: Duration, mut attempt: impl FnMut() -> ForwardOutcome) -> ForwardOutcome {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let outcome = attempt();
+        if outcome != ForwardOutcome::Absent {
+            return outcome;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return outcome;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
 fn forward_from(path: &Path, urls: &[String]) -> ForwardOutcome {
     forward_from_using(path, urls, |addr| {
         TcpStream::connect_timeout(addr, IO_TIMEOUT)
@@ -181,12 +208,11 @@ pub fn listen(urls: UnboundedSender<Vec<String>>) {
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { continue };
                     match receive(stream, &secret) {
-                        Ok(received) if !received.is_empty() => {
+                        Ok(received) => {
                             if urls.unbounded_send(received).is_err() {
                                 return;
                             }
                         }
-                        Ok(_) => {}
                         Err(err) => log::warn!("ignoring a deep-link connection: {err:#}"),
                     }
                 }
@@ -478,6 +504,50 @@ mod tests {
     }
 
     #[test]
+    fn retries_startup_absence_then_hands_off_the_original_callback() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let (client, stream) = connected_peer(&listener);
+        let server = std::thread::spawn(move || receive(stream, "s3cret").unwrap());
+        let urls = vec!["mmauth://callback?MMAUTHTOKEN=t".to_string()];
+        let mut client = Some(client);
+        let mut attempts = 0;
+        let outcome = retry_absent(Duration::from_secs(1), || {
+            attempts += 1;
+            if attempts == 1 {
+                ForwardOutcome::Absent
+            } else {
+                forward(client.take().unwrap(), "s3cret", &urls).unwrap()
+            }
+        });
+        assert_eq!(outcome, ForwardOutcome::Forwarded);
+        assert_eq!(attempts, 2);
+        assert_eq!(server.join().unwrap(), urls);
+    }
+
+    #[test]
+    fn startup_retries_are_bounded_and_never_retry_untrusted_peers() {
+        assert_eq!(
+            retry_absent(Duration::from_millis(5), || ForwardOutcome::Absent),
+            ForwardOutcome::Absent
+        );
+        for outcome in [
+            ForwardOutcome::Incompatible,
+            ForwardOutcome::AuthenticationFailed,
+        ] {
+            let mut attempts = 0;
+            let result = retry_absent(Duration::from_secs(3), || {
+                attempts += 1;
+                match outcome {
+                    ForwardOutcome::Incompatible => ForwardOutcome::Incompatible,
+                    _ => ForwardOutcome::AuthenticationFailed,
+                }
+            });
+            assert_eq!(result, outcome);
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[test]
     fn hands_links_to_the_listener() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let (client, stream) = connected_peer(&listener);
@@ -499,6 +569,18 @@ mod tests {
                 "mattermost-dev://callback?client_token=c&server_token=t".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn empty_authenticated_handoff_requests_activation() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let (client, stream) = connected_peer(&listener);
+        let server = std::thread::spawn(move || receive(stream, "s3cret").unwrap());
+        assert_eq!(
+            forward(client, "s3cret", &[]).unwrap(),
+            ForwardOutcome::Forwarded
+        );
+        assert!(server.join().unwrap().is_empty());
     }
 
     #[test]

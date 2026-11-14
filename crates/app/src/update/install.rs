@@ -16,9 +16,28 @@ use super::manifest::{Download, Manifest};
 /// No release comes close; a response this large is not one of ours.
 const MAX_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
 
-fn http() -> Result<reqwest::Client> {
+fn http(source: &str) -> Result<reqwest::Client> {
+    let source = url::Url::parse(source).context("invalid update URL")?;
+    ensure!(
+        super::manifest::is_secure(source.as_str(), cfg!(debug_assertions)),
+        "updates require HTTPS or loopback HTTP"
+    );
     reqwest::Client::builder()
         .user_agent(concat!("mtc/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error("too many update redirects")
+            } else if super::manifest::allowed_url(
+                attempt.previous().last().unwrap_or(&source),
+                attempt.url(),
+                cfg!(debug_assertions),
+            ) {
+                attempt.follow()
+            } else {
+                attempt
+                    .error("update redirect requires HTTPS (loopback HTTP only for debug testing)")
+            }
+        }))
         .connect_timeout(Duration::from_secs(30))
         // Silence, not size: a large download on a slow link still finishes.
         .read_timeout(Duration::from_secs(60))
@@ -29,7 +48,7 @@ fn http() -> Result<reqwest::Client> {
 /// The newest release, or `None` when the feed has none yet.
 pub async fn fetch_manifest(url: String) -> Result<Option<Manifest>> {
     mattermost::runtime::run(async move {
-        let response = http()?
+        let response = http(&url)?
             .get(&url)
             .send()
             .await
@@ -38,13 +57,18 @@ pub async fn fetch_manifest(url: String) -> Result<Option<Manifest>> {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
+        // The final feed's transport determines whether HTTP downloads are safe.
+        // A local debug feed may have redirected to an HTTPS manifest.
+        let feed_url = response.url().clone();
         let bytes = response
             .error_for_status()
             .context("the release feed is unavailable")?
             .bytes()
             .await
             .context("couldn’t read the release feed")?;
-        Manifest::parse(&bytes).map(Some)
+        let manifest = Manifest::parse(&bytes)?;
+        manifest.validate_downloads(&feed_url)?;
+        Ok(Some(manifest))
     })
     .await
 }
@@ -52,7 +76,7 @@ pub async fn fetch_manifest(url: String) -> Result<Option<Manifest>> {
 /// Download a release archive and check it against the feed's checksum.
 pub async fn download(download: Download) -> Result<Vec<u8>> {
     mattermost::runtime::run(async move {
-        let mut response = http()?
+        let mut response = http(&download.url)?
             .get(&download.url)
             .send()
             .await
@@ -619,9 +643,14 @@ mod tests {
     /// Serve `routes` (path → body) over HTTP on this computer; anything
     /// else is a 404. Returns the base URL.
     fn serve(routes: Vec<(&'static str, Vec<u8>)>) -> String {
+        serve_with(|_| routes)
+    }
+
+    fn serve_with(routes: impl FnOnce(&str) -> Vec<(&'static str, Vec<u8>)>) -> String {
         use std::io::{BufRead as _, BufReader, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let routes = routes(&base);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
@@ -649,6 +678,35 @@ mod tests {
         base
     }
 
+    /// Opt-in network smoke test: only request archive headers, never its body.
+    #[test]
+    #[ignore = "requires network access to the published GitHub release"]
+    fn live_official_feed_and_download_pass_the_url_policy() {
+        let manifest = futures::executor::block_on(fetch_manifest(
+            super::super::manifest::FEED_URL.to_owned(),
+        ))
+        .unwrap()
+        .expect("the official feed must contain a release");
+        let download = manifest
+            .downloads
+            .get("macos-universal")
+            .expect("the official release must offer the macOS archive")
+            .clone();
+        futures::executor::block_on(mattermost::runtime::run(async move {
+            let response = http(&download.url)?
+                .head(&download.url)
+                .send()
+                .await?
+                .error_for_status()?;
+            ensure!(
+                response.url().scheme() == "https",
+                "archive must stay on HTTPS"
+            );
+            Ok(())
+        }))
+        .unwrap();
+    }
+
     #[test]
     fn reads_the_feed_and_downloads_a_verified_archive() {
         let archive = b"not really a zip".to_vec();
@@ -656,12 +714,16 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        let downloads = serve(vec![("/archive.zip", archive.clone())]);
-        let feed = format!(
-            r#"{{"version": "9.0.0", "page": "{downloads}/page",
+        let feed = serve_with(|downloads| {
+            let feed = format!(
+                r#"{{"version": "9.0.0", "page": "{downloads}/page",
                 "downloads": {{"macos-universal": {{"url": "{downloads}/archive.zip", "sha256": "{sha256}"}}}}}}"#
-        );
-        let feed = serve(vec![("/latest.json", feed.into_bytes())]);
+            );
+            vec![
+                ("/latest.json", feed.into_bytes()),
+                ("/archive.zip", archive.clone()),
+            ]
+        });
 
         let manifest = futures::executor::block_on(fetch_manifest(format!("{feed}/latest.json")))
             .unwrap()
