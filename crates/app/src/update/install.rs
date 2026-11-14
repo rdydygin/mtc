@@ -5,7 +5,7 @@
 //! [`mattermost::runtime`]); the file work is blocking and runs off the UI
 //! thread on that runtime's blocking pool.
 
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, ensure};
 use semver::Version;
@@ -85,6 +85,22 @@ fn verify(digest: &[u8], expected: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check eligibility off the UI thread. A symlink is never an install target.
+/// The installer repeats this check while holding the installation lock.
+pub async fn installable_target(target: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    return mattermost::runtime::run(async move {
+        tokio::task::spawn_blocking(move || target.filter(|path| replacement::is_installable(path)))
+            .await
+            .context("checking update eligibility was cancelled")
+    })
+    .await
+    .ok()
+    .flatten();
+    #[cfg(not(target_os = "macos"))]
+    target
+}
+
 /// Unpack `archive` and put the app inside it in place of the bundle at
 /// `target`. Finishes before returning; the running process keeps using the
 /// files it already opened, and the next launch starts the new version.
@@ -111,12 +127,16 @@ mod macos {
     use semver::Version;
 
     pub fn install(archive: &[u8], version: &Version, target: &Path) -> Result<()> {
+        use super::replacement;
         let parent = target.parent().context("the app has no enclosing folder")?;
-        // Unpack beside the app, so the swap is a rename on one volume.
-        let staging = parent.join(format!(".mtc-update-{version}"));
-        let _ = fs::remove_dir_all(&staging);
-        fs::create_dir(&staging)
-            .with_context(|| format!("mtc can’t write to {}", parent.display()))?;
+        let _lock = replacement::lock(parent)?
+            .context("another mtc instance is installing an update; skipping this round")?;
+        ensure!(
+            replacement::is_installable(target),
+            "mtc can’t replace a missing or symlinked app"
+        );
+        // Private, unique staging beside the app keeps the swap on one volume.
+        let staging = replacement::create_staging(parent, version)?;
         let result = (|| {
             let zip = staging.join("update.zip");
             fs::write(&zip, archive).context("couldn’t save the update")?;
@@ -128,9 +148,23 @@ mod macos {
             .context("couldn’t unpack the update")?;
             let app = staging.join("mtc.app");
             check_bundle(&app, target, version)?;
-            super::swap(target, &app)
+            Ok(app)
         })();
-        let _ = fs::remove_dir_all(&staging);
+        let app = match result {
+            Ok(app) => app,
+            Err(err) => {
+                replacement::remove_best_effort(&staging);
+                return Err(err);
+            }
+        };
+        let result = replacement::swap(target, &app);
+        if result.is_ok() {
+            replacement::remove_best_effort(&staging);
+        } else {
+            // A fallback rollback may have failed. Retain our transaction,
+            // report its location, and never promote it on a later check.
+            log::warn!("update staging preserved at {}", staging.display());
+        }
         result
     }
 
@@ -173,32 +207,220 @@ mod macos {
     }
 }
 
-/// Put the bundle at `new` where the one at `target` is. The old bundle is
-/// moved aside first and put back if the new one can't take its place, so a
-/// failure never leaves the app missing.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn swap(target: &Path, new: &Path) -> Result<()> {
-    let name = target
-        .file_name()
-        .context("the app has no file name")?
-        .to_string_lossy();
-    let aside = target.with_file_name(format!(".{name}.old"));
-    let _ = std::fs::remove_dir_all(&aside);
-    std::fs::rename(target, &aside)
-        .with_context(|| format!("mtc can’t replace {}", target.display()))?;
-    if let Err(err) = std::fs::rename(new, target) {
-        let _ = std::fs::rename(&aside, target);
-        return Err(err).with_context(|| format!("mtc can’t replace {}", target.display()));
+#[cfg(any(target_os = "macos", test))]
+mod replacement {
+    use std::{
+        fs, io,
+        path::{Path, PathBuf},
+    };
+
+    use anyhow::{Context as _, Result, ensure};
+
+    pub(super) fn is_installable(target: &Path) -> bool {
+        fs::symlink_metadata(target).is_ok_and(|metadata| metadata.file_type().is_dir())
     }
-    if let Err(err) = std::fs::remove_dir_all(&aside) {
-        log::warn!("removing the previous version: {err}");
+
+    pub(super) fn create_staging(parent: &Path, version: &semver::Version) -> Result<PathBuf> {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).context("couldn’t choose an update staging name")?;
+        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = parent.join(format!(".mtc-update-{version}-{suffix}"));
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        builder
+            .create(&path)
+            .context("couldn’t create update staging")?;
+        Ok(path)
     }
-    Ok(())
+
+    /// Keep the lock file in place: unlinking it would let instances lock
+    /// different inodes. Closing the file releases flock, including on exit.
+    #[cfg(target_os = "macos")]
+    pub(super) fn lock(parent: &Path) -> Result<Option<fs::File>> {
+        use std::os::{fd::AsRawFd as _, unix::fs::OpenOptionsExt as _};
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(parent.join(".mtc-update.lock"))
+            .context("couldn’t open the update lock")?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "the update lock is not a regular file"
+        );
+        // SAFETY: file owns this valid descriptor throughout the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            Ok(None)
+        } else {
+            Err(err).context("couldn’t lock the update installation")
+        }
+    }
+
+    pub(super) fn remove_best_effort(path: &Path) {
+        if let Err(err) = fs::remove_dir_all(path)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            log::warn!("removing {}: {err}", path.display());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn exchange(target: &Path, new: &Path) -> io::Result<()> {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
+        let target = CString::new(target.as_os_str().as_bytes())?;
+        let new = CString::new(new.as_os_str().as_bytes())?;
+        // SAFETY: both pointers are valid NUL-terminated paths for the call.
+        // Staging is beside the installation, on the same volume.
+        if unsafe { libc::renamex_np(new.as_ptr(), target.as_ptr(), libc::RENAME_SWAP) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn exchange(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    pub(super) fn swap(target: &Path, new: &Path) -> Result<()> {
+        swap_with(target, new, exchange)
+    }
+
+    fn swap_with(
+        target: &Path,
+        new: &Path,
+        exchange: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            is_installable(target),
+            "mtc can’t replace a missing or symlinked app"
+        );
+        ensure!(
+            is_installable(new),
+            "the staged app is missing or symlinked"
+        );
+        match exchange(target, new) {
+            Ok(()) => {
+                // After exchange, `new` holds the previous installation. All
+                // verification has already finished; do not verify this path.
+                remove_best_effort(new);
+                Ok(())
+            }
+            Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                fallback(target, new, |from, to| fs::rename(from, to))
+            }
+            Err(err) => Err(err).context("couldn’t exchange the app bundles"),
+        }
+    }
+
+    /// A fallback backup belongs to this transaction's unique staging directory.
+    /// A rollback failure leaves it there for manual recovery only.
+    fn fallback(
+        target: &Path,
+        new: &Path,
+        mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+    ) -> Result<()> {
+        let aside = new.with_file_name("previous.app");
+        // symlink_metadata also notices dangling symlinks. Never overwrite one.
+        match fs::symlink_metadata(&aside) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            _ => anyhow::bail!("the transaction backup path is already occupied"),
+        }
+        rename(target, &aside)
+            .with_context(|| format!("mtc can’t replace {}", target.display()))?;
+        if let Err(err) = rename(new, target) {
+            if let Err(rollback) = rename(&aside, target) {
+                anyhow::bail!(
+                    "couldn’t install mtc: {err}; couldn’t restore it: {rollback}; previous app preserved at {}",
+                    aside.display()
+                );
+            }
+            return Err(err).context("couldn’t install mtc; previous app restored");
+        }
+        remove_best_effort(&aside);
+        Ok(())
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    #[test]
+    fn native_exchange_keeps_both_bundles_until_cleanup() {
+        let dir = std::env::temp_dir().join(format!("mtc-native-swap-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("mtc.app");
+        let new = dir.join("staged.app");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&new).unwrap();
+        fs::write(target.join("version"), "old").unwrap();
+        fs::write(new.join("version"), "new").unwrap();
+        exchange(&target, &new).unwrap();
+        assert_eq!(fs::read_to_string(target.join("version")).unwrap(), "new");
+        assert_eq!(fs::read_to_string(new.join("version")).unwrap(), "old");
+        remove_best_effort(&new);
+        assert!(target.is_dir());
+        assert!(!new.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(super) fn unsupported_swap(target: &Path, new: &Path) -> Result<()> {
+        swap_with(target, new, |_, _| Err(io::ErrorKind::Unsupported.into()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_exchange(target: &Path, new: &Path) -> Result<()> {
+        swap_with(target, new, |_, _| {
+            Err(io::ErrorKind::PermissionDenied.into())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_install(target: &Path, new: &Path) -> Result<()> {
+        let mut calls = 0;
+        fallback(target, new, |from, to| {
+            calls += 1;
+            if calls == 2 {
+                Err(io::ErrorKind::PermissionDenied.into())
+            } else {
+                fs::rename(from, to)
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_rollback(target: &Path, new: &Path) -> Result<()> {
+        let mut calls = 0;
+        fallback(target, new, |from, to| {
+            calls += 1;
+            if calls == 1 {
+                fs::rename(from, to)
+            } else {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
+
+    use super::replacement::{
+        create_staging, fail_exchange, fail_install, fail_rollback, swap, unsupported_swap,
+    };
 
     use super::*;
 
@@ -240,13 +462,157 @@ mod tests {
         let dir = scratch("swap-fail");
         let target = dir.join("mtc.app");
         bundle(&target, "0.1.0");
-        // Nothing to move in: the rename fails after the old one moved aside.
+        // Nothing to move in: exchange fails without moving the installed app.
         let missing = dir.join(".staging/mtc.app");
 
         assert!(swap(&target, &missing).is_err());
 
         assert_eq!(version_at(&target), "0.1.0");
         assert!(!dir.join(".mtc.app.old").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unsupported_exchange_falls_back_and_rolls_back_on_failure() {
+        let dir = scratch("unsupported");
+        let target = dir.join("mtc.app");
+        let new = dir.join(".staging/mtc.app");
+        bundle(&target, "0.1.0");
+        fs::create_dir_all(new.parent().unwrap()).unwrap();
+        assert!(unsupported_swap(&target, &new).is_err());
+        assert_eq!(version_at(&target), "0.1.0");
+        assert!(!dir.join(".mtc.app.old").exists());
+        bundle(&new, "0.2.0");
+        let err = fail_install(&target, &new).unwrap_err();
+        assert!(err.to_string().contains("previous app restored"));
+        assert_eq!(version_at(&target), "0.1.0");
+        assert_eq!(version_at(&new), "0.2.0");
+        assert!(!new.with_file_name("previous.app").exists());
+        unsupported_swap(&target, &new).unwrap();
+        assert_eq!(version_at(&target), "0.2.0");
+        assert!(!new.exists());
+        assert!(!dir.join(".mtc.app.old").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fallback_never_overwrites_an_existing_backup() {
+        let dir = scratch("existing-backup");
+        let target = dir.join("mtc.app");
+        let new = dir.join(".staging/mtc.app");
+        let aside = new.with_file_name("previous.app");
+        bundle(&target, "0.0.9");
+        bundle(&aside, "0.1.0");
+        bundle(&new, "0.2.0");
+        assert!(unsupported_swap(&target, &new).is_err());
+        assert_eq!(version_at(&aside), "0.1.0");
+        assert_eq!(version_at(&new), "0.2.0");
+        assert_eq!(version_at(&target), "0.0.9");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exchange_failure_does_not_start_a_fallback() {
+        let dir = scratch("exchange-fail");
+        let target = dir.join("mtc.app");
+        let new = dir.join(".mtc-update-0.2.0/mtc.app");
+        bundle(&target, "0.1.0");
+        bundle(&new, "0.2.0");
+        assert!(fail_exchange(&target, &new).is_err());
+        assert_eq!(version_at(&target), "0.1.0");
+        assert_eq!(version_at(&new), "0.2.0");
+        assert!(!dir.join(".mtc.app.old").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_rollback_reports_and_preserves_backup_without_promoting_it() {
+        let dir = scratch("rollback-fail");
+        let target = dir.join("mtc.app");
+        let new = dir.join(".mtc-update-0.2.0/mtc.app");
+        bundle(&target, "0.1.0");
+        bundle(&new, "0.2.0");
+        let err = fail_rollback(&target, &new).unwrap_err();
+        assert!(err.to_string().contains("previous app preserved"));
+        assert!(!target.exists());
+        let aside = new.with_file_name("previous.app");
+        assert_eq!(version_at(&aside), "0.1.0");
+        assert!(err.to_string().contains(&aside.display().to_string()));
+        assert_eq!(version_at(&new), "0.2.0");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unique_staging_leaves_unrelated_siblings_untouched() {
+        let dir = scratch("staging");
+        let target = dir.join("mtc.app");
+        let old = dir.join(".mtc.app.old");
+        let sibling = dir.join(".mtc-update-0.2.0/mtc.app");
+        bundle(&target, "0.1.0");
+        bundle(&old, "unverified");
+        bundle(&sibling, "unrelated");
+        let first = create_staging(&dir, &Version::new(0, 2, 0)).unwrap();
+        let second = create_staging(&dir, &Version::new(0, 2, 0)).unwrap();
+        assert_ne!(first, second);
+        let new = first.join("mtc.app");
+        bundle(&new, "0.2.0");
+        swap(&target, &new).unwrap();
+        replacement::remove_best_effort(&first);
+        assert_eq!(version_at(&target), "0.2.0");
+        assert_eq!(version_at(&old), "unverified");
+        assert_eq!(version_at(&sibling), "unrelated");
+        assert!(second.is_dir());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_install_path_is_refused_without_deleting_its_referent() {
+        let dir = scratch("symlink-target");
+        let target = dir.join("mtc.app");
+        let new = dir.join(".staging/mtc.app");
+        bundle(&new, "0.2.0");
+        std::os::unix::fs::symlink(&new, &target).unwrap();
+        assert!(!replacement::is_installable(&target));
+        #[cfg(target_os = "macos")]
+        assert!(futures::executor::block_on(installable_target(Some(target.clone()))).is_none());
+        assert!(swap(&target, &new).is_err());
+        assert_eq!(version_at(&new), "0.2.0");
+        assert!(fs::symlink_metadata(&target).unwrap().is_symlink());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lock_contention_skips_installing_and_creating_staging() {
+        if let Some(dir) = std::env::var_os("MTC_TEST_CONTENDED_UPDATE_LOCK") {
+            assert!(replacement::lock(Path::new(&dir)).unwrap().is_none());
+            return;
+        }
+        let dir = scratch("lock");
+        let target = dir.join("mtc.app");
+        bundle(&target, "0.1.0");
+        let guard = replacement::lock(&dir).unwrap().unwrap();
+        assert!(replacement::lock(&dir).unwrap().is_none());
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "update::install::tests::lock_contention_skips_installing_and_creating_staging",
+            ])
+            .env("MTC_TEST_CONTENDED_UPDATE_LOCK", &dir)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let err = macos::install(b"not an archive", &Version::new(0, 2, 0), &target).unwrap_err();
+        assert!(err.to_string().contains("skipping this round"));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        assert_eq!(version_at(&target), "0.1.0");
+        drop(guard);
+        assert!(replacement::lock(&dir).unwrap().is_some());
         fs::remove_dir_all(dir).unwrap();
     }
 

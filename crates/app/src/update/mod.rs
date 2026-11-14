@@ -269,6 +269,7 @@ impl Updater {
         let feed = self.feed.clone();
         let installable = installable_bundle(cx);
         self._check = Some(cx.spawn(async move |this, cx| {
+            let installable = install::installable_target(installable).await;
             let plan = match install::fetch_manifest(feed).await {
                 Ok(Some(manifest)) => {
                     manifest::plan(&manifest, &current_version(), installable.as_deref())
