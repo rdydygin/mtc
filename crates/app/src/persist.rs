@@ -23,6 +23,7 @@ use mattermost::User;
 use serde::{Deserialize, Serialize};
 
 use crate::keychain;
+use session::TimelineKind;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -71,6 +72,113 @@ pub struct State {
     pub sidebar_width_rem: Option<f32>,
     pub last_channel: Option<String>,
     pub updates: Updates,
+    pub drafts: Drafts,
+    #[serde(skip)]
+    pub draft_generation: u64,
+}
+
+/// Most recently changed last. This bounds draft storage to about 6.4 MiB.
+const MAX_DRAFTS: usize = 100;
+const MAX_DRAFT_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Drafts {
+    server: String,
+    user: String,
+    entries: Vec<TextDraft>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TextDraft {
+    channel: String,
+    root: Option<String>,
+    text: String,
+}
+
+impl Drafts {
+    fn matches(&self, server: &str, user: &str) -> bool {
+        self.server == server && self.user == user
+    }
+
+    pub fn get(&self, server: &str, user: &str, kind: &TimelineKind) -> Option<String> {
+        if !self.matches(server, user) {
+            return None;
+        }
+        self.entries
+            .iter()
+            .find(|d| {
+                d.channel == kind.channel().as_str()
+                    && d.root.as_deref() == kind.root().map(|r| r.as_str())
+            })
+            .map(|d| d.text.clone())
+    }
+
+    fn set(&mut self, kind: &TimelineKind, text: &str) {
+        let channel = kind.channel().to_string();
+        let root = kind.root().map(ToString::to_string);
+        let mut end = text.len().min(MAX_DRAFT_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let text = &text[..end];
+        if self
+            .entries
+            .iter()
+            .any(|d| d.channel == channel && d.root == root && d.text == text)
+        {
+            return;
+        }
+        self.entries
+            .retain(|d| d.channel != channel || d.root != root);
+        if !text.trim().is_empty() {
+            self.entries.push(TextDraft {
+                channel,
+                root,
+                text: text.into(),
+            });
+        }
+        let excess = self.entries.len().saturating_sub(MAX_DRAFTS);
+        self.entries.drain(..excess);
+    }
+}
+
+impl State {
+    fn account(&self) -> Option<(&str, &str)> {
+        let session = self.session.as_ref()?;
+        Some((&session.server, session.user.as_ref()?.id.as_str()))
+    }
+
+    fn reconcile_drafts(&mut self) {
+        if let Some((server, user)) = self.account() {
+            if self.drafts.matches(server, user) {
+                return;
+            }
+            self.drafts = Drafts {
+                server: server.into(),
+                user: user.into(),
+                entries: Vec::new(),
+            };
+        } else {
+            self.drafts = Drafts::default();
+        }
+    }
+}
+
+/// Stage text immediately, without queuing disk work per keystroke. The caller
+/// debounces save_staged; flush also saves this memory snapshot before quitting.
+/// A generation prevents an old view from writing after sign-out/re-login.
+pub fn stage_draft(server: &str, user: &str, generation: u64, kind: &TimelineKind, text: &str) {
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.account() == Some((server, user)) && state.draft_generation == generation {
+        state.reconcile_drafts();
+        state.drafts.set(kind, text);
+    }
+}
+
+pub fn save_staged() {
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = WRITER.send(Write::Save(Box::new(state.clone())));
 }
 
 #[cfg(not(test))]
@@ -94,6 +202,9 @@ enum Write {
     Save(Box<State>),
     /// Reply once every earlier save is on disk.
     Flush(mpsc::Sender<()>),
+    /// Observe the last successful write without saving staged changes.
+    #[cfg(test)]
+    Written(mpsc::Sender<Option<Vec<u8>>>),
 }
 
 /// The background writer. Saves that queue up while one is being written
@@ -108,16 +219,24 @@ static WRITER: LazyLock<mpsc::Sender<Write>> = LazyLock::new(|| {
             let mut latest = None;
             while let Ok(first) = rx.recv() {
                 let mut flushes = Vec::new();
+                #[cfg(test)]
+                let mut readers = Vec::new();
                 for write in std::iter::once(first).chain(rx.try_iter()) {
                     match write {
                         Write::Save(state) => latest = Some(*state),
                         Write::Flush(done) => flushes.push(done),
+                        #[cfg(test)]
+                        Write::Written(done) => readers.push(done),
                     }
                 }
                 if let Some(state) = latest.as_ref()
                     && let Err(err) = saver.write(state, write_file)
                 {
                     log::warn!("saving state: {err}");
+                }
+                #[cfg(test)]
+                for done in readers {
+                    let _ = done.send(saver.written.clone());
                 }
                 for done in flushes {
                     let _ = done.send(());
@@ -227,7 +346,8 @@ fn read() -> State {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
-    let (state, in_keychain) = restore_token(state);
+    let (mut state, in_keychain) = restore_token(state);
+    state.reconcile_drafts();
     if let Some(in_keychain) = in_keychain {
         let _ = KEYCHAIN_AT_LAUNCH.set(in_keychain);
     }
@@ -276,16 +396,49 @@ pub fn read_with<R>(read: impl FnOnce(&State) -> R) -> R {
 /// Change the state and save it in the background.
 pub fn update(change: impl FnOnce(&mut State)) {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let account = state.account().map(|(s, u)| (s.to_owned(), u.to_owned()));
     change(&mut state);
+    if account.as_ref().map(|(s, u)| (s.as_str(), u.as_str())) != state.account() {
+        state.draft_generation = state.draft_generation.wrapping_add(1);
+    }
+    state.reconcile_drafts();
     let _ = WRITER.send(Write::Save(Box::new(state.clone())));
 }
 
 /// Wait until every change so far is on disk, such as before quitting.
 pub fn flush() {
+    save_staged();
     let (done, wait) = mpsc::channel();
     if WRITER.send(Write::Flush(done)).is_ok() {
         let _ = wait.recv();
     }
+}
+
+/// Observe the background writer without flush's implicit save, so tests can
+/// distinguish a staged edit from a snapshot actually queued by closing a view.
+#[cfg(test)]
+pub fn written_for_test() -> State {
+    let (done, wait) = mpsc::channel();
+    WRITER.send(Write::Written(done)).unwrap();
+    let bytes = wait.recv().unwrap().expect("state was written");
+    restore_token(serde_json::from_slice(&bytes).unwrap()).0
+}
+
+/// Exercise the real serializer and atomic file replacement without touching
+/// the user's config directory or keychain during workspace restart tests.
+#[cfg(test)]
+pub fn round_trip_for_test(state: &State) -> State {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join(format!("workspace-drafts-{}.json", std::process::id()));
+    Saver::new(None)
+        .write(state, |bytes| replace_file(&path, bytes))
+        .unwrap();
+    let bytes = fs::read(&path).unwrap();
+    fs::remove_file(path).unwrap();
+    let (mut restored, _) = restore_token(serde_json::from_slice(&bytes).unwrap());
+    restored.reconcile_drafts();
+    restored
 }
 
 fn write_file(bytes: &[u8]) -> std::io::Result<()> {
@@ -330,6 +483,81 @@ mod tests {
 
     fn file(bytes: &[u8]) -> State {
         serde_json::from_slice(bytes).unwrap()
+    }
+
+    #[test]
+    fn draft_truncation_drops_a_code_point_straddling_the_limit() {
+        let mut drafts = Drafts::default();
+        let kind = TimelineKind::Channel("town".into());
+        let prefix = "a".repeat(MAX_DRAFT_BYTES - 1);
+        drafts.set(&kind, &format!("{prefix}🦀tail"));
+        assert_eq!(drafts.entries[0].text, prefix);
+        let restored: Drafts =
+            serde_json::from_slice(&serde_json::to_vec(&drafts).unwrap()).unwrap();
+        assert_eq!(restored.entries[0].text.len(), MAX_DRAFT_BYTES - 1);
+    }
+
+    #[test]
+    fn drafts_round_trip_with_owner_only_permissions_and_caps() {
+        let mut state = signed_in("https://drafts.example.com", "secret");
+        let mut me = User::default();
+        me.id = "me".into();
+        state.session.as_mut().unwrap().user = Some(me);
+        state.reconcile_drafts();
+        for i in 0..=MAX_DRAFTS {
+            state.drafts.set(
+                &TimelineKind::Channel(format!("channel-{i}").into()),
+                &"🦀".repeat(MAX_DRAFT_BYTES),
+            );
+        }
+        assert_eq!(state.drafts.entries.len(), MAX_DRAFTS);
+        assert!(
+            state
+                .drafts
+                .entries
+                .iter()
+                .all(|d| d.text.len() == MAX_DRAFT_BYTES)
+        );
+        assert!(
+            state
+                .drafts
+                .get(
+                    "https://drafts.example.com",
+                    "me",
+                    &TimelineKind::Channel("channel-0".into())
+                )
+                .is_none()
+        );
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("drafts-{}.json", std::process::id()));
+        let mut saver = Saver::new(None);
+        saver
+            .write(&state, |bytes| replace_file(&path, bytes))
+            .unwrap();
+        let restored = file(&fs::read(&path).unwrap());
+        assert_eq!(restored.drafts.entries.len(), MAX_DRAFTS);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_file(path).unwrap();
+        let kind = TimelineKind::Channel("channel-100".into());
+        state.drafts.set(&kind, "");
+        assert!(
+            state
+                .drafts
+                .get("https://drafts.example.com", "me", &kind)
+                .is_none()
+        );
+        state.session.as_mut().unwrap().user.as_mut().unwrap().id = "other".into();
+        state.reconcile_drafts();
+        assert!(state.drafts.entries.is_empty());
+        assert!(file(br#"{"last_channel":"old"}"#).drafts.entries.is_empty());
     }
 
     #[test]
