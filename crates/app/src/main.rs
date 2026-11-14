@@ -25,6 +25,7 @@ mod palette;
 mod persist;
 mod post_row;
 mod post_scroller;
+mod recovery;
 mod search;
 mod settings;
 mod sidebar;

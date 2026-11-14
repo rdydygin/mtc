@@ -923,7 +923,13 @@ impl Render for SidebarView {
             .collect();
         // Until the channel list arrives, each section shows rows in the
         // shape of the conversations about to fill it.
-        let loading = !self.session.read(cx).is_loaded();
+        let state = self.session.read(cx).channels_state().clone();
+        let loading = matches!(
+            state,
+            session::LoadState::NotLoaded | session::LoadState::Loading
+        );
+        let empty = state == session::LoadState::Loaded
+            && self.session.read(cx).channels().next().is_none();
         let theme = cx.theme().clone();
         // The workspace paints the backdrop; the sidebar is one of its
         // inset panels.
@@ -974,6 +980,13 @@ impl Render for SidebarView {
                             .px_2()
                             .gap_0p5()
                             .child(self.threads_item(cx))
+                            .when_some(match state { session::LoadState::Failed(message) => Some(message), _ => None }, |this, message| {
+                                this.child(crate::recovery::inline_failure(message,
+                                    Button::new("retry-conversations").on_click(cx.listener(|this, _, _, cx| {
+                                        this.session.update(cx, |s, cx| s.retry_channels(cx));
+                                    })), cx))
+                            })
+                            .when(empty, |this| this.child(div().p_3().text_sm().text_color(theme.muted_foreground).child("No conversations yet. Join a channel in Mattermost to get started.")))
                             .when(!favorites.is_empty(), |this| {
                                 this.child(
                                     Self::section_header(

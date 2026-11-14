@@ -134,7 +134,10 @@ messages, newest reply first, like Mattermost's own Threads view. Unread threads
 dot and mentions a count, which the sidebar entry adds up. **All** and **Unread** switch
 between every thread and the ones with replies you haven't read. Pick one and it opens beside
 the list, marked read; in a narrow window it takes the list's place until you close it.
-Right-click a thread to open it in its channel, mark it read, or unfollow it. Reading a
+Use ↑ / ↓ / Home / End to select a thread and Enter to open it. Tab to **More actions**
+for the selected thread to open it in its channel, mark it read, or unfollow it;
+the same commands are available by right-clicking. Closing the detail pane returns
+focus to the selected thread. Reading a
 thread anywhere, including beside its channel or on another device, clears it here too.
 
 Star a conversation from the star in its header, by right-clicking it in the sidebar, or
@@ -204,6 +207,10 @@ Dependencies point downward. The app depends on `gpui-kit` alone for UI.
   attaches the token only for the signed-in server. Decoding happens off the UI thread.
 - **Resilient real-time.** The socket detects silent connections, reconnects with
   backoff, and catches up live timelines with `posts?since=`.
+
+Failed conversation loads replace skeletons with **Retry**, including the remembered
+conversation at startup. Failed older-message pages, search pages, and file uploads
+keep existing content and offer an inline retry.
 
 ### Effortless UX
 
