@@ -82,10 +82,12 @@ pub enum ComposerEvent {
 
 pub struct Composer {
     input: Entity<TextareaState>,
+    emoji_search: Entity<crate::emoji_picker::EmojiSearch>,
     editing: bool,
     saved_draft: Option<String>,
     focus_handle: FocusHandle,
     selected_suggestion: usize,
+    selected_emoji: Option<String>,
     dismissed: Option<Token>,
     token: Option<Token>,
     composing: bool,
@@ -151,15 +153,23 @@ impl Composer {
         let caret = cx.observe_in(&input, window, |this, _, window, cx| {
             this.refresh_suggestions(window, cx);
         });
+        let store = cx.new(|_| session::EmojiStore::new(target.client.clone()));
+        let emoji_search =
+            cx.new(|cx| crate::emoji_picker::EmojiSearch::new(target.client.clone(), store, cx));
+        let emoji_updates = cx.observe(&emoji_search, |this, _, cx| {
+            this.reconcile_emoji_selection(cx)
+        });
         let focus_handle = cx.focus_handle();
         let focus_in = cx.on_focus_in(&focus_handle, window, |_, _, cx| cx.notify());
         let focus_out = cx.on_focus_out(&focus_handle, window, |_, _, _, cx| cx.notify());
         Self {
             input,
+            emoji_search,
             editing: false,
             saved_draft: None,
             focus_handle,
             selected_suggestion: 0,
+            selected_emoji: None,
             dismissed: None,
             token: None,
             composing: false,
@@ -171,7 +181,7 @@ impl Composer {
             target,
             files: Vec::new(),
             next_file_id: 0,
-            _subscriptions: vec![subscription, caret, focus_in, focus_out],
+            _subscriptions: vec![subscription, caret, focus_in, focus_out, emoji_updates],
         }
     }
 
@@ -387,6 +397,7 @@ impl Composer {
 
     pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_suggestion = 0;
+        self.selected_emoji = None;
         self.dismissed = None;
         self.input.update(cx, |state, cx| {
             state.set_value(text.to_string(), window, cx);
@@ -443,6 +454,13 @@ impl Composer {
                 this.refresh_suggestions(window, cx);
                 cx.notify();
             }));
+        let store = session.read(cx).emoji_store().clone();
+        self.emoji_search = cx
+            .new(|cx| crate::emoji_picker::EmojiSearch::new(self.target.client.clone(), store, cx));
+        self._subscriptions
+            .push(cx.observe(&self.emoji_search, |this, _, cx| {
+                this.reconcile_emoji_selection(cx)
+            }));
         self.session = Some(session);
         self.refresh_suggestions(window, cx);
         self
@@ -476,10 +494,26 @@ impl Composer {
         self._lookup = None;
         self.remote_users.clear();
         self.selected_suggestion = 0;
+        self.selected_emoji = None;
         self.dismissed = None;
         self.token = token.clone();
         self.lookup_team = team.clone();
         cx.notify();
+        self.emoji_search.update(cx, |search, cx| {
+            search.set_query(
+                token
+                    .as_ref()
+                    .filter(|t| t.kind == Kind::Emoji)
+                    .map_or("", |t| t.query.as_str()),
+                cx,
+            )
+        });
+        if token.as_ref().is_some_and(|t| t.kind == Kind::Emoji) {
+            self.selected_emoji = self
+                .suggestion_matches(cx)
+                .first()
+                .map(|row| row.completion.clone());
+        }
         let (Some(token), Some(team)) = (token, team) else {
             return;
         };
@@ -563,6 +597,31 @@ impl Composer {
         cx.notify();
     }
 
+    fn reconcile_emoji_selection(&mut self, cx: &mut Context<Self>) {
+        if self
+            .current_token(cx)
+            .is_some_and(|token| token.kind == Kind::Emoji)
+        {
+            let matches = self.suggestion_matches(cx);
+            self.selected_emoji = matches
+                .get(self.selected_index(&matches))
+                .map(|row| row.completion.clone());
+        }
+        cx.notify();
+    }
+
+    fn selected_index(&self, matches: &[Suggestion]) -> usize {
+        if let Some(name) = &self.selected_emoji {
+            matches
+                .iter()
+                .position(|row| &row.completion == name)
+                .unwrap_or(0)
+        } else {
+            self.selected_suggestion
+                .min(matches.len().saturating_sub(1))
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !event.keystroke.modifiers.modified() {
             self.handle_key(&event.keystroke.key, window, cx);
@@ -578,6 +637,7 @@ impl Composer {
         }
         let matches = self.suggestion_matches(cx);
         if !matches.is_empty() {
+            self.selected_suggestion = self.selected_index(&matches);
             match key {
                 "up" => {
                     self.selected_suggestion =
@@ -591,6 +651,7 @@ impl Composer {
                 }
                 "escape" => {
                     self.dismissed = self.current_token(cx);
+                    self.emoji_search.update(cx, |search, cx| search.cancel(cx));
                     self.lookup_generation += 1;
                     self._lookup = None;
                 }
@@ -599,14 +660,25 @@ impl Composer {
                     return;
                 }
             }
+            if matches!(key, "up" | "down")
+                && self
+                    .current_token(cx)
+                    .is_some_and(|token| token.kind == Kind::Emoji)
+            {
+                self.selected_emoji = Some(matches[self.selected_suggestion].completion.clone());
+            }
             cx.notify();
             cx.stop_propagation();
             return;
         }
         // A lookup can have no local rows yet. Escape still dismisses that
         // pending surface, rather than letting its eventual response reopen it.
-        if key == "escape" && self._lookup.is_some() && self.current_token(cx).is_some() {
+        if key == "escape"
+            && (self._lookup.is_some() || self.emoji_search.read(cx).is_loading())
+            && self.current_token(cx).is_some()
+        {
             self.dismissed = self.current_token(cx);
+            self.emoji_search.update(cx, |search, cx| search.cancel(cx));
             self.lookup_generation += 1;
             self._lookup = None;
             cx.notify();
@@ -655,6 +727,18 @@ impl Composer {
             return Vec::new();
         }
         match token.kind {
+            Kind::Emoji => {
+                session::emoji_matches(self.emoji_search.read(cx).custom(cx), &token.query, &[], 6)
+                    .iter()
+                    .map(|name| Suggestion {
+                        id: format!("emoji-{name}"),
+                        completion: format!(":{name}:"),
+                        label: format!(":{name}:"),
+                        detail: String::new(),
+                        user: None,
+                    })
+                    .collect()
+            }
             Kind::Command => extensions::slash_commands(cx)
                 .iter()
                 .filter(|c| c.name().starts_with(&token.query))
@@ -735,7 +819,7 @@ impl Composer {
         if matches.is_empty() {
             return None;
         }
-        let selected = self.selected_suggestion.min(matches.len() - 1);
+        let selected = self.selected_index(&matches);
         let theme = cx.theme();
         Some(
             v_flex()
@@ -763,6 +847,12 @@ impl Composer {
                                 .gap_2()
                                 .min_w_0()
                                 .children(avatar)
+                                .when(suggestion.completion.starts_with(':'), |row| {
+                                    row.child(crate::status::emoji_element(
+                                        suggestion.completion.trim_matches(':'),
+                                        self.emoji_search.read(cx).custom(cx),
+                                    ))
+                                })
                                 .child(
                                     div()
                                         .min_w_0()
@@ -1137,6 +1227,103 @@ mod tests {
         let composer = composer.borrow_mut().take().unwrap();
         cx.run_until_parked();
         (handle, composer)
+    }
+
+    #[gpui_kit::test]
+    fn emoji_completion_uses_caret_token_and_never_sends_on_accept(cx: &mut TestAppContext) {
+        let (handle, composer) = open_composer(cx);
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let submitted = submitted.clone();
+            cx.subscribe(&composer, move |_, event, _| {
+                if let ComposerEvent::Submit { text, .. } = event {
+                    submitted.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| {
+                c.set_text("🙂 (:smile:) after", window, cx);
+                c.input
+                    .update(cx, |input, cx| input.set_selected_range(11..11, cx));
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("emoji-smile").selected(), Some(true));
+            window.press("enter", cx);
+            assert_eq!(composer.read(cx).text(cx), "🙂 (:smile: ) after");
+            composer.update(cx, |c, cx| c.set_text(":he", window, cx));
+            window.render_frame(cx);
+            window.press("escape", cx);
+            assert!(composer.read(cx).suggestion_matches(cx).is_empty());
+            assert_eq!(composer.read(cx).text(cx), ":he");
+            composer.update(cx, |c, cx| c.set_text(":zzzz_unknown", window, cx));
+            window.press("escape", cx);
+            let composer = composer.read(cx);
+            assert_eq!(composer.dismissed, composer.current_token(cx));
+            assert!(!composer.emoji_search.read(cx).is_loading());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            submitted.borrow().is_empty(),
+            "accepting an emoji must not submit"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn delayed_custom_emoji_keeps_the_composer_selection(cx: &mut TestAppContext) {
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = std::sync::Mutex::new(wait);
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |r| {
+            if r.method() == "POST" && r.path() == "/api/v4/emoji/search" {
+                wait.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                Reply::json(json!([{"id":"remote", "name":"party_parrot"}]))
+            } else {
+                route(r)
+            }
+        });
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        let store = composer.read_with(cx, |c, cx| {
+            c.session.as_ref().unwrap().read(cx).emoji_store().clone()
+        });
+        store.update(cx, |s, cx| {
+            s.add(
+                vec![serde_json::from_value(json!({"id":"local", "name":"party_popper"})).unwrap()],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text(":party", window, cx));
+        })
+        .unwrap();
+        wait_until(cx, |_| {
+            server
+                .requests()
+                .iter()
+                .any(|r| r.method() == "POST" && r.path() == "/api/v4/emoji/search")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("emoji-party_popper").selected(), Some(true));
+        })
+        .unwrap();
+        release.send(()).unwrap();
+        wait_until(cx, |cx| {
+            store.read_with(cx, |s, _| s.custom().contains("party_parrot"))
+        });
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("emoji-party_popper").selected(), Some(true));
+            assert_eq!(window.find("emoji-party_parrot").selected(), Some(false));
+            window.press("enter", cx);
+            assert_eq!(composer.read(cx).text(cx), ":party_popper: ");
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

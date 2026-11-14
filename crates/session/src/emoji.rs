@@ -334,3 +334,69 @@ impl EmojiStore {
 fn is_status(err: &anyhow::Error, codes: &[u16]) -> bool {
     matches!(err.downcast_ref::<ApiError>(), Some(ApiError::Status(code)) if codes.contains(code))
 }
+
+/// Bounded shortcode matches, with prefixes before substrings and stable ordering.
+/// Standard aliases are indexed once; custom names come from the live snapshot.
+pub fn emoji_matches(
+    custom: &CustomEmojis,
+    query: &str,
+    recent: &[String],
+    limit: usize,
+) -> Vec<String> {
+    static NAMES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        let mut names: Vec<_> = emojis::iter().flat_map(|e| e.shortcodes()).collect();
+        names.extend(["+1", "-1", "white_check_mark"]);
+        names.sort_unstable();
+        names.dedup();
+        names
+    });
+    let query = query.trim_matches(':').to_lowercase();
+    let mut names: Vec<_> = NAMES
+        .iter()
+        .copied()
+        .chain(custom.iter().map(|(name, _)| name))
+        .filter_map(|name| {
+            let normalized = name.to_lowercase();
+            normalized.contains(&query).then(|| {
+                (
+                    if query.is_empty() {
+                        recent.iter().position(|r| r == name).unwrap_or(usize::MAX)
+                    } else {
+                        usize::MAX
+                    },
+                    !normalized.starts_with(&query),
+                    name,
+                )
+            })
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, name)| name.to_owned())
+        .collect()
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn matches_rank_prefixes_before_contains_deduplicate_and_cap() {
+        let custom = CustomEmojis::new([
+            ("smile".into(), "https://example.test/smile".into()),
+            ("smile_custom".into(), "https://example.test/custom".into()),
+            ("a_smile".into(), "https://example.test/contains".into()),
+        ]);
+        let matches = emoji_matches(&custom, "SMILE", &[], 100);
+        assert_eq!(matches[0], "smile");
+        assert!(
+            matches.iter().position(|s| s == "smile_custom")
+                < matches.iter().position(|s| s == "a_smile")
+        );
+        assert_eq!(matches.iter().filter(|s| *s == "smile").count(), 1);
+        assert_eq!(emoji_matches(&custom, "", &[], 8).len(), 8);
+    }
+}

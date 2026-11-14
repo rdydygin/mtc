@@ -21,7 +21,7 @@ mod threads;
 mod timeline;
 
 pub use directory::{Directory, UsernameLookup};
-pub use emoji::{CustomEmojis, EmojiStore};
+pub use emoji::{CustomEmojis, EmojiStore, emoji_matches};
 pub use prepare::{
     PreparedMessage, custom_emoji_names, emoji_for, emoji_name, emojify, mention_username,
     needs_rich_text,

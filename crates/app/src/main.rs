@@ -15,6 +15,7 @@ mod composer;
 mod deep_link;
 mod dither;
 mod download;
+mod emoji_picker;
 mod extensions;
 mod http;
 mod image_viewer;

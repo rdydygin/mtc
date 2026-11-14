@@ -90,7 +90,7 @@ On Linux and Windows, use Ctrl where the table says ⌘, Alt for ⌥, and Shift 
 | ⌥⇧↑ / ⌥⇧↓ | Previous / next unread channel |
 | Enter / ⇧Enter | Accept a visible suggestion or send / new line |
 | ↑ in an empty field | Edit your last message |
-| ↑ / ↓ in composer suggestions | Select a command, person, or channel |
+| ↑ / ↓ in composer suggestions | Select a command, person, channel, or emoji |
 | Tab / Enter in composer suggestions | Complete the selected suggestion |
 | Esc | Dismiss composer suggestions, cancel an edit, close the panel, or mark the channel read |
 | ⌘L | Focus the visible conversation’s message field (reveals the channel if search replaces it) |
@@ -124,6 +124,15 @@ opens one. A message scrolls into view in the conversation and is marked for a m
 (older messages load as needed); a reply opens in its thread, with a button back to the
 results. Mattermost's search syntax works, such as `"exact phrase"`, `from:username`,
 and `-word`. The last word you type also matches longer words that start with it.
+
+Type `:` and at least two letters at a word start to complete emoji shortcodes,
+including custom emoji from your server. Prefix matches appear before substring
+matches. Accepting inserts `:name: ` without sending; code, URLs and times do not
+trigger completion.
+
+Use **+** beside a message’s reactions or **Add reaction…** in its context or
+More actions menu to search emoji. Recent choices appear first. ↑/↓ selects,
+Enter toggles the reaction, and Esc closes the picker and returns focus.
 
 Type `@` at a word start to suggest people and `@here`, `@channel`, or `@all`.
 Known people appear immediately; server matches put current-channel members first,
