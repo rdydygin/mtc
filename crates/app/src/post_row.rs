@@ -60,6 +60,7 @@ pub const QUICK_REACTIONS: [(&str, &str); 4] = [
 pub enum PostAction {
     OpenThread,
     ToggleReaction(String),
+    MarkUnread,
     CopyText,
     CopyLink,
     Edit,
@@ -947,6 +948,7 @@ impl RenderOnce for PostRow {
             self.shown_files(),
             self.link_preview_url(),
             self.has_permalink,
+            !post.is_reply(),
         )
         .into();
         let row = h_flex()
@@ -1322,6 +1324,7 @@ fn post_menu_entries(
     files: &[FileInfo],
     link: Option<SharedString>,
     has_permalink: bool,
+    is_root: bool,
 ) -> Vec<PostMenuEntry> {
     let item = |label: String, action: PostAction| {
         PostMenuEntry::Command(label.into(), PostCommand::Post(action))
@@ -1337,6 +1340,9 @@ fn post_menu_entries(
         ));
     }
     entries.push(PostMenuEntry::Separator);
+    if is_root {
+        entries.push(item("Mark as unread".into(), PostAction::MarkUnread));
+    }
     entries.push(item("Copy text".into(), PostAction::CopyText));
     if has_permalink {
         entries.push(item("Copy link".into(), PostAction::CopyLink));
@@ -1540,6 +1546,29 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_message_menu_dispatches_mark_unread(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestQueryExt as _;
+        let (window, actions) = open_row(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            // The visible overflow also provides a keyboard path to the command.
+            window.click("more-actions", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let command = window.find_by_label("Mark as unread");
+            click_point(window, command.bounds().center(), cx);
+        })
+        .unwrap();
+        assert!(matches!(
+            actions.borrow().as_slice(),
+            [PostAction::MarkUnread]
+        ));
+    }
+
+    #[gpui_kit::test]
     fn clicking_the_message_text_opens_its_thread(cx: &mut TestAppContext) {
         let (window, actions) = open_row(cx);
         cx.update_window(window, |_, window, cx| {
@@ -1689,6 +1718,7 @@ mod tests {
             &[file],
             Some("https://example.com".into()),
             false,
+            true,
         );
         let labels = labels(&entries);
         assert!(labels.contains(&"Open report.pdf"));
@@ -1701,16 +1731,28 @@ mod tests {
     }
 
     #[test]
+    fn mark_unread_is_offered_only_for_root_posts() {
+        for is_mine in [false, true] {
+            let roots = post_menu_entries(is_mine, false, &[], None, false, true);
+            assert!(roots.iter().any(|entry| matches!(entry,
+                PostMenuEntry::Command(label, PostCommand::Post(PostAction::MarkUnread))
+                    if label == "Mark as unread")));
+            let replies = post_menu_entries(is_mine, false, &[], None, false, false);
+            assert!(!labels(&replies).contains(&"Mark as unread"));
+        }
+    }
+
+    #[test]
     fn copy_link_is_available_only_with_a_permalink() {
-        let entries = post_menu_entries(false, false, &[], None, true);
+        let entries = post_menu_entries(false, false, &[], None, true, true);
         assert!(labels(&entries).contains(&"Copy link"));
-        let entries = post_menu_entries(false, false, &[], None, false);
+        let entries = post_menu_entries(false, false, &[], None, false, true);
         assert!(!labels(&entries).contains(&"Copy link"));
     }
 
     #[test]
     fn menu_without_attachments_has_no_open_section() {
-        let entries = post_menu_entries(true, false, &[], None, false);
+        let entries = post_menu_entries(true, false, &[], None, false, true);
         let labels = labels(&entries);
         assert!(!labels.iter().any(|label| label.starts_with("Open")));
         assert_eq!(labels.last(), Some(&"Delete…"));

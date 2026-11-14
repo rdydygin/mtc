@@ -18,8 +18,8 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _, ht
 use crate::{
     Client, runtime,
     types::{
-        ChannelId, Emoji, Millis, Post, PostId, Preference, Reaction, Status, TeamId, User, UserId,
-        UserThread,
+        ChannelId, ChannelMember, ChannelUnreadAt, Emoji, Millis, Post, PostId, Preference,
+        Reaction, Status, TeamId, User, UserId, UserThread,
     },
 };
 
@@ -55,6 +55,13 @@ pub enum Event {
     },
     /// The current user read a channel, possibly on another device.
     ChannelViewed(ChannelId),
+    /// The user marked a post unread, possibly on another device.
+    PostUnread {
+        state: ChannelUnreadAt,
+        post_id: PostId,
+    },
+    /// Notification properties changed for a channel member.
+    ChannelMemberUpdated(ChannelMember),
     /// The current user read several channels at once.
     ChannelsViewed(Vec<(ChannelId, Millis)>),
     StatusChanged {
@@ -275,6 +282,16 @@ pub(crate) fn parse_event(text: &str) -> Option<Event> {
             user_id: str_field(data, "user_id").into(),
         },
         "user_updated" => Event::UserUpdated(embedded(data, "user")?),
+        "post_unread" => {
+            let mut state: ChannelUnreadAt = serde_json::from_value(data.clone()).ok()?;
+            state.channel_id = str_field(broadcast, "channel_id").into();
+            state.user_id = str_field(broadcast, "user_id").into();
+            Event::PostUnread {
+                state,
+                post_id: str_field(data, "post_id").into(),
+            }
+        }
+        "channel_member_updated" => Event::ChannelMemberUpdated(embedded(data, "channelMember")?),
         "channel_viewed" => Event::ChannelViewed(str_field(data, "channel_id").into()),
         "multiple_channels_viewed" => Event::ChannelsViewed(
             data.get("channel_times")
@@ -343,6 +360,7 @@ mod tests {
                 post,
                 mentions,
                 team_id,
+                ..
             }) => {
                 assert_eq!(post.id.as_str(), "p1");
                 assert_eq!(post.message, "hi");
@@ -434,6 +452,33 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_channel_state_events() {
+        let text = r#"{"event":"post_unread","data":{"post_id":"p1","last_viewed_at":19,"msg_count":7,"msg_count_root":4,"mention_count":2,"mention_count_root":1},"broadcast":{"channel_id":"c1","user_id":"me"}}"#;
+        match parse_event(text) {
+            Some(Event::PostUnread { state, post_id }) => {
+                assert_eq!(post_id.as_str(), "p1");
+                assert_eq!(state.channel_id.as_str(), "c1");
+                assert_eq!(state.user_id.as_str(), "me");
+                assert_eq!(state.last_viewed_at, 19);
+                assert_eq!((state.msg_count, state.msg_count_root), (7, 4));
+                assert_eq!((state.mention_count, state.mention_count_root), (2, 1));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let member = json!({ "channel_id": "c1", "user_id": "me", "notify_props": { "mark_unread": "mention", "desktop": "none" } });
+        for payload in [member.clone(), Value::String(member.to_string())] {
+            let text =
+                json!({ "event": "channel_member_updated", "data": { "channelMember": payload } })
+                    .to_string();
+            assert!(
+                matches!(parse_event(&text), Some(Event::ChannelMemberUpdated(member))
+                if member.is_muted() && member.notify_props["desktop"] == "none")
+            );
+        }
+        assert!(parse_event(r#"{"event":"channel_member_updated","data":{}}"#).is_none());
     }
 
     #[test]

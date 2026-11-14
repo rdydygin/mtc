@@ -27,6 +27,8 @@ actions!(
         CloseConversation,
         /// Add the open conversation to favorites, or remove it.
         ToggleFavorite,
+        /// Mute or unmute the open conversation.
+        ToggleChannelMute,
         /// Leave the open channel, after asking.
         LeaveChannel,
         NextChannel,

@@ -27,8 +27,8 @@ use crate::{
     actions::{
         CloseConversation, Dismiss, FocusComposer, LeaveChannel, NextChannel, NextUnreadChannel,
         PreviousChannel, PreviousUnreadChannel, QuickSwitch, RESET_ZOOM_KEY, SearchConversation,
-        SearchTeam, ShowSettings, ShowShortcuts, ShowThreads, ToggleFavorite, WORKSPACE_CONTEXT,
-        ZOOM_IN_KEY, ZOOM_OUT_KEY, shortcut_label,
+        SearchTeam, ShowSettings, ShowShortcuts, ShowThreads, ToggleChannelMute, ToggleFavorite,
+        WORKSPACE_CONTEXT, ZOOM_IN_KEY, ZOOM_OUT_KEY, shortcut_label,
     },
     cache,
     dither::DitherView,
@@ -368,6 +368,21 @@ impl Workspace {
             self.session.update(cx, |s, cx| {
                 let favorite = s.is_favorite(&active);
                 s.set_favorite(&active, !favorite, cx);
+            });
+        }
+    }
+
+    fn toggle_channel_mute(
+        &mut self,
+        _: &ToggleChannelMute,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = self.active.clone() {
+            self.session.update(cx, |s, cx| {
+                if let Some(channel) = s.channel(&active) {
+                    s.set_channel_muted(&active, !channel.is_muted(), cx);
+                }
             });
         }
     }
@@ -1082,6 +1097,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::close_conversation))
             .on_action(cx.listener(Self::toggle_favorite))
+            .on_action(cx.listener(Self::toggle_channel_mute))
             .on_action(cx.listener(Self::search_conversation))
             .on_action(cx.listener(Self::search_team))
             .on_action(cx.listener(Self::leave_channel))
@@ -1562,6 +1578,70 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn desktop_preferences_only_suppress_baseline_notifications(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (request.method(), request.path()) {
+                ("GET", "/api/v4/users/me/teams/team/channels") => Reply::json(json!([
+                    {"id":"town","team_id":"team","name":"town-square","type":"O"},
+                    {"id":"gm","type":"G","display_name":"Group"}
+                ])),
+                ("GET", "/api/v4/users/me/teams/team/channels/members") => Reply::json(json!([
+                    {"channel_id":"town","user_id":"me","notify_props":{"desktop":"all"}},
+                    {"channel_id":"gm","user_id":"me","notify_props":{"desktop":"mention"}}
+                ])),
+                _ => route(request),
+            }
+        });
+        let (handle, workspace) = open_workspace(&server, cx);
+        let session = workspace.read_with(cx, |w, _| w.session.clone());
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        cx.update_window(handle, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            session.update(cx, |s, cx| s.close_channel(cx));
+            session.read(cx).directory().clone().update(cx, |d, cx| {
+                d.set_status("me".into(), mattermost::Status::Online, cx)
+            });
+            for (ix, (channel, root, mentioned, visible, expected)) in [
+                ("town", "", false, false, false), // all never expands the baseline
+                ("town", "root", false, false, false),
+                ("town", "root", true, false, true),
+                ("town", "root", true, true, false),
+                ("gm", "", true, false, false), // implicit GM mention
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                session.update(cx, |s, cx| {
+                    s.set_open_thread(visible.then(|| "root".into()), cx)
+                });
+                let mut post = Post::default();
+                post.id = format!("notify-{ix}").into();
+                post.channel_id = channel.into();
+                post.root_id = root.into();
+                post.user_id = "ann".into();
+                post.message = "ordinary message".into();
+                let before = window.notifications(cx).len();
+                extensions::dispatch_session_event(
+                    &SessionEvent::Posted {
+                        post: std::sync::Arc::new(post),
+                        mentions_me: mentioned,
+                    },
+                    &session,
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    window.notifications(cx).len(),
+                    before + usize::from(expected)
+                );
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn do_not_disturb_silences_mentions_and_direct_messages(cx: &mut TestAppContext) {
         let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
             if request.method() == "GET" && request.path() == "/api/v4/users/me/teams/team/channels"
@@ -1854,5 +1934,104 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         workspace.read_with(cx, |w, _| assert_eq!(w.active, Some("dm-0".into())));
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_and_command_palette_mute_the_channel(cx: &mut TestAppContext) {
+        use gpui_kit::test::{TestEventExt as _, TestQueryExt as _};
+        let muted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = SlowServer::start(Network::new(Duration::from_millis(20)), {
+            let muted = muted.clone();
+            move |request| {
+                if request.method() == "PUT"
+                    && request.path() == "/api/v4/channels/town/members/me/notify_props"
+                {
+                    let props: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                    muted.store(
+                        props["mark_unread"] == "mention",
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    return Reply::json(
+                        json!({ "channel_id":"town", "user_id":"me", "notify_props":props }),
+                    );
+                }
+                if request.method() == "GET" && request.path() == "/api/v4/channels/town/members/me"
+                {
+                    return Reply::json(
+                        json!({"channel_id":"town","user_id":"me","notify_props":{"mark_unread":if muted.load(std::sync::atomic::Ordering::SeqCst) {"mention"} else {"all"}}}),
+                    );
+                }
+                route(request)
+            }
+        });
+        let (handle, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| w.session.read(cx).is_loaded())
+        });
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_channel(&"town".into(), window, cx));
+            window.render_frame(cx);
+            window.right_click("channel-town", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let at = window.find_by_label("Mute channel").bounds().center();
+            window.pointer_down(at, gpui_kit::MouseButton::Left, cx);
+            window.pointer_up(at, gpui_kit::MouseButton::Left, cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| {
+                let s = w.session.read(cx);
+                s.channel(&"town".into()).unwrap().is_muted() && !s.is_mute_pending(&"town".into())
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("channel-town").label(),
+                Some("Town Square, muted")
+            );
+            window.press(
+                if cfg!(target_os = "macos") {
+                    "cmd-k"
+                } else {
+                    "ctrl-k"
+                },
+                cx,
+            );
+            window.input("Unmute channel", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.find_by_label("Unmute channel");
+            window.press("enter", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| {
+                let s = w.session.read(cx);
+                !s.channel(&"town".into()).unwrap().is_muted() && !s.is_mute_pending(&"town".into())
+            })
+        });
+        let props: Vec<serde_json::Value> = server
+            .requests()
+            .iter()
+            .filter(|r| {
+                r.method() == "PUT" && r.path() == "/api/v4/channels/town/members/me/notify_props"
+            })
+            .map(|r| serde_json::from_slice(r.body()).unwrap())
+            .collect();
+        assert_eq!(
+            props,
+            vec![
+                json!({"mark_unread":"mention"}),
+                json!({"mark_unread":"all"})
+            ]
+        );
     }
 }

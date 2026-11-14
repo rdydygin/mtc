@@ -131,9 +131,13 @@ fences and leave IME composition keys alone.
 
 Editing keeps your unsent text and attachments; saving or canceling restores them.
 
-Right-click a message to reply, react, copy its text or Mattermost link, edit, or delete
-it. Click a message to open its replies in a thread panel beside the channel (collapsed reply threads); the reply
-count sits at the end of the message's reactions line. Click someone's name or avatar, or
+Right-click a message to reply, react, mark it unread, copy its text or Mattermost link,
+edit, or delete it. **Mark as unread** is available for root messages, not thread
+replies. It moves the "New messages" divider to that message and keeps the channel
+unread until you leave and reopen it, send a message, or press Esc. A read confirmed
+by the server clears it here too.
+Click a message to open its replies in a thread panel beside the channel (collapsed
+reply threads); the reply count sits at the end of the message's reactions line. Click someone's name or avatar, or
 an @mention of them in a message, to see their profile and start a direct message.
 
 **Threads**, at the top of the sidebar (⌘⇧T), lists the threads you follow (ones you
@@ -151,6 +155,10 @@ thread anywhere, including beside its channel or on another device, clears it he
 Star a conversation from the star in its header, by right-clicking it in the sidebar, or
 with "Add to favorites" in ⌘K. Favorites sit in their own section at the top of the
 sidebar and sync with your other Mattermost apps.
+
+Mute or unmute a conversation by right-clicking it in the sidebar, or with
+"Mute channel" / "Unmute channel" in ⌘K. A crossed-out bell marks muted channels;
+muting syncs with your other Mattermost apps and silences desktop notifications.
 
 Leave a channel by right-clicking it in the sidebar, or with "Leave channel" in ⌘K.
 mtc asks first, because it has no way to find and rejoin channels. Town Square and
@@ -225,9 +233,19 @@ keep existing content and offer an inline retry.
 Posts send optimistically, with Retry or Discard if a send fails. Drafts are kept per
 conversation across app restarts (channels and threads), and a "New messages" divider marks where you left off. You also get
 typing indicators, presence dots, and mention badges. Native notifications cover
-mentions and DMs when the conversation isn't in view (on macOS the app must run as a `.app`
-bundle for these). Do Not Disturb silences message notifications. The app restores your
-session, team, last channel, zoom, appearance, and sidebar width on launch, and follows the system light/dark setting.
+mentions and DMs. Channel desktop preferences can restrict those notifications;
+"none" silences them, and "default" inherits the account setting from Mattermost.
+"All messages" currently keeps the mentions-and-DMs baseline; notifying for every
+message is a follow-up. Change these preferences in Mattermost.
+In group DMs, an explicit channel "mentions" override requires an explicit mention
+in the message or attachment text, pretext, title, or fields. Channel settings for
+ignoring channel-wide mentions override the account setting. Inherited account
+mentions settings keep the usual implicit group-DM mentions.
+Muted channels, Do Not Disturb, and the conversation visible in an active window
+silence notifications. Replies count as visible when their thread is open.
+On macOS the app must run as a `.app` bundle for system notifications. The app restores
+your session, team, last channel, zoom, appearance, and sidebar width on launch, and
+follows the system light/dark setting.
 
 ### Extensibility
 

@@ -142,6 +142,20 @@ pub fn open(
             },
             actions::ToggleFavorite,
         ));
+        if !session_ref.is_mute_pending(active)
+            && let Some(channel) = session_ref.channel(active)
+        {
+            let muted = channel.is_muted();
+            commands.push(action_item(
+                crate::sidebar::mute_label(muted),
+                if muted {
+                    IconName::Bell
+                } else {
+                    IconName::BellOff
+                },
+                actions::ToggleChannelMute,
+            ));
+        }
         if session_ref.channel(active).is_some_and(|e| e.can_leave()) {
             commands.push(action_item(
                 "Leave channel",

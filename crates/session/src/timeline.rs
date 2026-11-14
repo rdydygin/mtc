@@ -218,6 +218,7 @@ pub struct Timeline {
     /// Invalidates pagination responses when their snapshot or cursor disappears.
     pagination_generation: u64,
     unread_after: Option<Millis>,
+    unread_post: Option<PostId>,
     _load_task: Option<Task<()>>,
 }
 
@@ -254,6 +255,7 @@ impl Timeline {
             older_failed: false,
             pagination_generation: 0,
             unread_after: None,
+            unread_post: None,
             _load_task: None,
         }
     }
@@ -290,9 +292,22 @@ impl Timeline {
     pub fn set_unread_after(&mut self, at: Option<Millis>, cx: &mut Context<Self>) {
         if self.unread_after != at {
             self.unread_after = at;
+            self.unread_post = None;
             cx.emit(TimelineEvent::Reset);
             cx.notify();
         }
+    }
+
+    /// The explicitly marked post, including a message authored by the user.
+    pub fn unread_post(&self) -> Option<&PostId> {
+        self.unread_post.as_ref()
+    }
+
+    pub(crate) fn set_unread_post(&mut self, post: PostId, at: Millis, cx: &mut Context<Self>) {
+        self.unread_after = Some(at);
+        self.unread_post = Some(post);
+        cx.emit(TimelineEvent::Reset);
+        cx.notify();
     }
 
     pub fn position(&self, id: &PostId) -> Option<usize> {

@@ -294,13 +294,36 @@ impl Extension for Core {
                     return;
                 };
                 let is_direct = channel.kind() == mattermost::ChannelType::Direct;
-                let is_visible =
-                    window.is_window_active() && session.active_channel() == Some(&post.channel_id);
+                let is_visible = window.is_window_active()
+                    && if post.is_reply() {
+                        session.open_thread() == Some(&post.root_id)
+                    } else {
+                        session.active_channel() == Some(&post.channel_id)
+                    };
+                let mentions_me = desktop_mentions(
+                    post,
+                    channel.kind(),
+                    channel.desktop_notifications(),
+                    *mentions_me,
+                    session.me(),
+                    channel.ignore_channel_mentions(),
+                );
                 let status = session.directory().read(cx).status(&session.me().id);
-                if status == mattermost::Status::DoNotDisturb
-                    || (!*mentions_me && !is_direct)
-                    || is_visible
-                    || channel.is_muted()
+                if post.is_system()
+                    || !should_notify(
+                        channel.desktop_notifications(),
+                        session
+                            .me()
+                            .notify_props
+                            .get("desktop")
+                            .map(String::as_str)
+                            .unwrap_or("mention"),
+                        mentions_me,
+                        is_direct,
+                        channel.is_muted(),
+                        is_visible,
+                        status,
+                    )
                 {
                     return;
                 }
@@ -332,5 +355,335 @@ fn join(args: &str, suffix: &str) -> String {
         suffix.to_string()
     } else {
         format!("{args} {suffix}")
+    }
+}
+
+fn desktop_level<'a>(channel: &'a str, account: &'a str) -> &'a str {
+    match channel {
+        "all" | "mention" | "none" => channel,
+        _ => account,
+    }
+}
+
+/// GMs include every member in the server's mentions list. An explicit channel
+/// mentions-only override opts out of those implicit mentions; inherited account
+/// settings retain Mattermost's usual GM behavior.
+fn desktop_mentions(
+    post: &mattermost::Post,
+    kind: mattermost::ChannelType,
+    desktop: &str,
+    mentions_me: bool,
+    me: &mattermost::User,
+    ignore_channel_mentions: Option<&str>,
+) -> bool {
+    if kind != mattermost::ChannelType::Group || desktop != "mention" {
+        return mentions_me;
+    }
+    let channel_mentions = match ignore_channel_mentions {
+        Some("on" | "true") => false,
+        Some("off" | "false") => true,
+        _ => me
+            .notify_props
+            .get("channel")
+            .is_none_or(|value| value != "false"),
+    };
+    if !mentions_me {
+        return false;
+    }
+    if explicit_mention(&post.message, me, channel_mentions) {
+        return true;
+    }
+    let Some(attachments) = post
+        .props
+        .get("attachments")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    for attachment in attachments {
+        for key in ["text", "pretext", "title"] {
+            if let Some(text) = attachment.get(key).and_then(serde_json::Value::as_str)
+                && explicit_mention(text, me, channel_mentions)
+            {
+                return true;
+            }
+        }
+        if let Some(fields) = attachment
+            .get("fields")
+            .and_then(serde_json::Value::as_array)
+        {
+            for field in fields {
+                for key in ["title", "value"] {
+                    if let Some(text) = field.get(key).and_then(serde_json::Value::as_str)
+                        && explicit_mention(text, me, channel_mentions)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn explicit_mention(message: &str, me: &mattermost::User, channel_mentions: bool) -> bool {
+    let lower = message.to_lowercase();
+    if !me.username.is_empty()
+        && contains_mention_key(&lower, &format!("@{}", me.username.to_lowercase()))
+    {
+        return true;
+    }
+    if channel_mentions
+        && ["@channel", "@all", "@here"]
+            .iter()
+            .any(|key| contains_mention_key(&lower, key))
+    {
+        return true;
+    }
+    if me
+        .notify_props
+        .get("first_name")
+        .is_some_and(|value| value == "true")
+        && !me.first_name.is_empty()
+        && contains_mention_key(message, &me.first_name)
+    {
+        return true;
+    }
+    me.notify_props.get("mention_keys").is_some_and(|keys| {
+        keys.split(',')
+            .map(str::trim)
+            .filter(|key| {
+                !key.is_empty()
+                    && (channel_mentions
+                        || !["@channel", "@all", "@here"].contains(&key.to_lowercase().as_str()))
+            })
+            .any(|key| contains_mention_key(&lower, &key.to_lowercase()))
+    })
+}
+
+/// Match whole keys, avoiding partial usernames and addresses. This is a small
+/// client-side check used only to disambiguate implicit GM mentions, not a
+/// replacement for the server's mention parser.
+fn contains_mention_key(message: &str, key: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '@');
+    message.match_indices(key).any(|(ix, _)| {
+        let mut suffix = message[ix + key.len()..].chars();
+        let next = suffix.next();
+        let dotted_name = next == Some('.') && suffix.next().is_some_and(word);
+        !message[..ix].chars().next_back().is_some_and(word)
+            && !next.is_some_and(word)
+            && !dotted_name
+    })
+}
+
+/// Preferences only reduce the mentions-and-DMs baseline. `all` expansion is
+/// deferred; `default` inherits the account setting. Mute and DND always win.
+fn should_notify(
+    desktop: &str,
+    account_desktop: &str,
+    mentions_me: bool,
+    is_direct: bool,
+    muted: bool,
+    visible: bool,
+    status: mattermost::Status,
+) -> bool {
+    if muted || visible || status == mattermost::Status::DoNotDisturb {
+        return false;
+    }
+    match desktop_level(desktop, account_desktop) {
+        "none" => false,
+        _ => mentions_me || is_direct,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mattermost::Status;
+
+    #[test]
+    fn desktop_preferences_inherit_and_override_account_defaults() {
+        for (channel, account, mention, direct, expected) in [
+            ("all", "none", false, false, false),
+            ("none", "all", true, true, false),
+            ("mention", "all", false, false, false),
+            ("mention", "none", true, false, true),
+            ("mention", "none", false, true, true),
+            ("default", "all", false, false, false),
+            ("default", "none", true, true, false),
+            ("default", "mention", false, false, false),
+            ("default", "mention", true, false, true),
+            ("default", "mention", false, true, true),
+            ("", "", false, false, false),
+            ("default", "default", false, true, true),
+        ] {
+            assert_eq!(
+                should_notify(
+                    channel,
+                    account,
+                    mention,
+                    direct,
+                    false,
+                    false,
+                    Status::Online
+                ),
+                expected,
+                "channel={channel}, account={account}, mention={mention}, direct={direct}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_mentions_only_override_requires_an_explicit_key() {
+        use mattermost::{ChannelType, Post, User};
+        let mut me = User::default();
+        me.username = "bob".into();
+        me.first_name = "Robert".into();
+        me.notify_props.insert("first_name".into(), "true".into());
+        me.notify_props
+            .insert("mention_keys".into(), "launch,release day".into());
+        for message in [
+            "hi @bob!",
+            "hi @bob.",
+            "@channel hello",
+            "@all",
+            "@here",
+            "Robert?",
+            "LAUNCH",
+            "release day!",
+        ] {
+            let mut post = Post::default();
+            post.message = message.into();
+            assert!(
+                desktop_mentions(&post, ChannelType::Group, "mention", true, &me, None),
+                "{message}"
+            );
+            assert!(!desktop_mentions(
+                &post,
+                ChannelType::Group,
+                "mention",
+                false,
+                &me,
+                None
+            ));
+        }
+        for message in [
+            "hello",
+            "robert",
+            "@bobby",
+            "@bob-other",
+            "@bob.jones",
+            "foo@bob",
+            "relaunch",
+            "launching",
+        ] {
+            let mut post = Post::default();
+            post.message = message.into();
+            assert!(
+                !desktop_mentions(&post, ChannelType::Group, "mention", true, &me, None),
+                "{message}"
+            );
+            assert!(desktop_mentions(
+                &post,
+                ChannelType::Group,
+                "default",
+                true,
+                &me,
+                None
+            ));
+        }
+        me.notify_props.insert("channel".into(), "false".into());
+        assert!(!explicit_mention("@channel @all @here", &me, false));
+        me.notify_props.insert("first_name".into(), "false".into());
+        assert!(!explicit_mention("Robert", &me, true));
+    }
+
+    #[test]
+    fn explicit_group_mentions_include_attachments_and_member_ignore_overrides() {
+        use mattermost::{ChannelType, Post, User};
+        use serde_json::json;
+        let mut me = User::default();
+        me.username = "bob".into();
+        me.notify_props.insert("channel".into(), "true".into());
+        for attachment in [
+            json!({"text":"hi @bob"}),
+            json!({"pretext":"hi @bob"}),
+            json!({"title":"hi @bob"}),
+            json!({"fields":[{"title":"hi @bob"}]}),
+            json!({"fields":[{"value":"hi @bob"}]}),
+        ] {
+            let mut post = Post::default();
+            post.props.insert("attachments".into(), json!([attachment]));
+            assert!(desktop_mentions(
+                &post,
+                ChannelType::Group,
+                "mention",
+                true,
+                &me,
+                Some("on")
+            ));
+        }
+        let mut post = Post::default();
+        post.props.insert(
+            "attachments".into(),
+            json!([{"text":"@channel @all @here"}]),
+        );
+        assert!(!desktop_mentions(
+            &post,
+            ChannelType::Group,
+            "mention",
+            true,
+            &me,
+            Some("on")
+        ));
+        assert!(desktop_mentions(
+            &post,
+            ChannelType::Group,
+            "mention",
+            true,
+            &me,
+            Some("default")
+        ));
+        me.notify_props.insert("channel".into(), "false".into());
+        assert!(!desktop_mentions(
+            &post,
+            ChannelType::Group,
+            "mention",
+            true,
+            &me,
+            Some("default")
+        ));
+        assert!(desktop_mentions(
+            &post,
+            ChannelType::Group,
+            "mention",
+            true,
+            &me,
+            Some("off")
+        ));
+        post.message = "@bob".into();
+        assert!(desktop_mentions(
+            &post,
+            ChannelType::Group,
+            "mention",
+            true,
+            &me,
+            Some("on")
+        ));
+    }
+
+    #[test]
+    fn mute_visibility_and_dnd_override_every_desktop_preference() {
+        for desktop in ["all", "mention", "none", "default"] {
+            for (muted, visible, status) in [
+                (true, false, Status::Online),
+                (false, true, Status::Online),
+                (false, false, Status::DoNotDisturb),
+            ] {
+                assert!(!should_notify(
+                    desktop, "all", true, true, muted, visible, status
+                ));
+            }
+        }
     }
 }
