@@ -9,7 +9,9 @@ mod appearance;
 mod assets;
 mod cache;
 mod composer;
-#[cfg(not(target_os = "macos"))]
+// Exercise the Linux/Windows handoff protocol in tests on macOS too.
+#[cfg(any(not(target_os = "macos"), test))]
+#[cfg_attr(all(target_os = "macos", test), allow(dead_code))]
 mod deep_link;
 mod dither;
 mod download;
@@ -52,7 +54,7 @@ fn main() {
     #[cfg(not(target_os = "macos"))]
     let launch_urls = {
         let urls = deep_link::urls_from_args();
-        if !urls.is_empty() && deep_link::forward_to_running(&urls) {
+        if !urls.is_empty() && deep_link::forward_to_running(&urls).should_exit() {
             return;
         }
         urls

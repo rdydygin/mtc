@@ -55,7 +55,10 @@ On Linux and Windows mtc registers the links itself each time it starts, pointin
 at the executable you ran. On Linux that's a hidden `mtc-sso-callback.desktop` entry in
 `~/.local/share/applications`, set as the handler with `xdg-mime`. On Windows it's a
 per-user key under `HKEY_CURRENT_USER\Software\Classes`. When the browser opens a link,
-the new mtc process passes it to the window that's already running and exits.
+the new mtc process passes it to the window that's already running and exits. If that
+window is from an older version with an incompatible sign-in protocol, the new process
+exits without forwarding the link or starting a second window. Quit the old mtc, reopen
+mtc, and retry sign-in, or paste the link into the waiting sign-in panel.
 
 If the browser can't hand control back, copy the address of the page it ends on
 (`…/login/desktop?client_token=…&server_token=…`) and paste it into mtc. On older
@@ -88,7 +91,13 @@ Attach files with the paperclip, by dropping them on a conversation, or by pasti
 image; they upload right away and send with the message. Click a picture to see it large
 in mtc: ← and → step through the message's other pictures, Esc closes it, and Download
 saves it to Downloads and shows it there. Click any other attachment to download it to
-Downloads and open it.
+Downloads and open documents and media with the system application. Programs, scripts,
+shortcuts, and unrecognized file types are shown in the file manager instead of opened.
+On macOS, downloaded attachments are marked for Gatekeeper checks. On Windows,
+documents and media are marked as Internet downloads before opening; if marking fails,
+they are shown in the file manager instead.
+Message links open web pages (`http` and `https`) and email addresses (`mailto`);
+other link types show a notification and are not sent to system handlers.
 
 Search a conversation's messages with ⌘F. Results appear beside the conversation as you
 type, newest first, with the matching words marked; ↑ and ↓ move through them and Enter

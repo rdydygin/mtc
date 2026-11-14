@@ -18,19 +18,20 @@
 
 use std::{
     fs,
-    io::{BufRead as _, BufReader, Read as _, Write as _},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    path::PathBuf,
-    time::Duration,
+    io::{self, BufRead as _, BufReader, Read as _, Write as _},
+    net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, bail};
 use futures::channel::mpsc::UnboundedSender;
+use hmac::{Hmac, Mac as _};
 use mattermost::sso::{CALLBACK_SCHEME, MOBILE_CALLBACK_SCHEME, is_callback_url};
+use sha2::Sha256;
 
-/// The first line the running instance sends, so a forwarding process never
-/// hands a link to some other program that took over a stale port.
-const GREETING: &str = "mtc-deep-link 1";
+/// Version 2 proves possession of the instance secret before sending callback links.
+const GREETING: &str = "mtc-deep-link 2";
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// Callback links are short; anything longer is not one of ours.
 const MAX_MESSAGE: u64 = 64 * 1024;
@@ -48,44 +49,122 @@ fn instance_file() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("mtc").join("instance"))
 }
 
-/// Hand `urls` to an mtc that is already running. Returns false when none
-/// answers, and this process should handle them itself.
-pub fn forward_to_running(urls: &[String]) -> bool {
-    match try_forward(urls) {
-        Ok(()) => true,
+/// Whether a callback process may start its own UI and listener.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ForwardOutcome {
+    Absent,
+    Forwarded,
+    Incompatible,
+    AuthenticationFailed,
+}
+
+impl ForwardOutcome {
+    pub fn should_exit(&self) -> bool {
+        *self != Self::Absent
+    }
+}
+
+/// Hand callbacks to the running instance, preserving its rendezvous file on failure.
+pub fn forward_to_running(urls: &[String]) -> ForwardOutcome {
+    let Some(path) = instance_file() else {
+        return ForwardOutcome::Absent;
+    };
+    forward_from(&path, urls)
+}
+
+fn forward_from(path: &Path, urls: &[String]) -> ForwardOutcome {
+    forward_from_using(path, urls, |addr| {
+        TcpStream::connect_timeout(addr, IO_TIMEOUT)
+    })
+}
+
+fn forward_from_using(
+    path: &Path,
+    urls: &[String],
+    connect: impl FnOnce(&SocketAddr) -> io::Result<TcpStream>,
+) -> ForwardOutcome {
+    match try_forward(path, urls, connect) {
+        Ok(ForwardOutcome::Incompatible) => {
+            log::error!(
+                "The running mtc uses a different sign-in protocol. Quit it, reopen mtc, \
+                 and retry sign-in, or paste the sign-in link into its waiting sign-in panel."
+            );
+            ForwardOutcome::Incompatible
+        }
+        Ok(outcome) => outcome,
         Err(err) => {
-            log::info!("no running mtc took the link ({err:#}); handling it here");
-            false
+            log::error!(
+                "Couldn’t verify the running mtc’s sign-in handoff ({err:#}). Quit all mtc instances, \
+                 reopen mtc, and retry sign-in."
+            );
+            ForwardOutcome::AuthenticationFailed
         }
     }
 }
 
-fn try_forward(urls: &[String]) -> Result<()> {
-    let path = instance_file().context("no config directory")?;
-    let contents = fs::read_to_string(&path)?;
+fn try_forward(
+    path: &Path,
+    urls: &[String],
+    connect: impl FnOnce(&SocketAddr) -> io::Result<TcpStream>,
+) -> Result<ForwardOutcome> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(ForwardOutcome::Absent),
+        Err(err) => return Err(err.into()),
+    };
     let (port, secret) = contents
         .trim()
         .split_once(' ')
         .context("malformed instance file")?;
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port.parse::<u16>()?));
-    let stream = TcpStream::connect_timeout(&addr, IO_TIMEOUT)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    let mut reader = BufReader::new(stream.try_clone()?.take(256));
-    let mut greeting = String::new();
-    reader.read_line(&mut greeting)?;
-    if greeting.trim_end() != GREETING {
+    let stream = match connect(&addr) {
+        Ok(stream) => stream,
+        Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
+            return Ok(ForwardOutcome::Absent);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    forward(stream, secret, urls)
+}
+
+fn forward(stream: TcpStream, secret: &str, urls: &[String]) -> Result<ForwardOutcome> {
+    forward_with_timeout(stream, secret, urls, IO_TIMEOUT)
+}
+
+fn forward_with_timeout(
+    mut stream: TcpStream,
+    secret: &str,
+    urls: &[String],
+    timeout: Duration,
+) -> Result<ForwardOutcome> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let nonce = new_secret()?;
+    stream.write_all(format!("{GREETING}\n{nonce}\n").as_bytes())?;
+    let mut reader = BufReader::new(stream);
+    let greeting = read_line(&mut reader)?;
+    if greeting != GREETING {
+        if greeting.starts_with("mtc-deep-link ") {
+            return Ok(ForwardOutcome::Incompatible);
+        }
         bail!("the port belongs to another program");
     }
-    let mut stream = stream;
-    let mut message = format!("{secret}\n");
-    for url in urls {
-        message.push_str(url);
-        message.push('\n');
+    let challenge = read_line(&mut reader)?;
+    let listener_proof = read_line(&mut reader)?;
+    verify(secret, "listener", &nonce, &challenge, "", &listener_proof)?;
+
+    let message: String = urls.iter().map(|url| format!("{url}\n")).collect();
+    if message.len() as u64 > MAX_MESSAGE {
+        bail!("too many callback links");
     }
-    stream.write_all(message.as_bytes())?;
-    stream.flush()?;
-    Ok(())
+    let proof = proof(secret, "callback", &nonce, &challenge, &message);
+    let stream = reader.get_mut();
+    stream.write_all(format!("{proof}\n{message}").as_bytes())?;
+    stream.shutdown(Shutdown::Write)?;
+    if read_line(&mut reader)? != "ok" {
+        bail!("the listener didn't accept the links");
+    }
+    Ok(ForwardOutcome::Forwarded)
 }
 
 /// Accept links from processes the system starts for them, and send them
@@ -119,20 +198,139 @@ pub fn listen(urls: UnboundedSender<Vec<String>>) {
     }
 }
 
-fn receive(mut stream: TcpStream, secret: &str) -> Result<Vec<String>> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    stream.write_all(format!("{GREETING}\n").as_bytes())?;
-    let mut message = String::new();
-    stream.take(MAX_MESSAGE).read_to_string(&mut message)?;
-    let mut lines = message.lines();
-    if lines.next() != Some(secret) {
-        bail!("wrong secret");
+fn receive(stream: TcpStream, secret: &str) -> Result<Vec<String>> {
+    receive_until(stream, secret, Instant::now() + IO_TIMEOUT)
+}
+
+fn receive_until(stream: TcpStream, secret: &str, deadline: Instant) -> Result<Vec<String>> {
+    receive_from(
+        &mut BufReader::new(DeadlineStream { stream, deadline }),
+        secret,
+    )
+}
+
+fn receive_from(
+    reader: &mut BufReader<impl io::Read + io::Write>,
+    secret: &str,
+) -> Result<Vec<String>> {
+    if read_line(reader)? != GREETING {
+        bail!("unsupported deep-link protocol");
     }
-    Ok(lines
+    let nonce = read_line(reader)?;
+    let challenge = new_secret()?;
+    let proof = proof(secret, "listener", &nonce, &challenge, "");
+    reader
+        .get_mut()
+        .write_all(format!("{GREETING}\n{challenge}\n{proof}\n").as_bytes())?;
+    let proof = read_line(reader)?;
+    let mut message = String::new();
+    reader
+        .by_ref()
+        .take(MAX_MESSAGE + 1)
+        .read_to_string(&mut message)?;
+    if message.len() as u64 > MAX_MESSAGE {
+        bail!("too many callback links");
+    }
+    verify(secret, "callback", &nonce, &challenge, &message, &proof)?;
+    reader.get_mut().write_all(b"ok\n")?;
+    Ok(message
+        .lines()
         .filter(|line| is_callback_url(line))
         .map(str::to_string)
         .collect())
+}
+
+/// Keep every read and write within the connection's original deadline.
+struct DeadlineStream {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    fn remaining(&self) -> io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "deep-link connection deadline elapsed",
+                )
+            })
+    }
+}
+
+impl io::Read for DeadlineStream {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(bytes)
+    }
+}
+
+impl io::Write for DeadlineStream {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// Bound every handshake line, including one from an unrelated local process.
+fn read_line(reader: &mut impl io::BufRead) -> Result<String> {
+    let mut line = String::new();
+    reader.take(256).read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        bail!("incomplete deep-link handshake");
+    }
+    line.pop();
+    Ok(line)
+}
+
+fn mac(secret: &str, role: &str, nonce: &str, challenge: &str, message: &str) -> Hmac<Sha256> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
+    for part in [GREETING, role, nonce, challenge, message] {
+        mac.update(&(part.len() as u64).to_be_bytes());
+        mac.update(part.as_bytes());
+    }
+    mac
+}
+
+fn proof(secret: &str, role: &str, nonce: &str, challenge: &str, message: &str) -> String {
+    mac(secret, role, nonce, challenge, message)
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn verify(
+    secret: &str,
+    role: &str,
+    nonce: &str,
+    challenge: &str,
+    message: &str,
+    proof: &str,
+) -> Result<()> {
+    if proof.len() != 64 {
+        bail!("invalid deep-link proof");
+    }
+    let mut bytes = [0; 32];
+    for (ix, byte) in bytes.iter_mut().enumerate() {
+        let pair = proof
+            .as_bytes()
+            .get(ix * 2..ix * 2 + 2)
+            .context("invalid deep-link proof")?;
+        let pair = std::str::from_utf8(pair)?;
+        *byte = u8::from_str_radix(pair, 16)?;
+    }
+    mac(secret, role, nonce, challenge, message)
+        .verify_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("wrong deep-link proof"))
 }
 
 fn new_secret() -> Result<String> {
@@ -282,40 +480,310 @@ mod tests {
     #[test]
     fn hands_links_to_the_listener() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            receive(stream, "s3cret").unwrap()
-        });
-        let mut stream = TcpStream::connect(addr).unwrap();
-        let mut greeting = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut greeting)
-            .unwrap();
-        assert_eq!(greeting.trim_end(), GREETING);
-        stream
-            .write_all(b"s3cret\nmmauth://callback?MMAUTHTOKEN=t\nhttps://evil.example\n")
-            .unwrap();
-        drop(stream);
+        let (client, stream) = connected_peer(&listener);
+        let server = std::thread::spawn(move || receive(stream, "s3cret").unwrap());
+        forward(
+            client,
+            "s3cret",
+            &[
+                "mmauth://callback?MMAUTHTOKEN=t".into(),
+                "mattermost-dev://callback?client_token=c&server_token=t".into(),
+                "https://evil.example".into(),
+            ],
+        )
+        .unwrap();
         assert_eq!(
             server.join().unwrap(),
-            vec!["mmauth://callback?MMAUTHTOKEN=t".to_string()]
+            vec![
+                "mmauth://callback?MMAUTHTOKEN=t".to_string(),
+                "mattermost-dev://callback?client_token=c&server_token=t".to_string(),
+            ]
         );
     }
 
     #[test]
     fn rejects_a_wrong_secret() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            receive(stream, "s3cret")
-        });
-        let mut stream = TcpStream::connect(addr).unwrap();
-        stream
-            .write_all(b"guess\nmmauth://callback?MMAUTHTOKEN=t\n")
-            .unwrap();
-        drop(stream);
+        let (client, stream) = connected_peer(&listener);
+        let server = std::thread::spawn(move || receive(stream, "s3cret"));
+        assert!(forward(client, "guess", &["mmauth://callback?MMAUTHTOKEN=t".into()]).is_err());
         assert!(server.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn callback_startup_preserves_incompatible_and_untrusted_instances() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("deep-link-{}", new_secret().unwrap()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("instance");
+        assert_eq!(forward_from(&path, &[]), ForwardOutcome::Absent);
+        assert!(!ForwardOutcome::Absent.should_exit());
+        for (reply, expected) in [
+            ("mtc-deep-link 1\n", ForwardOutcome::Incompatible),
+            (
+                "mtc-deep-link 2\nchallenge\ninvalid-proof\n",
+                ForwardOutcome::AuthenticationFailed,
+            ),
+        ] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let contents = format!("{} secret\n", addr.port());
+            fs::write(&path, &contents).unwrap();
+            let (client, stream) = connected_peer(&listener);
+            let server = std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                read_line(&mut reader).unwrap();
+                read_line(&mut reader).unwrap();
+                reader.get_mut().write_all(reply.as_bytes()).unwrap();
+                let mut rest = String::new();
+                reader.read_to_string(&mut rest).unwrap();
+                rest
+            });
+            let outcome = forward_from_using(
+                &path,
+                &["mmauth://callback?MMAUTHTOKEN=private".into()],
+                |requested| {
+                    assert_eq!(*requested, addr);
+                    Ok(client)
+                },
+            );
+            assert_eq!(outcome, expected);
+            assert!(
+                outcome.should_exit(),
+                "must exit before creating another listener"
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+            assert!(server.join().unwrap().is_empty());
+        }
+        let stale = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = stale.local_addr().unwrap();
+        fs::write(&path, format!("{} secret\n", addr.port())).unwrap();
+        assert_eq!(
+            forward_from_using(&path, &[], |requested| {
+                assert_eq!(*requested, addr);
+                Err(io::ErrorKind::ConnectionRefused.into())
+            }),
+            ForwardOutcome::Absent
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Deliver one byte per read and expire the deadline at a chosen protocol point.
+    struct ExpiringPeer {
+        stream: DeadlineStream,
+        read_count: usize,
+        expire_after: usize,
+    }
+
+    impl io::Read for ExpiringPeer {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let len = bytes.len().min(1);
+            let count = self.stream.read(&mut bytes[..len])?;
+            self.read_count += count;
+            if self.read_count == self.expire_after {
+                self.stream.deadline = Instant::now();
+            }
+            Ok(count)
+        }
+    }
+
+    impl io::Write for ExpiringPeer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.stream.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    /// Match the fixture's client even if another test retries a reused loopback port.
+    fn accept_peer(listener: &TcpListener, peer: SocketAddr) -> TcpStream {
+        loop {
+            let (stream, addr) = listener.accept().unwrap();
+            if addr == peer {
+                return stream;
+            }
+        }
+    }
+
+    fn connected_peer(listener: &TcpListener) -> (TcpStream, TcpStream) {
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream = accept_peer(listener, client.local_addr().unwrap());
+        (client, stream)
+    }
+
+    #[test]
+    fn slow_peers_cannot_hold_the_listener_during_handshake_or_body() {
+        // This is a deadlock watchdog, not the deadline being tested.
+        const WATCHDOG: Duration = Duration::from_secs(30);
+        let handshake = format!("{GREETING}\nnonce\nproof\n");
+        for body in [false, true] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let expire_after = if body { handshake.len() + 1 } else { 1 };
+            let mut peer = TcpStream::connect(addr).unwrap();
+            peer.set_write_timeout(Some(WATCHDOG)).unwrap();
+            let peer_addr = peer.local_addr().unwrap();
+            let (done, result) = std::sync::mpsc::channel();
+            let (next_peer, recovery_peer) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let stream = accept_peer(&listener, peer_addr);
+                let mut reader = BufReader::new(ExpiringPeer {
+                    stream: DeadlineStream {
+                        stream,
+                        deadline: Instant::now() + WATCHDOG,
+                    },
+                    read_count: 0,
+                    expire_after,
+                });
+                let err = receive_from(&mut reader, "secret").unwrap_err();
+                assert_eq!(
+                    reader.get_ref().read_count,
+                    expire_after,
+                    "must reject the next byte even while the peer has more data ready"
+                );
+                assert_eq!(
+                    err.downcast_ref::<io::Error>().unwrap().kind(),
+                    io::ErrorKind::TimedOut
+                );
+                drop(reader);
+                done.send(()).unwrap();
+                receive_until(
+                    accept_peer(&listener, recovery_peer.recv_timeout(WATCHDOG).unwrap()),
+                    "secret",
+                    Instant::now() + WATCHDOG,
+                )
+                .unwrap()
+            });
+            // Keep the peer open with bytes queued beyond expiry, so neither EOF
+            // nor an idle-read timeout can stand in for the absolute deadline.
+            peer.write_all(format!("{handshake}xx").as_bytes()).unwrap();
+            result.recv_timeout(WATCHDOG).unwrap();
+            drop(peer);
+            // A retry from another test may reach a reused ephemeral port first.
+            let mut unrelated = TcpStream::connect(addr).unwrap();
+            unrelated.set_write_timeout(Some(WATCHDOG)).unwrap();
+            unrelated.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+            let recovery = TcpStream::connect(addr).unwrap();
+            next_peer.send(recovery.local_addr().unwrap()).unwrap();
+            assert_eq!(
+                forward_with_timeout(
+                    recovery,
+                    "secret",
+                    &["mmauth://callback?MMAUTHTOKEN=t".into()],
+                    WATCHDOG,
+                )
+                .unwrap(),
+                ForwardOutcome::Forwarded
+            );
+            assert_eq!(
+                server.join().unwrap(),
+                vec!["mmauth://callback?MMAUTHTOKEN=t"]
+            );
+        }
+    }
+
+    #[test]
+    fn listener_rejects_tampered_callbacks_and_reflected_proofs() {
+        for reflect in [false, true] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let (client, stream) = connected_peer(&listener);
+            let server = std::thread::spawn(move || receive(stream, "secret"));
+            let mut reader = BufReader::new(client);
+            reader
+                .get_mut()
+                .write_all(format!("{GREETING}\nnonce\n").as_bytes())
+                .unwrap();
+            assert_eq!(read_line(&mut reader).unwrap(), GREETING);
+            let challenge = read_line(&mut reader).unwrap();
+            let listener_proof = read_line(&mut reader).unwrap();
+            let proof = if reflect {
+                listener_proof
+            } else {
+                proof(
+                    "secret",
+                    "callback",
+                    "nonce",
+                    &challenge,
+                    "mmauth://callback?MMAUTHTOKEN=original\n",
+                )
+            };
+            reader
+                .get_mut()
+                .write_all(format!("{proof}\nmmauth://callback?MMAUTHTOKEN=changed\n").as_bytes())
+                .unwrap();
+            reader.get_mut().shutdown(Shutdown::Write).unwrap();
+            assert!(server.join().unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn impostor_listener_never_receives_the_secret_or_callback() {
+        // Both the old fixed greeting and a forged version 2 proof must fail closed.
+        for reply in [
+            "mtc-deep-link 1\n",
+            "mtc-deep-link 2\nchallenge\n0000000000000000000000000000000000000000000000000000000000000000\n",
+        ] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let (client, mut stream) = connected_peer(&listener);
+            let impostor = std::thread::spawn(move || {
+                stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let greeting = read_line(&mut reader).unwrap();
+                let nonce = read_line(&mut reader).unwrap();
+                stream.write_all(reply.as_bytes()).unwrap();
+                let mut remaining = String::new();
+                let _ = reader.read_to_string(&mut remaining);
+                (greeting, nonce, remaining)
+            });
+            let outcome = forward(
+                client,
+                "s3cret",
+                &["mmauth://callback?MMAUTHTOKEN=private-token".into()],
+            );
+            if reply.starts_with("mtc-deep-link 1") {
+                assert_eq!(outcome.unwrap(), ForwardOutcome::Incompatible);
+            } else {
+                assert!(outcome.is_err());
+            }
+            let (greeting, nonce, remaining) = impostor.join().unwrap();
+            assert_eq!(greeting, GREETING);
+            assert_eq!(nonce.len(), 32);
+            assert!(!nonce.contains("s3cret"));
+            assert!(remaining.is_empty(), "sent sensitive data: {remaining}");
+        }
+    }
+
+    #[test]
+    fn proofs_bind_the_role_nonces_and_callback() {
+        let message = "mmauth://callback?MMAUTHTOKEN=t\n";
+        let signed = proof("secret", "callback", "nonce", "challenge", message);
+        assert!(verify("secret", "callback", "nonce", "challenge", message, &signed).is_ok());
+        for (role, nonce, challenge, message) in [
+            ("listener", "nonce", "challenge", message),
+            ("callback", "other", "challenge", message),
+            ("callback", "nonce", "other", message),
+            (
+                "callback",
+                "nonce",
+                "challenge",
+                "mmauth://callback?MMAUTHTOKEN=other\n",
+            ),
+        ] {
+            assert!(verify("secret", role, nonce, challenge, message, &signed).is_err());
+        }
+        assert!(
+            verify(
+                "secret",
+                "callback",
+                "nonce",
+                "challenge",
+                message,
+                &"é".repeat(32)
+            )
+            .is_err()
+        );
     }
 }

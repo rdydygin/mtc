@@ -508,9 +508,7 @@ impl TimelineView {
                     let index = images.iter().position(|f| f.id == file.id).unwrap_or(0);
                     image_viewer::open(client, images, index, window, cx);
                 } else {
-                    download::save(client, file, window, cx, |path, _, cx| {
-                        cx.open_with_system(path)
-                    });
+                    download::save(client, file, window, cx, download::open);
                 }
             }
             PostAction::MessageUser(user) => {
