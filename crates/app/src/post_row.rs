@@ -59,6 +59,7 @@ pub const QUICK_REACTIONS: [(&str, &str); 4] = [
 #[derive(Clone, Debug)]
 pub enum PostAction {
     OpenThread,
+    OpenLink(String),
     ToggleReaction(String),
     MarkUnread,
     CopyText,
@@ -201,7 +202,12 @@ impl PostRow {
         }
     }
 
-    fn render_body(&self, mention: Option<&Entity<MentionCard>>, cx: &App) -> AnyElement {
+    fn render_body(
+        &self,
+        mention: Option<&Entity<MentionCard>>,
+        on_action: &Entity<PostActionHandler>,
+        cx: &App,
+    ) -> AnyElement {
         if let Some(body) = extensions::render_post_body(&self.entry, cx) {
             return body;
         }
@@ -212,8 +218,18 @@ impl PostRow {
                 .on_link_click({
                     let mention = mention.cloned();
                     let directory = self.directory.clone();
+                    let on_action = on_action.clone();
                     move |url, event, window, cx| {
-                        open_link(url, event, mention.as_ref(), directory.as_ref(), window, cx)
+                        let on_action = on_action.read(cx).clone();
+                        open_link(
+                            url,
+                            event,
+                            mention.as_ref(),
+                            directory.as_ref(),
+                            &on_action,
+                            window,
+                            cx,
+                        )
                     }
                 })
                 // Language and copy sit in the block's top-right corner,
@@ -406,6 +422,7 @@ impl PostRow {
                 .min(IMAGE_MAX_HEIGHT / size.height as f32)
                 .min(1.);
             let url = embed.url.clone();
+            let on_action = self.on_action.clone();
             return Some(
                 div()
                     .id("link-image")
@@ -419,13 +436,14 @@ impl PostRow {
                     )
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
-                        open_external_link(&url, window, cx)
+                        on_action(PostAction::OpenLink(url.clone()), window, cx)
                     })
                     .into_any_element(),
             );
         }
         let preview = embed.link_preview()?;
         let url = preview.url.clone();
+        let on_action = self.on_action.clone();
         let site = if preview.site_name.is_empty() {
             url::Url::parse(&preview.url)
                 .ok()
@@ -522,7 +540,7 @@ impl PostRow {
                 .tooltip(move |window, cx| Tooltip::new(preview.url.clone()).build(window, cx))
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
-                    open_external_link(&url, window, cx)
+                    on_action(PostAction::OpenLink(url.clone()), window, cx)
                 })
                 .into_any_element(),
         )
@@ -811,6 +829,14 @@ impl RenderOnce for PostRow {
             cx,
             |_, _| false,
         );
+        // TextView's callbacks are Send + Sync. Retain the UI-thread action
+        // handler behind an entity handle, just like the mention card.
+        let link_action = window.use_keyed_state(
+            SharedString::from(format!("post-link-action-{}", post.id)),
+            cx,
+            |_, _| self.on_action.clone(),
+        );
+        link_action.update(cx, |handler, _| *handler = self.on_action.clone());
         let actions_revealed = *actions_open.read(cx) || actions_focus.is_focused(window);
         // Only Markdown text carries mention links.
         let mention = self.rich_text.is_some().then(|| {
@@ -1010,7 +1036,7 @@ impl RenderOnce for PostRow {
                                 .relative()
                                 .text_sm()
                                 .when(!sent, |this| this.opacity(0.6))
-                                .child(self.render_body(mention.as_ref(), cx))
+                                .child(self.render_body(mention.as_ref(), &link_action, cx))
                                 .when(edited, |this| {
                                     this.child(
                                         div()
@@ -1242,7 +1268,7 @@ impl Selectable for MentionAnchor {
 }
 
 /// Open web and email links without dispatching other protocols to the system.
-fn open_external_link(url: &str, window: &mut Window, cx: &mut App) {
+pub(crate) fn open_external_link(url: &str, window: &mut Window, cx: &mut App) {
     match url::Url::parse(url) {
         Ok(url) if matches!(url.scheme(), "http" | "https" | "mailto") => {
             cx.open_url(url.as_str());
@@ -1260,6 +1286,7 @@ fn open_link(
     event: &ClickEvent,
     mention: Option<&Entity<MentionCard>>,
     directory: Option<&Entity<Directory>>,
+    on_action: &PostActionHandler,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -1267,7 +1294,7 @@ fn open_link(
         return;
     }
     let Some(username) = session::mention_username(url) else {
-        open_external_link(url, window, cx);
+        on_action(PostAction::OpenLink(url.to_string()), window, cx);
         return;
     };
     let (Some(mention), Some(directory)) = (mention, directory) else {
@@ -1380,7 +1407,9 @@ fn post_menu(
             menu.item(PopupMenuItem::new(label.clone()).on_click(
                 move |_, window, cx| match &command {
                     PostCommand::Post(action) => on_action(action.clone(), window, cx),
-                    PostCommand::OpenLink(url) => open_external_link(url, window, cx),
+                    PostCommand::OpenLink(url) => {
+                        on_action(PostAction::OpenLink(url.to_string()), window, cx)
+                    }
                 },
             ))
         }
@@ -1597,6 +1626,34 @@ mod tests {
         })
         .unwrap();
         assert_eq!(opened_thread(&actions), 1);
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_permalink_routes_to_the_workspace(cx: &mut TestAppContext) {
+        let url = "http://localhost:1/team/pl/abc";
+        let (window, actions) = open_row_with(cx, &format!("[Message]({url})"));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let header = window.find("thread").bounds();
+            let reactions = window.find("reaction-+1").bounds();
+            click_point(
+                window,
+                point(
+                    reactions.left() + px(4.),
+                    (header.bottom() + reactions.top()) / 2.,
+                ),
+                cx,
+            );
+        })
+        .unwrap();
+        assert!(
+            actions
+                .borrow()
+                .iter()
+                .any(|a| matches!(a, PostAction::OpenLink(link) if link == url))
+        );
+        assert_eq!(opened_thread(&actions), 0);
+        assert!(cx.opened_url().is_none());
     }
 
     #[gpui_kit::test]

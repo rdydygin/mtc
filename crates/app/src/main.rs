@@ -20,6 +20,7 @@ mod http;
 mod image_viewer;
 mod keychain;
 mod lang_icon;
+mod links;
 mod login;
 mod palette;
 mod persist;

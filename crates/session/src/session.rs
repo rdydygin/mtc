@@ -167,6 +167,8 @@ pub struct Session {
     channels: HashMap<ChannelId, ChannelEntry>,
     /// Completed lists invalidate older channel hydration.
     channel_list_generation: u64,
+    /// Monotonic team selection revision, including round trips to the same team.
+    team_revision: u64,
     /// Channels hydrated since the pending list request started.
     hydrated_channels: HashSet<ChannelId>,
     channels_state: LoadState,
@@ -259,6 +261,7 @@ impl Session {
             team: preferred_team,
             channels: HashMap::new(),
             channel_list_generation: 0,
+            team_revision: 0,
             hydrated_channels: HashSet::new(),
             channels_state: LoadState::NotLoaded,
             teams_state: LoadState::NotLoaded,
@@ -447,7 +450,11 @@ impl Session {
                         .as_ref()
                         .is_some_and(|id| this.teams.iter().any(|t| &t.id == id));
                     if !keep {
-                        this.team = this.teams.first().map(|t| t.id.clone());
+                        let team = this.teams.first().map(|t| t.id.clone());
+                        if this.team != team {
+                            this.team_revision += 1;
+                            this.team = team;
+                        }
                     }
                     if this.team != guess || guess.is_none() {
                         this.channels.clear();
@@ -468,10 +475,16 @@ impl Session {
     }
 
     /// Switch the sidebar to another team.
+    /// Changes whenever a different team is selected.
+    pub fn team_revision(&self) -> u64 {
+        self.team_revision
+    }
+
     pub fn select_team(&mut self, team: TeamId, cx: &mut Context<Self>) {
         if self.team.as_ref() == Some(&team) {
             return;
         }
+        self.team_revision += 1;
         self.team = Some(team);
         self.channels.clear();
         self.channel_list_generation += 1;
