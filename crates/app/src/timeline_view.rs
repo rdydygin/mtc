@@ -150,8 +150,8 @@ impl TimelineView {
     }
 
     pub fn draft(&self, cx: &App) -> Option<String> {
-        let text = self.composer.read(cx).text(cx);
-        (!text.trim().is_empty() && !self.composer.read(cx).is_editing()).then_some(text)
+        let text = self.composer.read(cx).draft(cx);
+        (!text.trim().is_empty()).then_some(text)
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &mut App) {

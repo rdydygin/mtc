@@ -615,9 +615,19 @@ impl Workspace {
             .map(|(_, v, _)| v)
     }
 
-    /// Focus the conversation in view: the open channel, or in the Threads
-    /// pane, the open thread or else the list.
-    fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Focus the visible conversation, revealing the channel if search covers it.
+    /// In the Threads pane, focus its open thread or else the list.
+    fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.showing_threads && self.side_replaces_content {
+            if let Some((thread, _)) = &self.thread {
+                thread.focus_handle(cx).focus(window, cx);
+                return;
+            }
+            if self.search_open {
+                self.search_open = false;
+                cx.notify();
+            }
+        }
         let focus = if self.showing_threads {
             match (&self.thread, &self.threads) {
                 (Some((thread, _)), _) => Some(thread.focus_handle(cx)),
@@ -706,7 +716,7 @@ impl Workspace {
                 ("Previous unread channel", Box::new(PreviousUnreadChannel)),
                 ("Focus the message field", Box::new(FocusComposer)),
                 ("Close conversation", Box::new(CloseConversation)),
-                ("Close thread or mark channel read", Box::new(Dismiss)),
+                ("Close panel or mark channel read", Box::new(Dismiss)),
                 ("Settings", Box::new(ShowSettings)),
             ];
             let theme = cx.theme();
@@ -714,8 +724,10 @@ impl Workspace {
             let fixed = [
                 ("Send", "Enter".to_string()),
                 ("New line", "Shift-Enter".to_string()),
-                ("Edit your last message", "Up".to_string()),
-                ("Complete a slash command", "Tab".to_string()),
+                ("Edit your last message (empty field)", "Up".to_string()),
+                ("Select a slash suggestion", "Up / Down".to_string()),
+                ("Dismiss suggestions or cancel edit", "Escape".to_string()),
+                ("Complete the selected slash command", "Tab".to_string()),
                 ("Zoom in, out, actual size", zoom.join(" ")),
             ];
             // Dialog accepts pixels and clamps this rem-derived width to the viewport.
@@ -1132,6 +1144,7 @@ mod tests {
             gpui_kit::init(cx);
             update::init(cx);
             crate::actions::init(cx);
+            extensions::init(cx);
         });
         let client = Client::new_unverified(&server.url(), "token").unwrap();
         let mut me = User::default();
@@ -1434,5 +1447,159 @@ mod tests {
             assert!(!w.showing_threads);
             assert!(w.thread.is_some());
         });
+    }
+    #[gpui_kit::test]
+    fn composer_focus_follows_the_visible_pane(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (handle, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| w.session.read(cx).is_loaded())
+        });
+        cx.simulate_window_resize(handle, size(px(650.), px(800.)));
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| {
+                w.open_channel(&"town".into(), window, cx);
+                w.open_thread("town".into(), "root".into(), window, cx);
+            });
+            window.render_frame(cx);
+            window.press("secondary-l", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            let w = workspace.read(cx);
+            assert!(w.side_replaces_content);
+            assert!(
+                w.thread
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+            assert!(!w.active_view().unwrap().focus_handle(cx).is_focused(window));
+            window.input("/", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(
+                workspace
+                    .read(cx)
+                    .thread
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .read(cx)
+                    .draft(cx),
+                Some("/".into())
+            );
+            window.render_frame(cx);
+            assert!(
+                window.try_find("command-me").is_some(),
+                "suggestions must be visible"
+            );
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, cx| {
+            let thread = &w
+                .thread
+                .as_ref()
+                .expect("Escape only dismisses suggestions")
+                .0;
+            assert_eq!(thread.read(cx).draft(cx), Some("/".into()));
+        });
+
+        cx.simulate_window_resize(handle, size(px(1400.), px(800.)));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("secondary-l", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert!(
+                workspace
+                    .read(cx)
+                    .active_view()
+                    .unwrap()
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        })
+        .unwrap();
+
+        cx.simulate_window_resize(handle, size(px(650.), px(800.)));
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| {
+                w.search_conversation(&SearchConversation, window, cx)
+            });
+            window.render_frame(cx);
+            window.press("secondary-l", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let w = workspace.read(cx);
+            assert!(!w.search_open);
+            assert!(w.active_view().unwrap().focus_handle(cx).is_focused(window));
+            workspace.update(cx, |w, cx| {
+                w.open_thread("town".into(), "root".into(), window, cx)
+            });
+            window.render_frame(cx);
+            window.click("close-thread", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let w = workspace.read(cx);
+            assert!(w.thread.is_none());
+            assert!(w.active_view().unwrap().focus_handle(cx).is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_switcher_finds_read_conversations_beyond_the_sidebar_limit(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            if request.path() == "/api/v4/users/me/teams/team/channels" {
+                let channels: Vec<_> = (0..25).map(|ix| json!({
+                    "id": format!("dm-{ix}"), "type": "D", "name": format!("me__person-{ix}"),
+                    "display_name": format!("Conversation {ix}"), "last_post_at": ix,
+                })).collect();
+                Reply::json(json!(channels))
+            } else {
+                route(request)
+            }
+        });
+        let (handle, workspace) = open_workspace(&server, cx);
+        wait_until(cx, |cx| {
+            workspace.read_with(cx, |w, cx| w.session.read(cx).channels().count() == 25)
+        });
+        workspace.read_with(cx, |w, cx| {
+            let session = w.session.read(cx);
+            assert!(
+                !crate::sidebar::sections(session, cx)
+                    .direct
+                    .contains(&"dm-0".into())
+            );
+            let all = crate::sidebar::conversation_sections(session, cx);
+            assert_eq!(all.direct.len(), 25);
+        });
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.quick_switch(&QuickSwitch, window, cx));
+            window.render_frame(cx);
+            window.input("me__person-0", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.press("enter", cx))
+            .unwrap();
+        cx.run_until_parked();
+        workspace.read_with(cx, |w, _| assert_eq!(w.active, Some("dm-0".into())));
     }
 }

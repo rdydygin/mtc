@@ -80,9 +80,10 @@ On Linux and Windows, use Ctrl where the table says ⌘, Alt for ⌥, and Shift 
 | ⌥⇧↑ / ⌥⇧↓ | Previous / next unread channel |
 | Enter / ⇧Enter | Send / new line |
 | ↑ in an empty field | Edit your last message |
-| Tab | Complete a slash command |
-| Esc | Close the thread, or mark the channel read |
-| ⌘L | Focus the message field |
+| ↑ / ↓ in slash suggestions | Select a command |
+| Tab | Complete the selected slash command |
+| Esc | Dismiss slash suggestions, cancel an edit, close the panel, or mark the channel read |
+| ⌘L | Focus the visible conversation’s message field (reveals the channel if search replaces it) |
 | ⌘W | Close the conversation (keeps its draft) |
 | ⌘= / ⌘- / ⌘0 | Zoom in / out / actual size |
 | ⌘/ | All shortcuts |
@@ -109,6 +110,8 @@ opens one. A message scrolls into view in the conversation and is marked for a m
 (older messages load as needed); a reply opens in its thread, with a button back to the
 results. Mattermost's search syntax works, such as `"exact phrase"`, `from:username`,
 and `-word`. The last word you type also matches longer words that start with it.
+
+Editing keeps your unsent text and attachments; saving or canceling restores them.
 
 Right-click a message to reply, react, copy its text or Mattermost link, edit, or delete
 it. Click a message to open its replies in a thread panel beside the channel (collapsed reply threads); the reply

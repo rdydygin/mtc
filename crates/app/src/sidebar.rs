@@ -58,6 +58,23 @@ impl ChannelSections {
 }
 
 pub fn sections(session: &Session, cx: &App) -> ChannelSections {
+    let mut sections = conversation_sections(session, cx);
+    let active = session.active_channel();
+    let mut ix = 0;
+    sections.direct.retain(|id| {
+        let recent = ix < DIRECT_MESSAGE_LIMIT;
+        ix += 1;
+        recent
+            || Some(id) == active
+            || session
+                .channel(id)
+                .is_some_and(|e| e.is_unread() || e.mention_count() > 0)
+    });
+    sections
+}
+
+/// Every conversation, grouped for navigation before the sidebar's limit.
+pub fn conversation_sections(session: &Session, cx: &App) -> ChannelSections {
     let mut favorites: Vec<(&ChannelEntry, String)> = Vec::new();
     let mut channels: Vec<(&ChannelEntry, String)> = Vec::new();
     let mut direct: Vec<&ChannelEntry> = Vec::new();
@@ -73,22 +90,10 @@ pub fn sections(session: &Session, cx: &App) -> ChannelSections {
     favorites.sort_by(|a, b| a.1.cmp(&b.1));
     channels.sort_by(|a, b| a.1.cmp(&b.1));
     direct.sort_by_key(|e| std::cmp::Reverse(e.last_activity()));
-    let active = session.active_channel();
-    let direct = direct
-        .into_iter()
-        .enumerate()
-        .filter(|(ix, e)| {
-            *ix < DIRECT_MESSAGE_LIMIT
-                || e.is_unread()
-                || e.mention_count() > 0
-                || Some(e.id()) == active
-        })
-        .map(|(_, e)| e.id().clone())
-        .collect();
     ChannelSections {
         favorites: favorites.into_iter().map(|(e, _)| e.id().clone()).collect(),
         channels: channels.into_iter().map(|(e, _)| e.id().clone()).collect(),
-        direct,
+        direct: direct.into_iter().map(|e| e.id().clone()).collect(),
     }
 }
 
@@ -553,10 +558,11 @@ impl SidebarView {
         let status = session.directory().read(cx).status(&me.id);
         let connection = session.connection();
         let theme = cx.theme();
-        let dot = match connection {
-            Connection::Online => Self::status_color(status, cx),
-            Connection::Connecting => theme.muted_foreground,
-            Connection::Offline => theme.warning,
+        let dot = Self::status_color(status, cx);
+        let connection_label = match connection {
+            Connection::Online => "Connected",
+            Connection::Connecting => "Connecting…",
+            Connection::Offline => "Reconnecting…",
         };
         let name = me.display_name();
         let trigger = Button::new("account")
@@ -564,7 +570,7 @@ impl SidebarView {
             .p_0()
             .size_10()
             .tooltip(name.clone())
-            .accessibility_label(format!("Account: {name}"))
+            .accessibility_label(format!("Account: {name}, {connection_label}"))
             .child(
                 div()
                     .relative()
@@ -936,6 +942,29 @@ impl Render for SidebarView {
                     .border_color(theme.border)
                     .bg(theme.background)
                     .child(self.render_header(cx))
+                    .when(
+                        self.session.read(cx).connection() != Connection::Online,
+                        |this| {
+                            this.child(
+                                h_flex()
+                                    .px_3()
+                                    .py_2()
+                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(Icon::new(IconName::RefreshCw).xsmall())
+                                    .child(
+                                        if self.session.read(cx).connection()
+                                            == Connection::Connecting
+                                        {
+                                            "Connecting…"
+                                        } else {
+                                            "Reconnecting…"
+                                        },
+                                    ),
+                            )
+                        },
+                    )
                     .child(
                         v_flex()
                             .id("conversation-list")
@@ -1036,9 +1065,9 @@ pub fn confirm_leave(
     };
     let title = format!("Leave {}?", session_ref.channel_label(entry, cx));
     let description = if entry.kind() == ChannelType::Private {
-        "It’s private, so someone in it will have to add you back."
+        "This channel is private. Ask someone in it to add you back."
     } else {
-        "It’s public, so you can join it again later."
+        "You can rejoin from Mattermost in your browser, or ask someone to add you back."
     };
     let session = session.clone();
     let channel = channel.clone();

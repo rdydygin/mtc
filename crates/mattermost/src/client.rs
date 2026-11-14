@@ -978,16 +978,16 @@ mod tests {
         let client = Client::new_unverified(&server.url(), "token").unwrap();
         let channels = block_on(client.my_channels(&TeamId::from("team"))).unwrap();
         assert_eq!(channels.len(), 400);
+        // Local probes may reach the server before the client's request.
         let requests = server.requests();
         let accept = requests
             .iter()
             .find(|r| {
                 r.method() == "GET" && r.path().starts_with("/api/v4/users/me/teams/team/channels")
             })
-            .unwrap()
+            .expect("the client requested channels")
             .header("accept-encoding")
-            .unwrap_or_default()
-            .to_string();
+            .unwrap_or_default();
         for encoding in ["gzip", "br", "zstd", "deflate"] {
             assert!(accept.contains(encoding), "Accept-Encoding: {accept}");
         }
