@@ -107,7 +107,13 @@ impl TimelineView {
                     .get(s.client().server().as_str(), s.me().id.as_str(), &kind)
             })
         });
-        let composer = cx.new(|cx| Composer::new(placeholder, draft, target, window, cx));
+        let composer = cx.new(|cx| {
+            Composer::new(placeholder, draft, target, window, cx).with_session(
+                session.clone(),
+                window,
+                cx,
+            )
+        });
         let directory = session.read(cx).directory().clone();
 
         let subscriptions = vec![
