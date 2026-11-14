@@ -771,6 +771,41 @@ impl Client {
             .await
     }
 
+    /// Open (or reuse) a group message. Include the current user's id.
+    pub async fn group_channel(&self, users: &[UserId]) -> Result<Channel> {
+        self.post("channels/group".into(), users.to_vec()).await
+    }
+
+    /// Public channels in a team, in zero-based pages. Archived channels are
+    /// excluded by the server and checked again by the session.
+    pub async fn public_channels(
+        &self,
+        team: &TeamId,
+        page: usize,
+        per_page: usize,
+    ) -> Result<Vec<Channel>> {
+        self.get(format!(
+            "teams/{team}/channels?page={page}&per_page={per_page}"
+        ))
+        .await
+    }
+
+    pub async fn search_public_channels(&self, team: &TeamId, term: &str) -> Result<Vec<Channel>> {
+        self.post(
+            format!("teams/{team}/channels/search"),
+            json!({ "term": term, "include_deleted": false }),
+        )
+        .await
+    }
+
+    pub async fn join_channel(&self, channel: &ChannelId, user: &UserId) -> Result<ChannelMember> {
+        self.post(
+            format!("channels/{channel}/members"),
+            json!({ "user_id": user }),
+        )
+        .await
+    }
+
     /// Run a server-side slash command such as `/invite` in `channel`.
     pub async fn execute_command(
         &self,
@@ -1017,6 +1052,59 @@ mod tests {
         assert_eq!(me.notify_props["desktop"], "none");
         let older_profile: User = serde_json::from_value(json!({"id":"me"})).unwrap();
         assert!(older_profile.notify_props.is_empty());
+    }
+
+    #[test]
+    fn discovery_requests_use_mattermost_v4_shapes() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("POST", "/api/v4/channels/direct" | "/api/v4/channels/group") => {
+                    Reply::json(json!({ "id": "conversation" }))
+                }
+                ("POST", "/api/v4/channels/public/members") => {
+                    Reply::json(json!({ "channel_id": "public", "user_id": "me" }))
+                }
+                _ => Reply::json(json!([])),
+            }
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        block_on(client.search_users("Ann", 50)).unwrap();
+        block_on(client.direct_channel(&"me".into(), &"ann".into())).unwrap();
+        block_on(client.group_channel(&["me".into(), "ann".into(), "ben".into()])).unwrap();
+        block_on(client.public_channels(&"team".into(), 2, 100)).unwrap();
+        block_on(client.search_public_channels(&"team".into(), "design")).unwrap();
+        block_on(client.join_channel(&"public".into(), &"me".into())).unwrap();
+        let requests = server.requests();
+        for (path, body) in [
+            (
+                "/api/v4/users/search",
+                json!({ "term": "Ann", "limit": 50, "allow_inactive": false }),
+            ),
+            ("/api/v4/channels/direct", json!(["me", "ann"])),
+            ("/api/v4/channels/group", json!(["me", "ann", "ben"])),
+            (
+                "/api/v4/teams/team/channels/search",
+                json!({ "term": "design", "include_deleted": false }),
+            ),
+            (
+                "/api/v4/channels/public/members",
+                json!({ "user_id": "me" }),
+            ),
+        ] {
+            let request = requests
+                .iter()
+                .find(|r| r.method() == "POST" && r.path() == path)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(request.body()).unwrap(),
+                body
+            );
+        }
+        assert!(requests.iter().any(|r| r.method() == "GET"
+            && r.path() == "/api/v4/teams/team/channels?page=2&per_page=100"));
     }
 
     #[test]
