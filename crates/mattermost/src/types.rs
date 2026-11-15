@@ -159,7 +159,9 @@ pub struct CustomStatus {
     /// `thirty_minutes`, `one_hour`, `four_hours`, `today`, `this_week`,
     /// `date_and_time`, or empty for "don't clear".
     pub duration: String,
-    /// RFC 3339; empty when the status doesn't expire.
+    /// RFC 3339; empty when the status doesn't expire. Omit an empty value on
+    /// writes: the server decodes this as a Go time.Time and rejects "".
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub expires_at: String,
 }
 

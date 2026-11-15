@@ -115,3 +115,70 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+
+  live-mattermost:
+    # Informational until this check is added to branch protection.
+    name: Live Mattermost contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      mattermost:
+        # Keep in sync with script/live-test. Preview includes its own database.
+        image: mattermost/mattermost-preview:10.11.26
+        ports:
+          - 8065:8065
+        env:
+          MM_SERVICESETTINGS_SITEURL: http://localhost:8065
+          MM_TEAMSETTINGS_ENABLEOPENSERVER: 'true'
+          MM_TEAMSETTINGS_ENABLEUSERCREATION: 'true'
+          MM_EMAILSETTINGS_REQUIREEMAILVERIFICATION: 'false'
+          MM_SERVICESETTINGS_COLLAPSEDTHREADS: always_on
+          MM_SERVICESETTINGS_ENABLECUSTOMEMOJI: 'true'
+          MM_SERVICESETTINGS_ENABLECOMMANDS: 'true'
+          MM_TEAMSETTINGS_ENABLECUSTOMUSERSTATUSES: 'true'
+    env:
+      MTC_LIVE_SERVER: http://localhost:8065
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install GPUI native dependencies
+        # gpui-pre-linux 0.3.11 enables Wayland + X11. xkbcommon and x11rb
+        # link xkbcommon[-x11]/xcb; fontconfig-sys and freetype-sys use pkg-config.
+        # WGPU needs the Vulkan loader. Tests use GPUI's in-process test platform,
+        # so no Xvfb, compositor or software rendering adapter is needed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config cmake \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-xkb-dev \
+            libvulkan1 libfontconfig1-dev libfreetype6-dev
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: linux-live
+          cache-on-failure: true
+          # Manual runs save too, so iterating on a branch isn't a cold build each time.
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+      - name: Wait for Mattermost
+        run: |
+          for attempt in $(seq 1 120); do
+            if curl --fail --silent "$MTC_LIVE_SERVER/api/v4/system/ping"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'Mattermost did not become ready at /api/v4/system/ping' >&2
+          exit 1
+      - run: cargo test --locked -p mattermost --test live -- --ignored --test-threads=1
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p session --test live -- --ignored --test-threads=1
+      - name: Mattermost server logs on failure
+        if: failure()
+        run: docker logs ${{ job.services.mattermost.id }}

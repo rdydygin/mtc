@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Disposable local Mattermost, matching CI. Leave running for repeat invocations.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+image=mattermost/mattermost-preview:10.11.26
+container=mtc-live-mattermost
+export MTC_LIVE_SERVER="${MTC_LIVE_SERVER:-http://localhost:8065}"
+if [[ "$MTC_LIVE_SERVER" == 'http://localhost:8065' ]]; then
+  if docker container inspect "$container" >/dev/null 2>&1; then
+    actual_image=$(docker inspect --format '{{.Config.Image}}' "$container")
+    if [[ "$actual_image" != "$image" ]]; then
+      echo "$container uses $actual_image; expected $image. Remove it with docker rm -f $container to reset." >&2
+      exit 1
+    fi
+    if [[ "$(docker inspect --format '{{.State.Running}}' "$container")" != true ]]; then
+      docker start "$container"
+    fi
+  else
+    docker run -d --name "$container" -p 127.0.0.1:8065:8065 \
+      -e MM_SERVICESETTINGS_SITEURL=http://localhost:8065 \
+      -e MM_TEAMSETTINGS_ENABLEOPENSERVER=true \
+      -e MM_TEAMSETTINGS_ENABLEUSERCREATION=true \
+      -e MM_EMAILSETTINGS_REQUIREEMAILVERIFICATION=false \
+      -e MM_SERVICESETTINGS_COLLAPSEDTHREADS=always_on \
+      -e MM_SERVICESETTINGS_ENABLECUSTOMEMOJI=true \
+      -e MM_SERVICESETTINGS_ENABLECOMMANDS=true \
+      -e MM_TEAMSETTINGS_ENABLECUSTOMUSERSTATUSES=true \
+      "$image"
+  fi
+fi
+ready=false
+for ((attempt=0; attempt<120; attempt++)); do
+  if curl --fail --silent "$MTC_LIVE_SERVER/api/v4/system/ping"; then
+    ready=true
+    break
+  fi
+  sleep 2
+done
+if [[ "$ready" != true ]]; then
+  echo "Mattermost did not become ready: GET $MTC_LIVE_SERVER/api/v4/system/ping" >&2
+  docker logs "$container" >&2 || true
+  exit 1
+fi
+cargo test --locked -p mattermost --test live -- --ignored --test-threads=1
+cargo test --locked -p session --test live -- --ignored --test-threads=1

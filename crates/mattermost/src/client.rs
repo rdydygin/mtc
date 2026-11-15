@@ -301,19 +301,21 @@ impl Client {
         .await
     }
 
-    /// Update only the supplied channel notification properties.
+    /// Update the channel's unread notification property. The server returns
+    /// a status acknowledgement; fetch [`Self::my_channel_member`] for state.
     pub async fn set_channel_muted(
         &self,
         channel: &ChannelId,
         user: &UserId,
         muted: bool,
-    ) -> Result<ChannelMember> {
-        self.request(
+    ) -> Result<()> {
+        self.request::<serde_json::Value, _>(
             Method::PUT,
             format!("channels/{channel}/members/{user}/notify_props"),
             Some(json!({ "mark_unread": if muted { "mention" } else { "all" } })),
         )
         .await
+        .map(|_| ())
     }
 
     /// The newest `per_page` posts of a channel.
@@ -544,7 +546,8 @@ impl Client {
         self.post("users/usernames".into(), usernames).await
     }
 
-    /// The members of each group message, keyed by channel. The server
+    /// The other participants of each group message, keyed by channel (the
+    /// authenticated user is excluded). The server
     /// names group messages after members' usernames; clients rebuild the
     /// name from these profiles.
     pub async fn group_channel_members(
@@ -1022,6 +1025,149 @@ mod tests {
 
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         futures::executor::block_on(future)
+    }
+
+    #[test]
+    fn live_notify_props_put_acknowledges_without_fabricating_a_member() {
+        // Real PUT acknowledgement and WS/GET member shape from run-1 lines
+        // 1977-1981: PUT does not return the member represented by the event.
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (request.method(), request.path()) {
+                (
+                    "PUT",
+                    "/api/v4/channels/zjc6secg53nw8xd9yeh666o3oa/members/a8k4gfhkztyebfhamasuxs8qqy/notify_props",
+                ) => {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(request.body()).unwrap(),
+                        json!({"mark_unread":"mention"})
+                    );
+                    Reply::json(
+                        serde_json::from_str::<serde_json::Value>(include_str!(
+                            "../tests/fixtures/run-1-notify-props-response.json"
+                        ))
+                        .unwrap(),
+                    )
+                }
+                ("GET", "/api/v4/channels/zjc6secg53nw8xd9yeh666o3oa/members/me") => Reply::json(
+                    serde_json::from_str::<serde_json::Value>(include_str!(
+                        "../tests/fixtures/run-1-channel-member.json"
+                    ))
+                    .unwrap(),
+                ),
+                _ => Reply::not_found(),
+            }
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let channel = ChannelId::from("zjc6secg53nw8xd9yeh666o3oa");
+        let user = UserId::from("a8k4gfhkztyebfhamasuxs8qqy");
+        let () = block_on(client.set_channel_muted(&channel, &user, true)).unwrap();
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.method() == "PUT" && r.path().ends_with("/notify_props"))
+                .count(),
+            1,
+            "one notification mutation"
+        );
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|r| r.path().ends_with("/members/me")),
+            "mutation only acknowledges; caller chooses when to read"
+        );
+        let member = block_on(client.my_channel_member(&channel)).unwrap();
+        assert_eq!(member.channel_id, channel);
+        assert!(member.is_muted());
+    }
+
+    #[test]
+    fn live_custom_status_request_omits_an_empty_go_timestamp() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            if request.method() != "PUT" || request.path() != "/api/v4/users/me/status/custom" {
+                return Reply::not_found();
+            }
+            let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+            // Reproduce the real rejection (run-1 lines 1733-1737) if an empty
+            // Go time.Time value reappears; non-expiring statuses omit the field.
+            // Server line 3769: parsing time "" as "2006-01-02T15:04:05Z07:00":
+            // cannot parse "" as "2006".
+            if body.get("expires_at") == Some(&json!("")) {
+                return Reply::json(
+                    serde_json::from_str::<serde_json::Value>(include_str!(
+                        "../tests/fixtures/run-1-custom-status-rejected.json"
+                    ))
+                    .unwrap(),
+                )
+                .status(400);
+            }
+            Reply::json(json!({"status":"OK"}))
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let status: CustomStatus = serde_json::from_str(include_str!(
+            "../tests/fixtures/run-1-custom-status-request.json"
+        ))
+        .unwrap();
+        block_on(client.set_custom_status(status)).unwrap();
+        block_on(
+            client.set_custom_status(
+                CustomStatus::new("calendar", "Meeting")
+                    .expiring("date_and_time", "2030-11-07T18:00:00Z"),
+            ),
+        )
+        .unwrap();
+        let requests: Vec<_> = server
+            .requests()
+            .into_iter()
+            .filter(|r| r.method() == "PUT" && r.path() == "/api/v4/users/me/status/custom")
+            .collect();
+        assert_eq!(requests.len(), 2);
+        let no_expiry: serde_json::Value = serde_json::from_slice(requests[0].body()).unwrap();
+        assert_eq!(
+            no_expiry,
+            json!({"emoji":"calendar","text":"Live contract","duration":""})
+        );
+        let expiring: serde_json::Value = serde_json::from_slice(requests[1].body()).unwrap();
+        assert_eq!(expiring["expires_at"], "2030-11-07T18:00:00Z");
+        assert_eq!(expiring["duration"], "date_and_time");
+    }
+
+    #[test]
+    fn live_group_channel_profiles_exclude_the_authenticated_user() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            if request.method() == "POST" && request.path() == "/api/v4/users/group_channels" {
+                Reply::json(
+                    serde_json::from_str::<serde_json::Value>(include_str!(
+                        "../tests/fixtures/run-1-group-channel-users.json"
+                    ))
+                    .unwrap(),
+                )
+            } else {
+                Reply::not_found()
+            }
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let groups =
+            block_on(client.group_channel_members(vec!["n74jn8odc7gnipzfiigs9zwnba".into()]))
+                .unwrap();
+        let users = &groups[&ChannelId::from("n74jn8odc7gnipzfiigs9zwnba")];
+        assert_eq!(users.len(), 2);
+        assert!(
+            users
+                .iter()
+                .any(|u| u.id.as_str() == "pcf3ufs95tdjfcdhfowm8hrhqe")
+        );
+        assert!(
+            users
+                .iter()
+                .any(|u| u.id.as_str() == "936gu3kaotr6dppm6kxujfo1no")
+        );
+        assert!(
+            !users
+                .iter()
+                .any(|u| u.id.as_str() == "j1bs8njy63fg3ywiqtexfwna5y")
+        );
     }
 
     #[test]
