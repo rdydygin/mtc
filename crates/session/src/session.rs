@@ -2499,6 +2499,12 @@ mod slow_network_tests {
         let server = SlowServer::start(Network::new(Duration::ZERO), {
             let version = version.clone();
             move |request| {
+                if request.method() == "GET" && request.path() == "/api/v4/users/me/teams" {
+                    return Reply::json(json!([
+                        {"id":"team", "name":"team"},
+                        {"id":"other", "name":"other"}
+                    ]));
+                }
                 if request.method() == "GET"
                     && matches!(
                         request.path(),
@@ -2523,7 +2529,9 @@ mod slow_network_tests {
                     .is_some_and(|c| c.trigger() == name)
             })
         };
-        wait_until(cx, |cx| loaded(cx, "cmd1"));
+        wait_until(cx, |cx| {
+            session.read_with(cx, |s, _| s.teams_loaded()) && loaded(cx, "cmd1")
+        });
         let count = || {
             server
                 .requests()
