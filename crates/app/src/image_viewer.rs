@@ -18,8 +18,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, InteractiveElement as _, IntoElement, KeyDownEvent, ObjectFit,
-    ParentElement as _, Pixels, SharedString, Size, Styled as _, StyledImage as _, Window, div,
-    img, px, size,
+    ParentElement as _, Pixels, SharedString, Size, Styled as _, StyledImage as _, WeakEntity,
+    Window, div, img, px, size,
 };
 use mattermost::{Client, FileInfo};
 
@@ -60,23 +60,33 @@ struct ViewerImage {
 
 /// URL images share the file viewer's sizing, cache, focus and dismissal. They
 /// have no Mattermost file ID, so do not offer a file-API download command.
-pub(crate) fn open_remote(url: SharedString, window: &mut Window, cx: &mut App) {
+pub(crate) fn open_remote(
+    url: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<WeakEntity<crate::image_scope::ImageStore>> {
     let mut file = FileInfo::default();
     file.name = "Attachment image".into();
-    open_images(None, vec![ViewerImage { file, url }], 0, window, cx);
+    open_images(None, vec![ViewerImage { file, url }], 0, window, cx)
 }
 
+/// Returns the store of the pictures shown, which lasts as long as the
+/// viewer, if it opened.
 fn open_images(
     client: Option<Client>,
     images: Vec<ViewerImage>,
     index: usize,
     window: &mut Window,
     cx: &mut App,
-) {
+) -> Option<WeakEntity<crate::image_scope::ImageStore>> {
     if images.is_empty() || window.has_active_dialog(cx) {
-        return;
+        return None;
     }
     let images: Rc<[ViewerImage]> = images.into();
+    // Full-size pictures are the largest images drawn. Held by the dialog,
+    // not GPUI's app-wide store, they are freed when the viewer closes.
+    let pictures = crate::image_scope::ImageStore::new(cx);
+    let shown_pictures = pictures.downgrade();
     let current = cx.new(|_| index.min(images.len() - 1));
     let focus = cx.focus_handle();
     let initial_focus = Cell::new(true);
@@ -119,6 +129,7 @@ fn open_images(
             }
         };
         let picture = img(images[ix].url.clone())
+            .image_cache(&pictures)
             .w(shown.width)
             .h(shown.height)
             .object_fit(ObjectFit::Contain)
@@ -222,6 +233,7 @@ fn open_images(
                     ),
             )
     });
+    Some(shown_pictures)
 }
 
 /// The size to draw `file` at: its own, scaled down to fit `bounds`. A
@@ -272,6 +284,64 @@ mod tests {
         file.name = format!("{id}.png");
         file.mime_type = "image/png".into();
         file
+    }
+
+    /// The viewer holds the full-size pictures it shows, and frees them
+    /// when it closes; GPUI's app-wide store would keep them for the run.
+    #[gpui_kit::test]
+    fn the_viewer_frees_its_pictures_when_it_closes(cx: &mut TestAppContext) {
+        use gpui_kit::{ImgResourceLoader, Resource};
+        cx.update(gpui_kit::init);
+        let window = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| Blank))
+                .unwrap()
+                .0
+        });
+        cx.update(crate::http::PictureClient::install);
+        let url = "https://example.com/full.png";
+        let shared = Resource::Uri(url.into());
+        let pictures = cx
+            .update_window(window, |_, window, cx| {
+                let pictures = open_remote(url.into(), window, cx).unwrap();
+                window.render_frame(cx);
+                pictures
+            })
+            .unwrap();
+        // The picture is fetched and decoded on the test executor, then
+        // painted from the viewer's store.
+        let mut painted = None;
+        for _ in 0..20 {
+            cx.run_until_parked();
+            painted = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    match pictures.upgrade()?.read(cx).get(&shared) {
+                        Some(Ok(image)) if window.has_image_atlas_entry(&image) => Some(image),
+                        _ => None,
+                    }
+                })
+                .unwrap();
+            if painted.is_some() {
+                break;
+            }
+        }
+        let painted = painted.expect("the viewer paints its picture");
+        assert!(!cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&shared)));
+        cx.update_window(window, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(pictures.upgrade().is_none(), "closing frees the pictures");
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                !window.has_image_atlas_entry(&painted),
+                "and takes them out of the GPU atlas"
+            );
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

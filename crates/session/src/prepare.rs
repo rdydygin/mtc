@@ -148,6 +148,15 @@ pub fn custom_emoji_names(text: &str) -> Vec<Cow<'_, str>> {
     names
 }
 
+/// Whether `text` writes a Markdown image. Whether one counts against a
+/// post's picture budget depends on whether its alt names a server emoji,
+/// and Markdown decodes the alt (`&#58;party&#58;` is `:party:`) where no
+/// shortcode scan sees it; so such text may read differently after any
+/// custom emoji change. Image syntax always begins with a literal `![`.
+pub(crate) fn has_markdown_image(text: &str) -> bool {
+    text.contains("![")
+}
+
 /// The name in an emoji field such as a custom status, which some clients
 /// fill with the shortcode (`:tada:`) rather than the name (`tada`).
 pub fn emoji_name(field: &str) -> &str {

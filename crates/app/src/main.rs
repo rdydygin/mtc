@@ -19,6 +19,7 @@ mod emoji_picker;
 mod extensions;
 mod http;
 mod image_guard;
+mod image_scope;
 mod image_viewer;
 #[cfg(any(not(target_os = "macos"), test))]
 mod instance;

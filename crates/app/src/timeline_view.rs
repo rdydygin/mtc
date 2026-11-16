@@ -56,6 +56,12 @@ pub struct TimelineView {
     timeline: Entity<Timeline>,
     scroller: Entity<PostScrollerState>,
     composer: Entity<Composer>,
+    /// Decoded avatars, emoji, and pictures shown in this conversation's
+    /// posts and their popovers. GPUI's default image store keeps every
+    /// image for the whole run; these go, from memory and the GPU atlas,
+    /// with the view. Only rows and popover content draw inside it (see
+    /// [`crate::image_scope`]), so the composer still redraws on its own.
+    images: Entity<crate::image_scope::ImageStore>,
     /// Row identities before the next timeline event, for scroll anchoring.
     row_ids: Vec<PostId>,
     /// Parsed Markdown for live rich posts, kept so
@@ -142,6 +148,7 @@ impl TimelineView {
             timeline,
             scroller,
             composer,
+            images: crate::image_scope::ImageStore::new(cx),
             row_ids: Vec::new(),
             rich_text: HashMap::new(),
             attachment_cards: HashMap::new(),
@@ -725,7 +732,7 @@ impl TimelineView {
             });
         });
 
-        PostRow::new(entry.clone(), session.me().id.clone(), on_action)
+        let row = PostRow::new(entry.clone(), session.me().id.clone(), on_action)
             .saved(session.is_saved(&post.id))
             .has_permalink(session.team().is_some() && entry.delivery() == session::Delivery::Sent)
             .author(author, avatar)
@@ -742,7 +749,10 @@ impl TimelineView {
             .custom_emoji(session.custom_emoji().clone())
             .emoji_store(session.emoji_store().clone())
             .reaction_focus_fallback(self.composer.focus_handle(cx))
-            .into_any_element()
+            .image_cache(self.images.clone());
+        // Each row draws inside the cache: the list lays rows out while it
+        // prepaints, and their pictures must not reach the app-wide store.
+        crate::image_scope::image_scope(&self.images, row).into_any_element()
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -885,11 +895,18 @@ impl TimelineView {
                     ),
             );
         let details = Rc::new(details);
+        let images = self.images.clone();
         let details_popover = Popover::new("channel-details")
             .anchor(gpui_kit::Anchor::TopLeft)
             .trigger_style(StyleRefinement::default().flex_1().min_w_0())
             .trigger(trigger)
-            .content(move |_, _, cx| render_header_details(&title, &details, cx));
+            .content(move |_, _, cx| {
+                // Header Markdown can show custom emoji.
+                crate::image_scope::in_image_scope(
+                    Some(&images),
+                    render_header_details(&title, &details, cx),
+                )
+            });
         h_flex()
             .flex_none()
             .h_16()
@@ -1293,6 +1310,154 @@ mod tests {
                     && r.path().contains("before=")
             })
             .count()
+    }
+
+    const PICTURE: &str = "https://example.com/picture.png";
+
+    /// A channel whose posts are by Ann, who has a picture, drawn with her
+    /// group's first row, and so her avatar, on screen. That row's message
+    /// is Markdown with a picture of its own.
+    fn open_with_author_avatar(
+        cx: &mut TestAppContext,
+    ) -> (SlowServer, Entity<TimelineView>, gpui_kit::AnyWindowHandle) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            // Stray local connections reach test ports too: answer by method
+            // and path.
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("POST", "/api/v4/users/ids") => Reply::json(json!([
+                    { "id": "ann", "username": "ann", "last_picture_update": 1 },
+                ])),
+                // Nothing older, so Ann's group keeps starting at n60.
+                ("GET", "/api/v4/channels/town/posts") if request.path().contains("before=") => {
+                    Reply::json(json!({}))
+                }
+                ("GET", "/api/v4/channels/town/posts") => {
+                    let mut page = posts(60..120);
+                    page["posts"]["n60"]["message"] = json!(format!("**look** ![pic]({PICTURE})"));
+                    Reply::json(page)
+                }
+                _ => route(request),
+            }
+        });
+        let (view, _) = open_channel(&server, cx);
+        cx.update(crate::http::PictureClient::install);
+        let ann = mattermost::UserId::from("ann");
+        // The directory asks the test server, over the network, about Ann.
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, cx| {
+                let session = v.session.read(cx);
+                session.directory().read(cx).user(&ann).is_some()
+            })
+        });
+        let handle = cx.update(|cx| *cx.windows().last().unwrap());
+        view.update(cx, |v, cx| {
+            v.scroller.update(cx, |s, cx| s.scroll_to_item(0, cx));
+        });
+        (server, view, handle)
+    }
+
+    fn ann_avatar(view: &Entity<TimelineView>, cx: &mut TestAppContext) -> gpui_kit::Resource {
+        view.read_with(cx, |v, cx| {
+            let client = v.session.read(cx).client().clone();
+            gpui_kit::Resource::Uri(avatar_url(&client, "ann", 1).into())
+        })
+    }
+
+    /// Draw until each of `pictures` has decoded, in the view's own store,
+    /// and been painted into the window's atlas. The pictures come from
+    /// [`crate::http::PictureClient`] and decode on the test executor, and
+    /// Markdown is parsed there too, so a few frames settle it.
+    fn draw_until_painted(
+        view: &Entity<TimelineView>,
+        handle: gpui_kit::AnyWindowHandle,
+        pictures: &[gpui_kit::Resource],
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        for _ in 0..20 {
+            cx.run_until_parked();
+            let painted = cx
+                .update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    let store = view.read(cx).images.read(cx);
+                    pictures.iter().all(|picture| {
+                        matches!(
+                            store.get(picture),
+                            Some(Ok(image)) if window.has_image_atlas_entry(&image)
+                        )
+                    })
+                })
+                .unwrap();
+            if painted {
+                return;
+            }
+        }
+        let states = view.read_with(cx, |v, cx| {
+            let store = v.images.read(cx);
+            pictures
+                .iter()
+                .map(|picture| format!("{picture:?}: {:?}", store.get(picture).map(|r| r.is_ok())))
+                .collect::<Vec<_>>()
+        });
+        panic!("pictures never painted from the view's store: {states:?}");
+    }
+
+    #[gpui_kit::test]
+    fn post_images_belong_to_the_view_and_go_with_it(cx: &mut TestAppContext) {
+        use gpui_kit::{ImgResourceLoader, Resource};
+        let (_server, view, handle) = open_with_author_avatar(cx);
+        let pictures = [ann_avatar(&view, cx), Resource::Uri(PICTURE.into())];
+        // The avatar draws at once; the Markdown picture once the message
+        // is parsed, off the UI thread.
+        draw_until_painted(&view, handle, &pictures, cx);
+        // Rows are laid out while the list prepaints, and Markdown pictures
+        // while the text prepaints: neither may reach the app-wide store.
+        for picture in &pictures {
+            assert!(
+                !cx.update(|cx| cx.has_asset::<ImgResourceLoader>(picture)),
+                "{picture:?} stays out of the app-wide store"
+            );
+        }
+        let images = view.read_with(cx, |v, _| v.images.downgrade());
+        cx.update_window(handle, |_, window, _| window.remove_window())
+            .unwrap();
+        drop(view);
+        // GPUI releases dropped entities when it next flushes effects.
+        cx.update(|_| {});
+        cx.run_until_parked();
+        assert!(
+            images.upgrade().is_none(),
+            "the view's images were released"
+        );
+    }
+
+    /// Popovers paint after the rest of the window, outside the row's
+    /// image scope; their pictures must not fall back to the app-wide
+    /// store, which keeps them for the whole run.
+    #[gpui_kit::test]
+    fn profile_popover_pictures_paint_from_the_view_cache(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        let (_server, view, handle) = open_with_author_avatar(cx);
+        let avatar = ann_avatar(&view, cx);
+        draw_until_painted(&view, handle, std::slice::from_ref(&avatar), cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within("n60").click("author-avatar", cx);
+            window.render_frame(cx);
+            assert!(
+                !window.find_all("profile-message").is_empty(),
+                "the profile is open"
+            );
+        })
+        .unwrap();
+        draw_until_painted(&view, handle, std::slice::from_ref(&avatar), cx);
+        assert!(
+            !cx.update(|cx| cx.has_asset::<gpui_kit::ImgResourceLoader>(&avatar)),
+            "the popover's picture stays out of the app-wide store"
+        );
     }
 
     #[gpui_kit::test]

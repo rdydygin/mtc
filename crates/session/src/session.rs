@@ -2118,7 +2118,9 @@ impl Session {
                 team_id,
                 user_id,
             } => {
-                self.load_channels(cx);
+                if self.channel_list_may_change(&name, &team_id, &user_id) {
+                    self.load_channels(cx);
+                }
                 let in_team = team_id.is_empty() || self.team.as_ref() == Some(&team_id);
                 let discovery_changed = matches!(
                     name.as_str(),
@@ -2212,6 +2214,24 @@ impl Session {
             }
             _ => {}
         }
+    }
+
+    /// Whether a channel event can change the current team's channel list or
+    /// the user's memberships. Each reload refetches every channel and
+    /// membership in the team, so the frequent events that cannot (people
+    /// joining or leaving channels the user is in, changes in other teams)
+    /// are ignored.
+    fn channel_list_may_change(&self, name: &str, team_id: &TeamId, user_id: &UserId) -> bool {
+        let other_team =
+            !team_id.is_empty() && self.team.as_ref().is_some_and(|current| current != team_id);
+        // The removed user's own `user_removed` frame names no user.
+        let someone_else = !user_id.is_empty()
+            && user_id != &self.me.id
+            && matches!(
+                name,
+                "user_added" | "user_removed" | "added_to_team" | "leave_team"
+            );
+        !other_team && !someone_else
     }
 
     /// Clear unread state for channels read on this or another device.
@@ -2613,6 +2633,57 @@ mod slow_network_tests {
             });
             cx.run_until_parked();
             assert_eq!(invalidations.get(), expected, "{name} in {team} for {user}");
+        }
+    }
+
+    #[gpui_kit::test]
+    fn channel_list_reloads_only_for_events_that_can_change_it(cx: &mut TestAppContext) {
+        const LIST: &str = "/api/v4/users/me/teams/team/channels";
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        let lists = || {
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.method() == "GET" && r.path().split('?').next() == Some(LIST))
+                .count()
+        };
+        let mut expected = lists();
+        for (name, team, user, reloads) in [
+            ("user_added", "team", "ann", false),
+            ("user_removed", "team", "ben", false),
+            ("leave_team", "team", "ann", false),
+            ("added_to_team", "team", "ann", false),
+            ("channel_created", "other", "", false),
+            ("channel_updated", "other", "me", false),
+            ("user_added", "other", "me", false),
+            ("user_added", "team", "me", true),
+            // The removed user's own frame carries no user id.
+            ("user_removed", "", "", true),
+            ("channel_updated", "team", "", true),
+            ("direct_added", "", "me", true),
+        ] {
+            session.update(cx, |s, cx| {
+                s.handle_event(
+                    mattermost::Event::ChannelsChanged {
+                        name: name.into(),
+                        team_id: team.into(),
+                        user_id: user.into(),
+                    },
+                    cx,
+                );
+                // A reload shows the sidebar loading at once.
+                assert_eq!(!s.is_loaded(), reloads, "{name} in {team} for {user}");
+            });
+            if reloads {
+                expected += 1;
+                wait_until(cx, |cx| {
+                    lists() >= expected && session.read_with(cx, |s, _| s.is_loaded())
+                });
+            }
+            cx.run_until_parked();
+            assert_eq!(lists(), expected, "{name} in {team} for {user}");
         }
     }
 

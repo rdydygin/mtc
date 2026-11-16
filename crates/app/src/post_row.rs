@@ -41,7 +41,9 @@ use gpui_kit::{
 use mattermost::{Client, FileInfo, Status, User, UserId};
 use session::{CustomEmojis, Delivery, Directory, Entry, UsernameLookup};
 
-use crate::{composer::format_size, extensions, http::avatar_url, time};
+use crate::{
+    composer::format_size, extensions, http::avatar_url, image_scope::in_image_scope, time,
+};
 
 /// The largest an inline image is drawn, in logical pixels. Images keep
 /// their aspect ratio; this bounds raster content, not interface layout.
@@ -105,6 +107,7 @@ pub struct PostRow {
     custom_emoji: CustomEmojis,
     emoji_store: Option<Entity<session::EmojiStore>>,
     reaction_focus_fallback: Option<FocusHandle>,
+    images: Option<Entity<crate::image_scope::ImageStore>>,
     saved: bool,
     has_permalink: bool,
     on_action: PostActionHandler,
@@ -130,6 +133,7 @@ impl PostRow {
             custom_emoji: CustomEmojis::default(),
             emoji_store: None,
             reaction_focus_fallback: None,
+            images: None,
             saved: false,
             has_permalink: false,
             on_action,
@@ -220,6 +224,12 @@ impl PostRow {
     /// A surviving focus target owned by the timeline when this row leaves the list.
     pub fn reaction_focus_fallback(mut self, focus: FocusHandle) -> Self {
         self.reaction_focus_fallback = Some(focus);
+        self
+    }
+
+    /// The image cache the row is drawn in, for its popovers to paint from.
+    pub fn image_cache(mut self, images: Entity<crate::image_scope::ImageStore>) -> Self {
+        self.images = Some(images);
         self
     }
 
@@ -401,6 +411,7 @@ impl PostRow {
         let me = self.me.clone();
         let custom_emoji = self.custom_emoji.clone();
         let on_action = self.on_action.clone();
+        let images = self.images.clone();
         let close = mention.clone();
         Some(
             Popover::new("mention-profile")
@@ -431,7 +442,10 @@ impl PostRow {
                         custom_emoji: custom_emoji.clone(),
                         user,
                     };
-                    render_profile(&profile, popover, &on_action, cx)
+                    in_image_scope(
+                        images.as_ref(),
+                        render_profile(&profile, popover, &on_action, cx),
+                    )
                 })
                 .into_any_element(),
         )
@@ -770,12 +784,16 @@ impl PostRow {
             custom_emoji: self.custom_emoji.clone(),
         };
         let on_action = self.on_action.clone();
+        let images = self.images.clone();
         Popover::new(id)
             .anchor(Anchor::TopLeft)
             .trigger(trigger)
             .content(move |_, _, cx| {
                 let popover = cx.entity();
-                render_profile(&profile, popover, &on_action, cx)
+                in_image_scope(
+                    images.as_ref(),
+                    render_profile(&profile, popover, &on_action, cx),
+                )
             })
             .into_any_element()
     }
@@ -884,6 +902,7 @@ impl RenderOnce for PostRow {
             .filter(|_| self.entry.delivery() == Delivery::Sent)
             .map(|(client, store)| {
                 let on_action = self.on_action.clone();
+                let images = self.images.clone();
                 window.use_keyed_state(
                     SharedString::from(format!("post-emoji-{}", post.id)),
                     cx,
@@ -893,6 +912,7 @@ impl RenderOnce for PostRow {
                             store,
                             on_action,
                             self.reaction_focus_fallback.clone(),
+                            images,
                             window,
                             cx,
                         )
