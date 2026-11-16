@@ -142,7 +142,14 @@ fn links_to_drawable(document: &Document, value: &str) -> bool {
     let (Some(target), None) = (targets.next(), targets.next()) else {
         return false;
     };
-    svg_element(&target, &DRAWABLE)
+    // usvg indexes only an element's first id-like attribute; with one, in
+    // any namespace, there is no choice to get wrong.
+    let ids = target
+        .attributes()
+        .filter(|attribute| attribute.name() == "id")
+        .count();
+    ids == 1
+        && svg_element(&target, &DRAWABLE)
         && target
             .ancestors()
             .skip(1)
@@ -254,7 +261,13 @@ mod tests {
             r##"<x:rect xmlns:x="urn:x" id="r"/><filter id="f"><feImage href="#r"/></filter><rect width="1" height="1" filter="url(#f)"/>"##.into(),
             r##"<style id="r"/><filter id="f"><feImage href="#r"/></filter><rect width="1" height="1" filter="url(#f)"/>"##.into(),
             // Only resolved when the text is laid out, so only with fonts.
-            r#"<defs><filter id="f"><feImage href="/dev/zero"/></filter></defs><text x="10" y="30" filter="url(#f)">Hello</text>"#.into(),
+            r#"<defs><filter id="f"><feImage href="/dev/zero"/></filter></defs><text x="10" y="30" font-family="MtcTest" filter="url(#f)">A</text>"#.into(),
+            // usvg indexes only an element's first id-like attribute, so a
+            // fragment naming a later one names nothing usvg keeps.
+            r##"<rect id="visible" xml:id="r" width="1" height="1"/><filter id="f"><feImage href="#r"/></filter><rect width="10" height="10" filter="url(#f)"/>"##.into(),
+            r##"<rect xml:id="visible" id="r" width="1" height="1"/><filter id="f"><feImage href="#r"/></filter><rect width="10" height="10" filter="url(#f)"/>"##.into(),
+            r##"<rect xlink:id="visible" xml:id="r" width="1" height="1"/><filter id="f"><feImage href="#r"/></filter><rect width="10" height="10" filter="url(#f)"/>"##.into(),
+            r##"<rect svg:id="visible" id="r" xmlns:svg="http://www.w3.org/2000/svg" width="1" height="1"/><filter id="f"><feImage href="#r"/></filter><rect width="10" height="10" filter="url(#f)"/>"##.into(),
             r#"<filter id="f"><feImage xlink:href="/dev/zero"/></filter><rect width="1" height="1" filter="url(#f)"/>"#.into(),
             r#"<image width="1" height="1" odd:href="/dev/zero" xmlns:odd="http://www.w3.org/1999/xlink"/>"#.into(),
             // Nested SVG: declared, or plain text that isn't a raster image.
@@ -301,10 +314,13 @@ mod tests {
         }
     }
 
+    /// Only the bundled test font (family `MtcTest`, one glyph: `A`), so
+    /// text is laid out the same way on every machine, with or without
+    /// system fonts. See `testdata/README.md`.
     static FONTS: std::sync::LazyLock<std::sync::Arc<usvg::fontdb::Database>> =
         std::sync::LazyLock::new(|| {
             let mut fonts = usvg::fontdb::Database::new();
-            fonts.load_system_fonts();
+            fonts.load_font_data(include_bytes!("testdata/mtc-test-font.ttf").to_vec());
             std::sync::Arc::new(fonts)
         });
 
@@ -351,9 +367,6 @@ mod tests {
     /// anything, and the attacks it refuses really would.
     #[test]
     fn the_guard_agrees_with_the_renderer() {
-        // macOS always has system fonts, so text is laid out there.
-        #[cfg(target_os = "macos")]
-        assert!(!FONTS.is_empty());
         let every = self_contained()
             .into_iter()
             .chain(loading())
@@ -364,12 +377,24 @@ mod tests {
             }
         }
         for svg in loading() {
-            // Text is only laid out where the system has fonts.
-            if svg.contains("<text") && FONTS.is_empty() {
-                continue;
-            }
             assert!(!renderer_loads(&svg).is_empty(), "{svg}");
         }
+    }
+
+    #[test]
+    fn the_test_font_lays_out_text() {
+        let face = FONTS.faces().next().expect("the test font loads");
+        assert_eq!(face.families[0].0, "MtcTest");
+        let text = svg(r#"<text x="10" y="30" font-family="MtcTest" font-size="20">A</text>"#);
+        let tree = usvg::Tree::from_str(
+            &text,
+            &usvg::Options {
+                fontdb: FONTS.clone(),
+                ..usvg::Options::default()
+            },
+        )
+        .unwrap();
+        assert!(tree.root().has_children(), "the text was laid out");
     }
 
     #[test]
