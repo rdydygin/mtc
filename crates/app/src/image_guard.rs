@@ -13,7 +13,9 @@
 //! doesn't ask the renderer. It reads the document the way usvg does and
 //! refuses every reference that could leave it, wherever it appears.
 
-use roxmltree::{Document, Node, ParsingOptions};
+use std::collections::HashMap;
+
+use roxmltree::{Document, Node, NodeId, ParsingOptions};
 
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
@@ -67,12 +69,83 @@ pub fn is_safe_image(body: &[u8]) -> bool {
     let Ok(document) = Document::parse_with_options(text, options) else {
         return true;
     };
+    // Every check below is linear in what it reads, and links are looked up
+    // in an index built once, so a large document can't make the check
+    // itself the denial of service.
+    let ids = Ids::new(&document);
     document
         .descendants()
-        .all(|node| is_self_contained(&document, &node))
+        .all(|node| is_self_contained(&ids, &node))
 }
 
-fn is_self_contained(document: &Document, node: &Node) -> bool {
+/// The elements usvg can link to by `id`, found in one pass.
+struct Ids<'a> {
+    targets: HashMap<&'a str, Target>,
+}
+
+struct Target {
+    /// How many elements carry the id; usvg's choice among several is its
+    /// implementation's.
+    elements: usize,
+    /// Whether the (first) element is one an `<feImage>` can draw: usvg
+    /// keeps it, it can be drawn, and it has a single id-like attribute.
+    drawable: bool,
+}
+
+impl<'a> Ids<'a> {
+    fn new(document: &'a Document) -> Self {
+        let svg_element = |node: &Node, names: &[&str]| {
+            node.is_element()
+                && matches!(node.tag_name().namespace(), None | Some(SVG_NS))
+                && names.contains(&node.tag_name().name())
+        };
+        // Whether every element above a node is a container usvg keeps as
+        // written. Descendants come after their parent, so each node's
+        // answer extends its parent's.
+        let mut kept: HashMap<NodeId, bool> = HashMap::new();
+        let mut targets: HashMap<&'a str, Target> = HashMap::new();
+        for node in document.descendants().filter(Node::is_element) {
+            let parent_kept = node.parent().is_none_or(|parent| {
+                !parent.is_element()
+                    || (kept.get(&parent.id()).copied().unwrap_or(false)
+                        && svg_element(&parent, &CONTAINERS))
+            });
+            kept.insert(node.id(), parent_kept);
+            // usvg indexes only an element's first id-like attribute; with
+            // one, in any namespace, there is no choice to get wrong.
+            let single_id = node
+                .attributes()
+                .filter(|attribute| attribute.name() == "id")
+                .count()
+                == 1;
+            let drawable = single_id && parent_kept && svg_element(&node, &DRAWABLE);
+            for attribute in node.attributes() {
+                let recognized = attribute.name() == "id"
+                    && matches!(
+                        attribute.namespace(),
+                        None | Some(SVG_NS) | Some(XLINK_NS) | Some(XML_NS)
+                    );
+                if recognized {
+                    let target = targets.entry(attribute.value()).or_insert(Target {
+                        elements: 0,
+                        drawable,
+                    });
+                    target.elements += 1;
+                }
+            }
+        }
+        Self { targets }
+    }
+
+    /// Whether `id` names exactly one element, one an `<feImage>` can draw.
+    fn is_drawable(&self, id: &str) -> bool {
+        self.targets
+            .get(id)
+            .is_some_and(|target| target.elements == 1 && target.drawable)
+    }
+}
+
+fn is_self_contained(ids: &Ids, node: &Node) -> bool {
     if node.is_text() {
         // CSS can only set presentation attributes, never a link, but its
         // `url(…)` values must stay local too.
@@ -93,7 +166,7 @@ fn is_self_contained(document: &Document, node: &Node) -> bool {
             // for `<feImage>` a fragment naming no element usvg keeps.
             let link_ok = match element {
                 "image" => is_embedded_raster(value),
-                "feImage" => is_embedded_raster(value) || links_to_drawable(document, value),
+                "feImage" => is_embedded_raster(value) || links_to_drawable(ids, value),
                 // A hyperlink: usvg draws its content and never follows it.
                 "a" if node.tag_name().namespace() == Some(SVG_NS) => true,
                 _ => is_local_reference(value) || is_embedded_raster(value),
@@ -113,59 +186,27 @@ fn is_local_reference(value: &str) -> bool {
 
 /// Whether `value` links to one element that usvg keeps and can draw, the
 /// only fragment `<feImage>` doesn't treat as a path. Parses the link as
-/// svgtypes' IRI does, and finds `id`s as usvg's tree records them.
-fn links_to_drawable(document: &Document, value: &str) -> bool {
+/// svgtypes' IRI does; `ids` records ids as usvg's tree does.
+fn links_to_drawable(ids: &Ids, value: &str) -> bool {
     let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
     let Some(rest) = value.trim_start_matches(is_space).strip_prefix('#') else {
         return false;
     };
     let (id, tail) = rest.split_at(rest.find(' ').unwrap_or(rest.len()));
-    if id.is_empty() || !tail.trim_start_matches(is_space).is_empty() {
-        return false;
-    }
-    let svg_element = |node: &Node, names: &[&str]| {
-        node.is_element()
-            && matches!(node.tag_name().namespace(), None | Some(SVG_NS))
-            && names.contains(&node.tag_name().name())
-    };
-    let mut targets = document.descendants().filter(|node| {
-        node.attributes().any(|attribute| {
-            attribute.name() == "id"
-                && matches!(
-                    attribute.namespace(),
-                    None | Some(SVG_NS) | Some(XLINK_NS) | Some(XML_NS)
-                )
-                && attribute.value() == id
-        })
-    });
-    // A duplicate id leaves which one usvg picks to its implementation.
-    let (Some(target), None) = (targets.next(), targets.next()) else {
-        return false;
-    };
-    // usvg indexes only an element's first id-like attribute; with one, in
-    // any namespace, there is no choice to get wrong.
-    let ids = target
-        .attributes()
-        .filter(|attribute| attribute.name() == "id")
-        .count();
-    ids == 1
-        && svg_element(&target, &DRAWABLE)
-        && target
-            .ancestors()
-            .skip(1)
-            .filter(Node::is_element)
-            .all(|ancestor| svg_element(&ancestor, &CONTAINERS))
+    !id.is_empty() && tail.trim_start_matches(is_space).is_empty() && ids.is_drawable(id)
 }
 
-/// Every CSS `url(…)` in `value` names an element of the same document.
+/// Every CSS `url(…)` in `value` names an element of the same document:
+/// after optional whitespace, quotes and whitespace, a `#`. One pass; the
+/// prefix read for each `url(` ends before the next one begins.
 fn urls_are_local(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.match_indices("url(").all(|(start, _)| {
-        let target = &lower[start + "url(".len()..];
-        let target = target[..target.find(')').unwrap_or(target.len())]
-            .trim()
-            .trim_matches(['"', '\'']);
-        is_local_reference(target)
+        let target = lower[start + "url(".len()..]
+            .trim_start()
+            .trim_start_matches(['"', '\''])
+            .trim_start();
+        target.starts_with('#')
     })
 }
 
@@ -395,6 +436,56 @@ mod tests {
         )
         .unwrap();
         assert!(tree.root().has_children(), "the text was laid out");
+    }
+
+    /// Large legal documents: every link is looked up in one index, every
+    /// ancestor chain is walked once, and each `url(` reads only its own
+    /// prefix. Done per reference, these took billions of steps.
+    #[test]
+    fn large_documents_are_checked_in_linear_time() {
+        const REFERENCES: usize = 50_000;
+        const DEPTH: usize = 5_000;
+        let started = std::time::Instant::now();
+
+        // Many feImages naming one rect, inside unused <defs>.
+        let mut many = String::from(r#"<defs><rect id="r" width="1" height="1"/><filter id="f">"#);
+        for _ in 0..REFERENCES {
+            many.push_str(r##"<feImage href="#r"/>"##);
+        }
+        many.push_str("</filter></defs>");
+        assert!(is_safe_image(svg(&many).as_bytes()));
+        // One reference that names nothing still fails the whole document.
+        let broken = many.replacen(r##"href="#r""##, r##"href="#missing""##, 1);
+        assert!(!is_safe_image(svg(&broken).as_bytes()));
+
+        // A deep chain of groups, each named by its own feImage.
+        let mut deep = String::new();
+        for level in 0..DEPTH {
+            deep.push_str(&format!(r#"<g id="g{level}">"#));
+        }
+        deep.push_str(&"</g>".repeat(DEPTH));
+        deep.push_str(r#"<filter id="f">"#);
+        for level in 0..DEPTH {
+            deep.push_str(&format!(r##"<feImage href="#g{level}"/>"##));
+        }
+        deep.push_str("</filter>");
+        assert!(is_safe_image(svg(&deep).as_bytes()));
+
+        // A megabyte of `url(` without a closing parenthesis, every one
+        // naming a fragment; then the same with one external target last.
+        let urls = "url(#".repeat(200_000);
+        let local = format!(r#"<rect width="1" height="1" fill="{urls}"/>"#);
+        assert!(is_safe_image(svg(&local).as_bytes()));
+        let external = format!(r#"<rect width="1" height="1" fill="{urls}url(/x"/>"#);
+        assert!(!is_safe_image(svg(&external).as_bytes()));
+
+        // Generous for an unoptimized build on a slow machine; the quadratic
+        // check took minutes.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
