@@ -60,6 +60,11 @@ pub fn is_safe_image(body: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(body) else {
         return true;
     };
+    // Parsing itself is quadratic in the attributes of one tag, here and
+    // again in usvg, so a crowded tag is refused before either parses it.
+    if has_crowded_tag(text) || declares_markup_entity(text) {
+        return false;
+    }
     // usvg parses with exactly these options, so entities expand the same
     // way, and a document that fails here fails there before loading anything.
     let options = ParsingOptions {
@@ -76,6 +81,75 @@ pub fn is_safe_image(body: &[u8]) -> bool {
     document
         .descendants()
         .all(|node| is_self_contained(&ids, &node))
+}
+
+/// The most attributes, namespace declarations included, a start tag may
+/// carry. roxmltree compares each attribute of a tag with every earlier one,
+/// and each namespace declaration with every earlier one, so a tag with `n`
+/// costs about `n²/2` comparisons. Real SVG elements carry a few dozen at
+/// most: every presentation attribute written out, or an editor's root
+/// element declaring its namespaces. At this bound the largest body we
+/// download, 32 MB of such tags, parses in a second or two, a few times as
+/// long as ordinary tags take; one tag of 50 000 took two seconds alone.
+const MAX_ATTRIBUTES: usize = 256;
+
+/// Whether some start tag roxmltree reads could carry more than
+/// [`MAX_ATTRIBUTES`] attributes. Counts the quoted strings from each `<` to
+/// the next `>` outside quotes: every attribute and namespace declaration
+/// has exactly one. roxmltree's tags contain no other `<`, not even in a
+/// value, so every tag it reads restarts the count, whatever the scan took
+/// the text before it for: a comment, CDATA, the DTD. There, the count is
+/// only ever too high. One pass over the bytes.
+fn has_crowded_tag(text: &str) -> bool {
+    let mut in_markup = false;
+    let mut quote = None;
+    let mut strings = 0;
+    for byte in text.bytes() {
+        match (byte, quote) {
+            (b'<', _) => {
+                in_markup = true;
+                quote = None;
+                strings = 0;
+            }
+            (_, Some(open)) if byte == open => quote = None,
+            (_, Some(_)) => {}
+            (b'>', None) => in_markup = false,
+            (b'"' | b'\'', None) if in_markup => {
+                quote = Some(byte);
+                strings += 1;
+                if strings > MAX_ATTRIBUTES {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether an `<!ENTITY` declaration's value holds markup. roxmltree parses
+/// an entity's value as content wherever it is referenced, so its tags
+/// aren't in the body as written, and a tag cut off by the end of the value
+/// leaves its attributes to the next tag: referencing many such entities
+/// builds one tag of any size. SVG uses entities for namespace names and
+/// the like, not for markup, so any `<` in a value refuses the document.
+///
+/// The value is the first quoted string after `<!ENTITY`: the name and the
+/// optional `%` before it hold no quote. Both searches stop at the next `<`,
+/// before the next declaration, so each byte is read at most twice.
+fn declares_markup_entity(text: &str) -> bool {
+    text.match_indices("<!ENTITY").any(|(start, _)| {
+        let declaration = &text[start + "<!ENTITY".len()..];
+        let Some(open) = declaration.find(['<', '"', '\'']) else {
+            return false;
+        };
+        let quote = declaration.as_bytes()[open];
+        quote != b'<'
+            && declaration[open + 1..]
+                .bytes()
+                .find(|&byte| byte == quote || byte == b'<')
+                == Some(b'<')
+    })
 }
 
 /// The elements usvg can link to by `id`, found in one pass.
@@ -486,6 +560,121 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// A rect with `count` attributes in all, each value holding what could
+    /// throw a count off: `>`, `=` and the other quote.
+    fn rect_with_attributes(count: usize) -> String {
+        let attributes: String = (2..count)
+            .map(|i| format!(r#" data-{i}='a>b="c"=d'"#))
+            .collect();
+        format!(r#"<rect width="1" height="1"{attributes}/>"#)
+    }
+
+    #[test]
+    fn crowded_tags_are_refused_before_parsing() {
+        let attributes: String = (0..50_000).map(|i| format!(" a{i}=''")).collect();
+        let crowded = svg(&format!("<rect{attributes}/>"));
+        let declarations: String = (0..50_000)
+            .map(|i| format!(" xmlns:p{i}='urn:{i}'"))
+            .collect();
+        let declaring = svg(&format!("<g{declarations}/>"));
+        let started = std::time::Instant::now();
+        assert!(!is_safe_image(crowded.as_bytes()));
+        assert!(!is_safe_image(declaring.as_bytes()));
+        // Half a megabyte each; parsing either took two seconds, growing
+        // with the square of the size.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn attributes_are_counted_per_tag_whatever_comes_before() {
+        let full = rect_with_attributes(MAX_ATTRIBUTES);
+        let over = rect_with_attributes(MAX_ATTRIBUTES + 1);
+        // Each leaves the count thinking it is inside quotes or outside
+        // markup; neither may hide the tag after it.
+        for before in [
+            "",
+            r#"<!-- it's "quoted -->"#,
+            r#"<text><![CDATA[ ' " ]]></text>"#,
+            r#"<?pi " ?>"#,
+            r#"<text>"it's" = 'x' > y</text>"#,
+            &format!("<!-- {} -->", "=".repeat(1_000)),
+            &format!(
+                "<style>{}</style>",
+                r#"rect { font-family: "A" } "#.repeat(1_000)
+            ),
+            &rect_with_attributes(MAX_ATTRIBUTES),
+        ] {
+            let fits = svg(&format!("{before}{full}"));
+            assert!(is_safe_image(fits.as_bytes()), "{fits}");
+            let crowded = svg(&format!("{before}{over}"));
+            assert!(!is_safe_image(crowded.as_bytes()), "{crowded}");
+        }
+
+        let doc = |dtd: &str, inner: &str| {
+            format!(
+                r#"<!DOCTYPE svg [{dtd}]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">{inner}</svg>"#
+            )
+        };
+        let dtd = r#"<!ENTITY q '"'><!-- ' --><!ENTITY a "x>y">"#;
+        assert!(is_safe_image(doc(dtd, &full).as_bytes()));
+        assert!(!is_safe_image(doc(dtd, &over).as_bytes()));
+    }
+
+    #[test]
+    fn entities_holding_markup_are_refused() {
+        let doc = |dtd: &str, inner: &str| {
+            format!(
+                r#"<!DOCTYPE svg [{dtd}]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">{inner}</svg>"#
+            )
+        };
+        // roxmltree leaves the attributes of a tag cut off by the end of an
+        // entity to the next tag, so tags no bound sees can grow without one.
+        let pieces = doc(
+            r#"<!ENTITY a "<x a1='1' a2='2'"><!ENTITY b "<y b1='1'">"#,
+            "&a;&b;<g c='3'/>",
+        );
+        let options = ParsingOptions {
+            allow_dtd: true,
+            ..ParsingOptions::default()
+        };
+        let parsed = Document::parse_with_options(&pieces, options).unwrap();
+        let g = parsed
+            .descendants()
+            .find(|node| node.has_tag_name("g"))
+            .unwrap();
+        let names: Vec<_> = g.attributes().map(|attribute| attribute.name()).collect();
+        assert_eq!(names, ["a1", "a2", "b1", "c"]);
+        assert!(!is_safe_image(pieces.as_bytes()));
+
+        // Many such entities: one tag of 100 000 attributes, every entity
+        // within the bound on its own. Parsing it took five seconds.
+        let (mut dtd, mut references) = (String::new(), String::new());
+        for entity in 0..500 {
+            dtd.push_str(&format!(r#"<!ENTITY e{entity} "<x"#));
+            for attribute in 0..200 {
+                dtd.push_str(&format!(" a{entity}_{attribute}=''"));
+            }
+            dtd.push_str(r#"">"#);
+            references.push_str(&format!("&e{entity};"));
+        }
+        let built = doc(&dtd, &format!("{references}<g/>"));
+        let started = std::time::Instant::now();
+        assert!(!is_safe_image(built.as_bytes()));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+
+        // Entities as SVG editors use them, for names, still render.
+        let names = r##"<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd" [
+            <!ENTITY ns_svg "http://www.w3.org/2000/svg">
+            <!ENTITY ns_xlink 'http://www.w3.org/1999/xlink'>
+            <!ENTITY red "#f00">
+        ]><svg xmlns="&ns_svg;" xmlns:xlink="&ns_xlink;" width="1" height="1"><rect width="1" height="1" fill="&red;"/></svg>"##;
+        assert!(is_safe_image(names.as_bytes()));
     }
 
     #[test]
