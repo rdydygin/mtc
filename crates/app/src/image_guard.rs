@@ -13,7 +13,7 @@
 //! doesn't ask the renderer. It reads the document the way usvg does and
 //! refuses every reference that could leave it, wherever it appears.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
 
@@ -102,7 +102,7 @@ enum Cost {
     /// [`Markup::prefixed_pairs`].
     PrefixedAttributes,
     /// Copying and searching the namespaces in scope; see
-    /// [`Markup::namespace_lookups`].
+    /// [`Markup::namespace_lookups`] and [`Markup::distinct_namespaces`].
     NamespaceScopes,
 }
 
@@ -129,7 +129,9 @@ fn parse_cost(text: &str) -> Option<Cost> {
     }
     // Each comparison reads at most one prefix as long as the longest.
     let lookups = markup.namespace_lookups;
-    if lookups.saturating_mul(1 + markup.longest_prefix) > MAX_NAMESPACE_WORK {
+    if lookups.saturating_mul(1 + markup.longest_prefix) > MAX_NAMESPACE_WORK
+        || markup.distinct_namespaces > MAX_NAMESPACES
+    {
         return Some(Cost::NamespaceScopes);
     }
     None
@@ -156,6 +158,13 @@ const MAX_ATTRIBUTE_PAIRS: usize = 1 << 26;
 /// prefixed attributes on most elements, which costs a few hundred bytes
 /// per element: tens of millions for the largest drawings.
 const MAX_NAMESPACE_WORK: usize = 1 << 28;
+
+/// The most distinct namespaces, by prefix and value, a document may
+/// declare; see [`Markup::distinct_namespaces`]. Editors declare a dozen at
+/// most, and pasted icons repeat the same ones. At this bound roxmltree
+/// shifts at most eight million entries keeping them sorted; 65 000, in
+/// 1.6 MB, shifted two billion.
+const MAX_NAMESPACES: usize = 4096;
 
 /// What a document's entity declarations hold, read as roxmltree reads
 /// them.
@@ -285,6 +294,12 @@ struct Markup {
     /// Repeating a declaration on siblings costs little; nesting new ones
     /// makes every element below pay for all.
     namespace_lookups: usize,
+    /// Distinct namespaces declared, by prefix and value. roxmltree keeps
+    /// each distinct one in a vector sorted for its whole document, so each
+    /// new one shifts every later one: their square. Repeating one costs
+    /// nothing. Two values written differently may name the same namespace,
+    /// so this only ever counts too many.
+    distinct_namespaces: usize,
 }
 
 impl Markup {
@@ -300,6 +315,7 @@ impl Markup {
         let mut markup = Self::default();
         // For each open element, how many namespaces are in scope at most.
         let mut scopes = Vec::new();
+        let mut namespaces = HashSet::new();
         let mut at = 0;
         while let Some(offset) = text[at..].find('<') {
             let rest = &text[at + offset..];
@@ -317,7 +333,7 @@ impl Markup {
                 scopes.pop();
                 rest.find('>').map(|end| end + 1)
             } else {
-                markup.start_tag(rest, longest_entity, &mut scopes)
+                markup.start_tag(rest, longest_entity, &mut scopes, &mut namespaces)
             };
             let Some(read) = read else {
                 break;
@@ -331,11 +347,12 @@ impl Markup {
     /// then attributes, each a name, `=` and a quoted value that holds no
     /// `<`, then `>` or `/>`. Returns its length, or `None` where roxmltree
     /// would fail, with what roxmltree does before failing charged.
-    fn start_tag(
+    fn start_tag<'a>(
         &mut self,
-        text: &str,
+        text: &'a str,
         longest_entity: usize,
         scopes: &mut Vec<usize>,
+        namespaces: &mut HashSet<(&'a str, &'a str)>,
     ) -> Option<usize> {
         let bytes = text.as_bytes();
         let space = |at: usize| bytes.get(at).is_some_and(|byte| XML_SPACE.contains(byte));
@@ -398,6 +415,9 @@ impl Markup {
                 self.namespace_lookups =
                     self.namespace_lookups.saturating_add(2 * declarations - 1);
                 self.longest_prefix = self.longest_prefix.max(prefix.len());
+                if namespaces.insert((prefix, value)) {
+                    self.distinct_namespaces += 1;
+                }
                 let references = entity_references(value).0;
                 let uri = value
                     .len()
@@ -949,6 +969,15 @@ mod tests {
         let declarations: String = (0..60_000).map(|i| format!(" xmlns:p{i}='u'")).collect();
         let unfinished = format!("<svg xmlns='http://www.w3.org/2000/svg'><g{declarations} bad");
 
+        // 65 000 distinct namespaces in descending order, each inserted at
+        // the front of roxmltree's sorted vector: 1.6 MB, two billion
+        // entries shifted.
+        let descending: String = (1..=65_000)
+            .rev()
+            .map(|i| format!("<g xmlns:p='urn:{i:06}'/>"))
+            .collect();
+        let distinct = svg(&descending);
+
         // 500 entities each holding a tag cut off after 200 attributes,
         // which roxmltree gathers into one: five seconds.
         let (mut dtd, mut references) = (String::new(), String::new());
@@ -971,6 +1000,7 @@ mod tests {
             ("one crowded tag", crowded, Cost::CrowdedTag),
             ("long namespace names", long_names, Cost::PrefixedAttributes),
             ("nested declarations", nested, Cost::NamespaceScopes),
+            ("distinct namespaces", distinct, Cost::NamespaceScopes),
             (
                 "an unfinished tag of declarations",
                 unfinished,
@@ -1050,6 +1080,7 @@ mod tests {
                 // Its own prefix and `p:y`'s looked up among one namespace,
                 // and its one declaration checked.
                 namespace_lookups: 3,
+                distinct_namespaces: 1,
             }
         );
         // `p:xmlns` declares the default namespace, so binds no prefix.
@@ -1114,6 +1145,10 @@ mod tests {
             // Two declarations: two squared.
             assert_eq!(markup.namespace_lookups, 2 * 2, "{text}");
         }
+        // Distinct namespaces, by prefix and value, counted as each
+        // declaration completes, whether or not its tag does.
+        let distinct = "<r xmlns:p='u'><a xmlns:p='u'/><b xmlns:p='v'/><c xmlns:q='u'/><d xmlns='u' xmlns:x='w' bad";
+        assert_eq!(scan(distinct).distinct_namespaces, 5);
         let declarations: String = (0..60_000).map(|i| format!(" xmlns:p{i}='u'")).collect();
         let unfinished = scan(&format!("<g{declarations} bad"));
         assert_eq!(unfinished.namespace_lookups, 60_000 * 60_000);
@@ -1193,6 +1228,26 @@ mod tests {
             "<a/>".repeat(1_000_000)
         ));
         assert_eq!(cost(&lookups), Some(Cost::NamespaceScopes));
+
+        // Distinct namespaces, each other check passed: the root's
+        // `xmlns:xlink` and `xmlns` and siblings declaring one each.
+        let siblings = |count: usize| {
+            svg(&(0..count)
+                .map(|i| format!("<g xmlns:p='urn:{i}'/>"))
+                .collect::<String>())
+        };
+        let full = siblings(MAX_NAMESPACES - 2);
+        assert_eq!(Markup::scan(&full, 0).distinct_namespaces, MAX_NAMESPACES);
+        assert_eq!(cost(&full), None);
+        assert_eq!(
+            cost(&siblings(MAX_NAMESPACES - 1)),
+            Some(Cost::NamespaceScopes)
+        );
+        let (_, reproducer, _) = attacks()
+            .into_iter()
+            .find(|(name, ..)| *name == "distinct namespaces")
+            .unwrap();
+        assert_eq!(Markup::scan(&reproducer, 0).distinct_namespaces, 65_002);
     }
 
     #[test]
@@ -1209,9 +1264,12 @@ mod tests {
             r#"<path inkscape:connector-curvature="0" sodipodi:nodetypes="ccc" d="M0 0h1v1z"/>"#;
         let drawing = inkscape.replace("</g>", &format!("{}</g>", path.repeat(100_000)));
         assert_eq!(cost(&drawing), None);
-        // Icons pasted in with their own declarations, however many.
+        // Icons pasted in with their own declarations, however many: the
+        // same two namespaces each time.
         let icon = r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1" height="1"><rect width="1" height="1"/></svg>"#;
-        assert!(is_safe_image(svg(&icon.repeat(1_000)).as_bytes()));
+        let sprites = svg(&icon.repeat(5_000));
+        assert_eq!(Markup::scan(&sprites, 0).distinct_namespaces, 2);
+        assert!(is_safe_image(sprites.as_bytes()));
         // Text that names them is no declaration.
         let prose = svg(&format!(
             "<!-- xmlns xmlns --><style>/* xmlns */</style><text>{}</text>",
