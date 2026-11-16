@@ -4,7 +4,9 @@ use gpui_kit::{Context, Entity, EventEmitter, SharedString, Task};
 use mattermost::{ChannelId, Client, Millis, Post, PostId, PostList, Reaction, UserId};
 
 use crate::{
-    CustomEmojis, Directory, EmojiStore, PreparedMessage, prepare::custom_emoji_names, retry::retry,
+    CustomEmojis, Directory, EmojiStore, PreparedMessage,
+    prepare::{custom_emoji_names, has_markdown_image},
+    retry::retry,
 };
 
 /// Mattermost persists props, unlike its short-lived pending_post_id echo.
@@ -178,7 +180,11 @@ impl Entry {
     /// Prepare the message again for a new set of custom emoji. Returns
     /// whether the display text changed.
     fn reprepare(&mut self, custom: &CustomEmojis) -> bool {
-        if !self.post.message.contains(':') && self.attachments.is_empty() {
+        // Custom emoji reach a message only through shortcodes, which need
+        // a literal colon, or Markdown images, whose alt and URL may encode
+        // theirs (see `has_markdown_image`).
+        let message = &self.post.message;
+        if !message.contains(':') && !has_markdown_image(message) && self.attachments.is_empty() {
             return false;
         }
         let mut images = crate::image_policy::ImageBudget::default();
@@ -191,11 +197,20 @@ impl Entry {
         changed
     }
 
-    /// Whether the message or attachments name any of the custom emoji
-    /// `names`, the only way custom emoji reach the prepared text.
+    /// Whether preparing the message or attachments with custom emoji
+    /// `names` changed could read differently: they name one of them, or
+    /// write Markdown images, whose admission can turn on any emoji.
     fn uses_custom_emoji(&self, names: &HashSet<String>) -> bool {
         if names.is_empty() {
             return false;
+        }
+        if has_markdown_image(&self.post.message)
+            || self
+                .attachments
+                .iter()
+                .any(|attachment| attachment.has_markdown_images())
+        {
+            return true;
         }
         custom_emoji_names(&self.post.message)
             .iter()
@@ -1066,6 +1081,85 @@ mod tests {
                 "Updated"
             )
         });
+    }
+
+    /// Markdown decodes an image's alt text before deciding whether it is a
+    /// server emoji, which the image budget doesn't count: an alt written
+    /// with character references names an emoji no shortcode scan sees.
+    #[gpui_kit::test]
+    fn encoded_emoji_image_alts_follow_emoji_changes(cx: &mut TestAppContext) {
+        use crate::image_policy::MAX_POST_IMAGES;
+        let client = Client::new_unverified("https://chat.example.com", "token").unwrap();
+        let emoji_url = client.custom_emoji_url(&"party1".into());
+        // Every colon is a character reference, URLs' too: Markdown decodes
+        // them all, so nothing in the source is a literal `:`.
+        let source = format!(
+            "![&#58;party&#58;]({})\n{}",
+            emoji_url.replace(':', "&#58;"),
+            (0..MAX_POST_IMAGES)
+                .map(|i| format!("![p](https&#58;//example.com/{i}.png)"))
+                .collect::<String>()
+        );
+        assert!(!source.contains(':'));
+        let last = format!("https://example.com/{}.png", MAX_POST_IMAGES - 1);
+        let empty = CustomEmojis::for_server(&client);
+        let mut party = empty.clone();
+        party.insert("party".into(), emoji_url.clone());
+        // The premise: whether the last picture shows depends on `party`.
+        assert!(!PreparedMessage::new(&source, &empty).allows_image(&last));
+        assert!(PreparedMessage::new(&source, &party).allows_image(&last));
+
+        let posts = || {
+            let mut message = post("message", 1);
+            message.message = source.clone();
+            let mut bot = post("bot", 2);
+            bot.message.clear();
+            bot.props.insert(
+                "attachments".into(),
+                serde_json::json!([{ "text": source.clone() }]),
+            );
+            [message, bot]
+        };
+        let shows_last = |timeline: &Entity<Timeline>, cx: &mut TestAppContext| {
+            timeline.read_with(cx, |t, _| {
+                let message = t.entries()[0].message().allows_image(&last);
+                let attachment = t.entries()[1].attachments()[0]
+                    .text()
+                    .full()
+                    .allows_image(&last);
+                assert_eq!(message, attachment);
+                message
+            })
+        };
+
+        // Live: the emoji arrives, then goes.
+        let (timeline, _) = timeline_with_client(client.clone(), cx);
+        timeline.update(cx, |t, cx| {
+            t.set_custom_emoji(empty.clone(), cx);
+            for post in posts() {
+                t.upsert(post, cx);
+            }
+        });
+        assert!(!shows_last(&timeline, cx));
+        timeline.update(cx, |t, cx| t.set_custom_emoji(party.clone(), cx));
+        assert!(shows_last(&timeline, cx), "a loaded emoji frees its slot");
+        timeline.update(cx, |t, cx| t.set_custom_emoji(empty.clone(), cx));
+        assert!(!shows_last(&timeline, cx), "a removed emoji takes it again");
+
+        // Prepared off the UI thread before the emoji arrived.
+        let (timeline, _) = timeline_with_client(client.clone(), cx);
+        timeline.update(cx, |t, cx| {
+            t.set_custom_emoji(party.clone(), cx);
+            let prepared = Prepared {
+                entries: posts()
+                    .into_iter()
+                    .map(|p| Entry::new(p, Delivery::Sent, &empty))
+                    .collect(),
+                custom_emoji: empty.clone(),
+            };
+            t.replace_all(2, prepared, 0, cx);
+        });
+        assert!(shows_last(&timeline, cx));
     }
 
     /// Each attachment text is prepared on its own, so a fence left open in
