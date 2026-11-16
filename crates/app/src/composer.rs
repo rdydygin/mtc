@@ -117,6 +117,9 @@ pub struct Composer {
     suggestion_data: u64,
     /// The pictures the suggestions showed when last pruned.
     shown_pictures: HashSet<String>,
+    /// How often the suggestions were worked out, for tests.
+    #[cfg(test)]
+    computations: std::cell::Cell<usize>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -125,10 +128,14 @@ pub struct Composer {
 struct SuggestionInputs {
     token: Option<Token>,
     dismissed: Option<Token>,
-    /// The token the autocomplete answer is for.
-    lookup: Option<Token>,
-    /// The directory's user revision, which presence doesn't move.
+    /// Whether an autocomplete answer for the token is in; which answer is
+    /// told by `data`.
+    answered: bool,
+    /// For people: the directory's user revision, which presence doesn't
+    /// move.
     directory: u64,
+    /// For emoji: the custom emoji's revision.
+    emoji: u64,
     data: u64,
 }
 
@@ -216,6 +223,8 @@ impl Composer {
             suggestions: RefCell::new(None),
             suggestion_data: 0,
             shown_pictures: HashSet::new(),
+            #[cfg(test)]
+            computations: std::cell::Cell::new(0),
             _subscriptions: vec![subscription, caret, focus_in, focus_out, emoji_updates],
         }
     }
@@ -498,7 +507,15 @@ impl Composer {
             }));
         self._subscriptions
             .push(cx.observe_in(&session, window, |this, _, window, cx| {
-                this.suggestion_data += 1;
+                // Channels and commands come from the session; people and
+                // emoji have their own revisions, so typing a name isn't
+                // worked out again on every session change.
+                if this
+                    .current_token(cx)
+                    .is_some_and(|token| matches!(token.kind, Kind::Channel | Kind::Command))
+                {
+                    this.suggestion_data += 1;
+                }
                 this.refresh_suggestions(window, cx);
                 this.reconcile_command_selection(cx);
                 cx.notify();
@@ -652,9 +669,9 @@ impl Composer {
         cx.notify();
     }
 
+    /// The emoji search changed: its query, its loading, or the custom emoji
+    /// themselves, which the suggestions key on by their own revision.
     fn reconcile_emoji_selection(&mut self, cx: &mut Context<Self>) {
-        // Custom emoji arrived or changed.
-        self.suggestion_data += 1;
         if self
             .current_token(cx)
             .is_some_and(|token| token.kind == Kind::Emoji)
@@ -848,13 +865,20 @@ impl Composer {
     /// what they depend on changed since the last call.
     fn suggestion_matches(&self, cx: &gpui_kit::App) -> Rc<[Suggestion]> {
         let token = self.current_token(cx);
+        let kind = token.as_ref().map(|token| token.kind);
         let inputs = SuggestionInputs {
             dismissed: self.dismissed.clone(),
-            lookup: self.token.clone(),
-            directory: self
-                .session
-                .as_ref()
-                .map_or(0, |s| s.read(cx).directory().read(cx).revision()),
+            answered: self.token == token && !self.remote_users.is_empty(),
+            directory: match (&self.session, kind) {
+                (Some(session), Some(Kind::Person)) => {
+                    session.read(cx).directory().read(cx).revision()
+                }
+                _ => 0,
+            },
+            emoji: match kind {
+                Some(Kind::Emoji) => self.emoji_search.read(cx).custom_revision(cx),
+                _ => 0,
+            },
             data: self.suggestion_data,
             token,
         };
@@ -869,6 +893,8 @@ impl Composer {
     }
 
     fn compute_suggestions(&self, token: Option<Token>, cx: &gpui_kit::App) -> Vec<Suggestion> {
+        #[cfg(test)]
+        self.computations.set(self.computations.get() + 1);
         let Some(token) = token else {
             return Vec::new();
         };
@@ -2109,6 +2135,53 @@ mod tests {
             "a new token frees the pictures it no longer shows"
         );
         assert!(!in_atlas(cx, handle, &new), "from the GPU atlas too");
+    }
+
+    /// A keystroke works the suggestions out once, through the observers
+    /// it sets off and the frames after it; a frame with nothing new
+    /// reuses them.
+    #[gpui_kit::test]
+    fn a_keystroke_works_the_suggestions_out_once(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        let computations =
+            |cx: &mut TestAppContext| composer.read_with(cx, |c, _| c.computations.get());
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap()
+        };
+        for (typed, key) in [("@a", "n"), (":pa", "r")] {
+            cx.update_window(handle, |_, window, cx| {
+                composer.update(cx, |c, cx| c.set_text("", window, cx));
+                window.input(typed, cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            draw(cx);
+            let before = computations(cx);
+            // Typing a name leaves the emoji search, and its catalogue, be.
+            let searches = Rc::new(std::cell::Cell::new(0));
+            let emoji_search = composer.read_with(cx, |c, _| c.emoji_search.clone());
+            let _watch = cx.update(|cx| {
+                let searches = searches.clone();
+                cx.observe(&emoji_search, move |_, _| searches.set(searches.get() + 1))
+            });
+            cx.update_window(handle, |_, window, cx| window.input(key, cx))
+                .unwrap();
+            cx.run_until_parked();
+            draw(cx);
+            draw(cx);
+            assert_eq!(
+                computations(cx) - before,
+                1,
+                "typing {key:?} after {typed:?}"
+            );
+            if typed.starts_with('@') {
+                assert_eq!(searches.get(), 0, "a name doesn't search emoji");
+            }
+            draw(cx);
+            assert_eq!(computations(cx) - before, 1, "an unchanged frame");
+        }
     }
 
     /// An autocomplete answer ranks people above the directory's; a person
