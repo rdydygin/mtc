@@ -17,7 +17,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -27,7 +27,7 @@ use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
     sync::{broadcast, watch},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 use tokio_tungstenite::{
     WebSocketStream,
@@ -181,21 +181,53 @@ type Route = dyn Fn(&Request) -> Reply + Send + Sync;
 /// Where the client opens its event connection.
 const WEBSOCKET_PATH: &str = "/api/v4/websocket";
 
-/// The event connection's side of the server.
+/// What the server and each connection's task share.
 #[derive(Clone)]
-struct Websockets {
-    /// Off until asked for, so other tests see the connection refused as
-    /// before and no reconnect events reach their sessions.
-    accept: Arc<AtomicBool>,
+struct Shared {
+    requests: Arc<Mutex<Vec<Request>>>,
+    closed_stalled_requests: Arc<Mutex<Vec<Request>>>,
+    /// Requests read but not yet answered in full.
+    answering: Arc<AtomicUsize>,
+    /// Off until asked for, so other tests see the event connection
+    /// refused as before and no reconnect events reach their sessions.
+    accept_websockets: Arc<AtomicBool>,
     events: broadcast::Sender<String>,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            requests: Arc::default(),
+            closed_stalled_requests: Arc::default(),
+            answering: Arc::default(),
+            accept_websockets: Arc::default(),
+            events: broadcast::channel(64).0,
+        }
+    }
+}
+
+/// Counts a request as being answered for as long as it lives.
+struct Answering<'a>(&'a AtomicUsize);
+
+impl<'a> Answering<'a> {
+    fn start(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Answering<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A local HTTP server with simulated latency and bandwidth.
 pub struct SlowServer {
     addr: SocketAddr,
-    requests: Arc<Mutex<Vec<Request>>>,
-    closed_stalled_requests: Arc<Mutex<Vec<Request>>>,
-    websockets: Websockets,
+    shared: Shared,
+    /// Accepts connections; owns every connection's task, so aborting it
+    /// on drop ends them too.
     task: JoinHandle<()>,
 }
 
@@ -217,41 +249,29 @@ impl SlowServer {
             .set_nonblocking(true)
             .expect("make the listener non-blocking");
         let addr = std_listener.local_addr().expect("read the server address");
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let closed_stalled_requests = Arc::new(Mutex::new(Vec::new()));
         let route: Arc<Route> = Arc::new(route);
-        let log = requests.clone();
-        let closed = closed_stalled_requests.clone();
         let started = Instant::now();
-        let websockets = Websockets {
-            accept: Arc::new(AtomicBool::new(false)),
-            events: broadcast::channel(64).0,
-        };
-        let sockets = websockets.clone();
+        let shared = Shared::default();
+        let connections = shared.clone();
         let task = runtime::spawn(async move {
             let listener = TcpListener::from_std(std_listener).expect("adopt the listener");
+            // Dropped, and so aborted, with this task.
+            let mut tasks = JoinSet::new();
             while let Ok((stream, _)) = listener.accept().await {
+                while tasks.try_join_next().is_some() {}
                 let route = route.clone();
-                let log = log.clone();
-                let closed = closed.clone();
-                let sockets = sockets.clone();
-                tokio::spawn(async move {
-                    let _ = serve(stream, network, started, &*route, &log, &closed, &sockets).await;
+                let shared = connections.clone();
+                tasks.spawn(async move {
+                    let _ = serve(stream, network, started, &*route, &shared).await;
                 });
             }
         });
-        Self {
-            addr,
-            requests,
-            closed_stalled_requests,
-            websockets,
-            task,
-        }
+        Self { addr, shared, task }
     }
 
     /// Take event connections from now on, greeting each with `hello`.
     pub fn accept_websockets(self) -> Self {
-        self.websockets.accept.store(true, Ordering::SeqCst);
+        self.shared.accept_websockets.store(true, Ordering::SeqCst);
         self
     }
 
@@ -259,12 +279,18 @@ impl SlowServer {
     /// `{"event": "typing", "data": {…}, "broadcast": {…}}`, on every open
     /// event connection. Returns how many connections it went to.
     pub fn push(&self, event: serde_json::Value) -> usize {
-        self.websockets.events.send(event.to_string()).unwrap_or(0)
+        self.shared.events.send(event.to_string()).unwrap_or(0)
     }
 
     /// How many event connections are open.
     pub fn websockets(&self) -> usize {
-        self.websockets.events.receiver_count()
+        self.shared.events.receiver_count()
+    }
+
+    /// How many requests have been read but not yet answered in full.
+    /// Event connections don't count.
+    pub fn answering(&self) -> usize {
+        self.shared.answering.load(Ordering::SeqCst)
     }
 
     /// The server's base URL, as a person would type it.
@@ -274,14 +300,14 @@ impl SlowServer {
 
     /// Every request so far, in arrival order.
     pub fn requests(&self) -> Vec<Request> {
-        self.requests.lock().unwrap().clone()
+        self.shared.requests.lock().unwrap().clone()
     }
 
     /// Requests for stalled responses closed by the client, even during writes.
     /// Select by method
     /// and path, just as with [`Self::requests`], to ignore unrelated traffic.
     pub fn closed_stalled_requests(&self) -> Vec<Request> {
-        self.closed_stalled_requests.lock().unwrap().clone()
+        self.shared.closed_stalled_requests.lock().unwrap().clone()
     }
 }
 
@@ -291,10 +317,10 @@ async fn serve(
     network: Network,
     started: Instant,
     route: &Route,
-    log: &Mutex<Vec<Request>>,
-    closed: &Mutex<Vec<Request>>,
-    websockets: &Websockets,
+    shared: &Shared,
 ) -> std::io::Result<()> {
+    let log = &shared.requests;
+    let closed = &shared.closed_stalled_requests;
     stream.set_nodelay(true)?;
     let mut buffer = Vec::new();
     loop {
@@ -314,16 +340,19 @@ async fn serve(
         }
         request.body = buffer[consumed..consumed + body_len].to_vec();
         buffer.drain(..consumed + body_len);
-        log.lock().unwrap().push(request.clone());
-
-        if websockets.accept.load(Ordering::SeqCst)
+        if shared.accept_websockets.load(Ordering::SeqCst)
             && request.path().split('?').next() == Some(WEBSOCKET_PATH)
             && let Some(key) = request.header("sec-websocket-key")
         {
             // The client says nothing before the handshake's answer.
             let accept = derive_accept_key(key.as_bytes());
-            return serve_websocket(stream, &accept, websockets).await;
+            log.lock().unwrap().push(request);
+            return serve_websocket(stream, &accept, &shared.events).await;
         }
+        // Counted before it's logged, so a request seen in the log is
+        // either answered or still counted.
+        let _answering = Answering::start(&shared.answering);
+        log.lock().unwrap().push(request.clone());
 
         let reply = route(&request);
         if let Some(gate) = &reply.gate {
@@ -362,11 +391,11 @@ async fn serve(
 async fn serve_websocket(
     mut stream: TcpStream,
     accept: &str,
-    websockets: &Websockets,
+    events: &broadcast::Sender<String>,
 ) -> std::io::Result<()> {
     // Subscribe before answering, so nothing pushed after the client sees
     // the handshake is missed.
-    let mut events = websockets.events.subscribe();
+    let mut events = events.subscribe();
     stream
         .write_all(
             format!(
@@ -505,12 +534,11 @@ mod tests {
                 let mut probe = TcpStream::from_std(stream.try_clone()?)?;
                 let stream = TcpStream::from_std(stream)?;
                 let gate = Gate::default();
-                let requests = Arc::new(Mutex::new(Vec::new()));
-                let closed = Arc::new(Mutex::new(Vec::new()));
+                let shared = Shared::default();
+                let requests = shared.requests.clone();
+                let closed = shared.closed_stalled_requests.clone();
                 let task = tokio::spawn({
                     let gate = gate.clone();
-                    let requests = requests.clone();
-                    let closed = closed.clone();
                     async move {
                         let route = move |_: &Request| {
                             Reply::bytes(vec![1, 2])
@@ -522,12 +550,7 @@ mod tests {
                             Network::new(Duration::ZERO),
                             Instant::now(),
                             &route,
-                            &requests,
-                            &closed,
-                            &Websockets {
-                                accept: Arc::new(AtomicBool::new(false)),
-                                events: broadcast::channel(1).0,
-                            },
+                            &shared,
                         )
                         .await
                     }
