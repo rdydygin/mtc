@@ -1498,6 +1498,85 @@ mod tests {
         assert!(!cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&bob)));
     }
 
+    /// Ann's and Bob's pictures, as the directory now has them, once it
+    /// knows both.
+    fn author_pictures(view: &Entity<SearchView>, cx: &mut TestAppContext) -> (Resource, Resource) {
+        let picture = |user: &str, cx: &mut TestAppContext| {
+            view.read_with(cx, |v, cx| {
+                let session = v.session.read(cx);
+                let version = session
+                    .directory()
+                    .read(cx)
+                    .user(&user.into())?
+                    .last_picture_update;
+                Some(Resource::Uri(
+                    avatar_url(session.client(), user, version).into(),
+                ))
+            })
+        };
+        wait_until(cx, |cx| {
+            picture("ann", cx).is_some() && picture("bob", cx).is_some()
+        });
+        (picture("ann", cx).unwrap(), picture("bob", cx).unwrap())
+    }
+
+    /// Unpinning, unsaving or refreshing replaces a collection's rows
+    /// without a new search; pictures of authors no row shows go too.
+    #[gpui_kit::test]
+    fn collection_rows_free_their_authors_pictures_when_they_go(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let unpinned = Arc::new(AtomicBool::new(false));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let unpinned = unpinned.clone();
+            move |request| match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("POST", "/api/v4/users/ids") => Reply::json(json!([
+                    { "id": "ann", "username": "ann", "last_picture_update": 1 },
+                    { "id": "bob", "username": "bob", "last_picture_update": 2 },
+                ])),
+                ("GET", "/api/v4/channels/town/pinned") => {
+                    let mut posts = json!({
+                        "bob": { "id": "bob", "channel_id": "town", "user_id": "bob",
+                                 "message": "kept", "create_at": 2 },
+                    });
+                    if !unpinned.load(Ordering::SeqCst) {
+                        posts["ann"] = json!({ "id": "ann", "channel_id": "town",
+                                               "user_id": "ann", "message": "pinned",
+                                               "create_at": 1 });
+                    }
+                    Reply::json(json!({ "posts": posts }))
+                }
+                _ => route(request),
+            }
+        });
+        let (window, view) = open_collection(&server, Collection::Pinned("town".into()), cx);
+        cx.update(crate::http::PictureClient::install);
+        let (ann, bob) = author_pictures(&view, cx);
+        let images = view.read_with(cx, |v, _| v.images.clone());
+        let painted = draw_until_painted(cx, window, {
+            let (images, ann, bob) = (images.clone(), ann.clone(), bob.clone());
+            move |cx| vec![images.read(cx).get(&ann), images.read(cx).get(&bob)]
+        });
+
+        unpinned.store(true, Ordering::SeqCst);
+        view.update(cx, |v, cx| v.load_collection(0, cx));
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 1));
+        cx.run_until_parked();
+        assert!(
+            images.read_with(cx, |images, _| images.get(&ann).is_none()),
+            "the unpinned post's author's picture goes"
+        );
+        assert!(!in_atlas(cx, window, &painted[0]), "from the GPU atlas too");
+        assert!(images.read_with(cx, |images, _| images.get(&bob).is_some()));
+        assert!(in_atlas(cx, window, &painted[1]), "the kept row's stays");
+    }
+
     #[gpui_kit::test]
     fn failed_pagination_retains_results_and_retries_the_same_page(cx: &mut TestAppContext) {
         use std::sync::{
