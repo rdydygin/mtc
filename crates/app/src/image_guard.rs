@@ -330,7 +330,7 @@ impl Markup {
     /// Reads the start tag `text` begins with, as roxmltree does: a name,
     /// then attributes, each a name, `=` and a quoted value that holds no
     /// `<`, then `>` or `/>`. Returns its length, or `None` where roxmltree
-    /// would fail.
+    /// would fail, with what roxmltree does before failing charged.
     fn start_tag(
         &mut self,
         text: &str,
@@ -386,9 +386,17 @@ impl Markup {
             }
             let value = &text[at..at + length];
             at += length + 1;
+            // roxmltree handles each attribute as it completes, checking a
+            // declaration against the tag's earlier ones then, so its share
+            // is charged now, kept if the tag later fails: adding `2n - 1`
+            // for the `n`th keeps each sum at the square of the count.
             attributes += 1;
+            self.widest_tag = self.widest_tag.max(attributes);
+            self.attribute_pairs = self.attribute_pairs.saturating_add(2 * attributes - 1);
             if let Some(prefix) = declared_prefix(name) {
                 declarations += 1;
+                self.namespace_lookups =
+                    self.namespace_lookups.saturating_add(2 * declarations - 1);
                 self.longest_prefix = self.longest_prefix.max(prefix.len());
                 let references = entity_references(value).0;
                 let uri = value
@@ -397,18 +405,17 @@ impl Markup {
                 self.longest_uri = self.longest_uri.max(uri);
             } else if name.contains(':') {
                 prefixed += 1;
+                self.prefixed_pairs = self.prefixed_pairs.saturating_add(2 * prefixed - 1);
             }
         };
-        self.widest_tag = self.widest_tag.max(attributes);
-        self.attribute_pairs = self.attribute_pairs.saturating_add(attributes * attributes);
-        self.prefixed_pairs = self.prefixed_pairs.saturating_add(prefixed * prefixed);
+        // The rest roxmltree does once the tag is complete: copy the
+        // namespaces in scope, if it declares any, and look up its prefix
+        // and those of its attributes.
         let inherited = scopes.last().copied().unwrap_or(0);
         let scope = inherited.saturating_add(declarations);
         let mut lookups = (1 + prefixed).saturating_mul(scope);
         if declarations > 0 {
-            lookups = lookups
-                .saturating_add(inherited.saturating_mul(scope))
-                .saturating_add(declarations * declarations);
+            lookups = lookups.saturating_add(inherited.saturating_mul(scope));
         }
         self.namespace_lookups = self.namespace_lookups.saturating_add(lookups);
         if open {
@@ -857,14 +864,13 @@ mod tests {
         assert!(tree.root().has_children(), "the text was laid out");
     }
 
-    /// Large legal documents: every link is looked up in one index, every
-    /// ancestor chain is walked once, and each `url(` reads only its own
-    /// prefix. Done per reference, these took billions of steps.
-    #[test]
-    fn large_documents_are_checked_in_linear_time() {
+    /// Large legal documents, and whether each is safe: every link is
+    /// looked up in one index, every ancestor chain is walked once, and each
+    /// `url(` reads only its own prefix. Done per reference, these took
+    /// billions of steps.
+    fn large_documents() -> Vec<(String, bool)> {
         const REFERENCES: usize = 50_000;
         const DEPTH: usize = 5_000;
-        let started = std::time::Instant::now();
 
         // Many feImages naming one rect, inside unused <defs>.
         let mut many = String::from(r#"<defs><rect id="r" width="1" height="1"/><filter id="f">"#);
@@ -872,10 +878,8 @@ mod tests {
             many.push_str(r##"<feImage href="#r"/>"##);
         }
         many.push_str("</filter></defs>");
-        assert!(is_safe_image(svg(&many).as_bytes()));
         // One reference that names nothing still fails the whole document.
         let broken = many.replacen(r##"href="#r""##, r##"href="#missing""##, 1);
-        assert!(!is_safe_image(svg(&broken).as_bytes()));
 
         // A deep chain of groups, each named by its own feImage.
         let mut deep = String::new();
@@ -888,23 +892,126 @@ mod tests {
             deep.push_str(&format!(r##"<feImage href="#g{level}"/>"##));
         }
         deep.push_str("</filter>");
-        assert!(is_safe_image(svg(&deep).as_bytes()));
 
         // A megabyte of `url(` without a closing parenthesis, every one
         // naming a fragment; then the same with one external target last.
         let urls = "url(#".repeat(200_000);
         let local = format!(r#"<rect width="1" height="1" fill="{urls}"/>"#);
-        assert!(is_safe_image(svg(&local).as_bytes()));
         let external = format!(r#"<rect width="1" height="1" fill="{urls}url(/x"/>"#);
-        assert!(!is_safe_image(svg(&external).as_bytes()));
 
-        // Generous for an unoptimized build on a slow machine; the quadratic
-        // check took minutes.
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(20),
-            "{:?}",
-            started.elapsed()
+        [
+            (many, true),
+            (broken, false),
+            (deep, true),
+            (local, true),
+            (external, false),
+        ]
+        .into_iter()
+        .map(|(inner, safe)| (svg(&inner), safe))
+        .collect()
+    }
+
+    #[test]
+    fn large_documents_are_checked() {
+        for (document, safe) in large_documents() {
+            assert_eq!(is_safe_image(document.as_bytes()), safe);
+        }
+    }
+
+    /// Documents each check refuses, with the one that refuses them: every
+    /// one took seconds or more to parse unguarded.
+    fn attacks() -> Vec<(&'static str, String, Cost)> {
+        // One tag of 50 000 attributes: half a megabyte, two seconds.
+        let attributes: String = (0..50_000).map(|i| format!(" a{i}=''")).collect();
+        let crowded = svg(&format!("<rect{attributes}/>"));
+
+        // Every pair of prefixed attributes compares 100 KB namespace
+        // names: 445 KB, six seconds.
+        let uri = "x".repeat(100_000);
+        let attributes: String = (0..MAX_ATTRIBUTES - 2)
+            .map(|i| format!(" {}:a{i}=''", if i % 2 == 0 { 'p' } else { 'q' }))
+            .collect();
+        let long_names = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' xmlns:p='urn:{uri}p' xmlns:q='urn:{uri}q'>{}</svg>",
+            format!("<g{attributes}/>").repeat(100)
         );
+
+        // 3 000 elements each declaring one more: 80 KB, twelve seconds.
+        let mut nested = String::new();
+        for level in 0..3_000 {
+            nested.push_str(&format!("<g xmlns:p{level}='urn:{level}'>"));
+        }
+        nested.push_str(&"</g>".repeat(3_000));
+        let nested = svg(&nested);
+
+        // 60 000 declarations, each checked against the earlier ones as it
+        // is read, on a tag that never ends: 1 MB, 2.6 seconds.
+        let declarations: String = (0..60_000).map(|i| format!(" xmlns:p{i}='u'")).collect();
+        let unfinished = format!("<svg xmlns='http://www.w3.org/2000/svg'><g{declarations} bad");
+
+        // 500 entities each holding a tag cut off after 200 attributes,
+        // which roxmltree gathers into one: five seconds.
+        let (mut dtd, mut references) = (String::new(), String::new());
+        for entity in 0..500 {
+            dtd.push_str(&format!(r#"<!ENTITY e{entity} "<x"#));
+            for attribute in 0..200 {
+                dtd.push_str(&format!(" a{entity}_{attribute}=''"));
+            }
+            dtd.push_str(r#"">"#);
+            references.push_str(&format!("&e{entity};"));
+        }
+        let built = with_dtd(&dtd, &format!("{references}<g/>"));
+
+        // Each reference compared with 30 000 declarations: 830 KB, over a
+        // second.
+        let dtd: String = (0..30_000).map(|i| format!("<!ENTITY e{i} 'x'>")).collect();
+        let lookups = with_dtd(&dtd, &"&e29999;".repeat(30_000));
+
+        vec![
+            ("one crowded tag", crowded, Cost::CrowdedTag),
+            ("long namespace names", long_names, Cost::PrefixedAttributes),
+            ("nested declarations", nested, Cost::NamespaceScopes),
+            (
+                "an unfinished tag of declarations",
+                unfinished,
+                Cost::CrowdedTag,
+            ),
+            ("entities building one tag", built, Cost::MarkupEntity),
+            ("entity lookups", lookups, Cost::EntityReferences),
+        ]
+    }
+
+    #[test]
+    fn each_attack_is_refused_by_its_check() {
+        for (name, document, refused_by) in attacks() {
+            assert_eq!(cost(&document), Some(refused_by), "{name}");
+        }
+    }
+
+    /// How long the guard takes on each attack and large document. Run with
+    /// `cargo test --release -p mtc image_guard -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark: timing depends on the machine"]
+    fn benchmark() {
+        let documents = attacks()
+            .into_iter()
+            .map(|(name, document, _)| (name.to_string(), document))
+            .chain(
+                large_documents()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (document, _))| (format!("large document {i}"), document)),
+            );
+        for (name, document) in documents {
+            let started = std::time::Instant::now();
+            is_safe_image(document.as_bytes());
+            let elapsed = started.elapsed();
+            println!("{name}: {} KB, {elapsed:?}", document.len() / 1024);
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "{name}: {elapsed:?}"
+            );
+        }
     }
 
     /// Why `text` is refused for what it costs to read, if it is.
@@ -917,16 +1024,6 @@ mod tests {
         format!(
             r#"<!DOCTYPE svg [{dtd}]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">{inner}</svg>"#
         )
-    }
-
-    /// Runs `check`, which refuses an attack, and fails if it takes longer
-    /// than an unoptimized build on a busy machine should: each attack took
-    /// seconds or more to parse or render unguarded.
-    fn quickly(check: impl FnOnce()) {
-        let started = std::time::Instant::now();
-        check();
-        let elapsed = started.elapsed();
-        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
     }
 
     /// A rect with `count` attributes in all, each value holding what could
@@ -999,6 +1096,28 @@ mod tests {
 
         // roxmltree fails at a `<` in a value, and parses nothing after.
         assert_eq!(scan("<a b='<'/><c d='1' e='2'/>"), Markup::default());
+        // But what it read before failing still costs: each declaration is
+        // checked against the tag's earlier ones as it completes, before the
+        // tag turns out to be malformed, or unfinished.
+        for tail in [" bad", " bad='", " / >", ""] {
+            let text = format!("<r><g a='1' p:b='2' xmlns:x='u' xmlns:y='u'{tail}");
+            let markup = scan(&text);
+            assert_eq!(
+                (
+                    markup.widest_tag,
+                    markup.attribute_pairs,
+                    markup.prefixed_pairs
+                ),
+                (4, 16, 1),
+                "{text}"
+            );
+            // Two declarations: two squared.
+            assert_eq!(markup.namespace_lookups, 2 * 2, "{text}");
+        }
+        let declarations: String = (0..60_000).map(|i| format!(" xmlns:p{i}='u'")).collect();
+        let unfinished = scan(&format!("<g{declarations} bad"));
+        assert_eq!(unfinished.namespace_lookups, 60_000 * 60_000);
+        assert_eq!(unfinished.widest_tag, 60_000);
     }
 
     #[test]
@@ -1035,10 +1154,6 @@ mod tests {
         );
         assert_eq!(cost(&tags(4_096)), Some(Cost::CrowdedTag));
         assert_eq!(cost(&tags(4_095)), None);
-
-        let attributes: String = (0..50_000).map(|i| format!(" a{i}=''")).collect();
-        let crowded = svg(&format!("<rect{attributes}/>"));
-        quickly(|| assert_eq!(cost(&crowded), Some(Cost::CrowdedTag)));
     }
 
     #[test]
@@ -1053,7 +1168,7 @@ mod tests {
             "<svg xmlns='http://www.w3.org/2000/svg' xmlns:p='urn:{uri}p' xmlns:q='urn:{uri}q'>{}</svg>",
             format!("<g{attributes}/>").repeat(100)
         );
-        quickly(|| assert_eq!(cost(&reviewed), Some(Cost::PrefixedAttributes)));
+        assert_eq!(cost(&reviewed), Some(Cost::PrefixedAttributes));
         // The same through an entity.
         let entity = with_dtd(
             &format!("<!ENTITY u '{uri}'>"),
@@ -1071,15 +1186,6 @@ mod tests {
 
     #[test]
     fn nested_namespace_declarations_are_refused() {
-        // 3 000 elements each declaring one more: 80 KB that took twelve
-        // seconds to parse.
-        let mut nested = String::new();
-        for level in 0..3_000 {
-            nested.push_str(&format!("<g xmlns:p{level}='urn:{level}'>"));
-        }
-        nested.push_str(&"</g>".repeat(3_000));
-        let nested = svg(&nested);
-        quickly(|| assert_eq!(cost(&nested), Some(Cost::NamespaceScopes)));
         // Many prefixes in scope, then many elements looking theirs up.
         let declarations: String = (0..126).map(|i| format!(" xmlns:p{i}='u{i}'")).collect();
         let lookups = svg(&format!(
@@ -1131,20 +1237,6 @@ mod tests {
         assert_eq!(names, ["a1", "a2", "b1", "c"]);
         assert_eq!(cost(&pieces), Some(Cost::MarkupEntity));
 
-        // Many such entities: one tag of 100 000 attributes, every entity
-        // within the bound on its own. Parsing it took five seconds.
-        let (mut dtd, mut references) = (String::new(), String::new());
-        for entity in 0..500 {
-            dtd.push_str(&format!(r#"<!ENTITY e{entity} "<x"#));
-            for attribute in 0..200 {
-                dtd.push_str(&format!(" a{entity}_{attribute}=''"));
-            }
-            dtd.push_str(r#"">"#);
-            references.push_str(&format!("&e{entity};"));
-        }
-        let built = with_dtd(&dtd, &format!("{references}<g/>"));
-        quickly(|| assert_eq!(cost(&built), Some(Cost::MarkupEntity)));
-
         // Entities as SVG editors use them, for names, still render.
         let names = r##"<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd" [
             <!ENTITY ns_svg "http://www.w3.org/2000/svg">
@@ -1156,11 +1248,6 @@ mod tests {
 
     #[test]
     fn costly_entity_references_are_refused() {
-        // Each reference compared with 30 000 declarations: 830 KB that
-        // took over a second to parse.
-        let dtd: String = (0..30_000).map(|i| format!("<!ENTITY e{i} 'x'>")).collect();
-        let lookups = with_dtd(&dtd, &"&e29999;".repeat(30_000));
-        quickly(|| assert_eq!(cost(&lookups), Some(Cost::EntityReferences)));
         // An entity referencing another 255 times, which roxmltree allows
         // under each of 2 000 references, every one compared with 10 000
         // declarations: within the bound if each counted once.
