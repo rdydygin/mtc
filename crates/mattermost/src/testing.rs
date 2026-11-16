@@ -6,19 +6,32 @@
 //! poor connection: which requests run in parallel, how long startup takes
 //! in round trips, whether slow downloads survive and stalled ones fail.
 //!
+//! With [`SlowServer::accept_websockets`] it also takes the client's event
+//! connection, greets it as Mattermost does, and sends it whatever
+//! [`SlowServer::push`] is given, so tests can drive real-time events through
+//! the same path the server's would take.
+//!
 //! Enabled by the `test-support` feature.
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
+use futures::{SinkExt as _, StreamExt as _};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
-    sync::watch,
-    task::JoinHandle,
+    sync::{broadcast, watch},
+    task::{JoinHandle, JoinSet},
+};
+use tokio_tungstenite::{
+    WebSocketStream,
+    tungstenite::{Message, handshake::derive_accept_key, protocol::Role},
 };
 
 use crate::runtime;
@@ -165,11 +178,37 @@ impl Reply {
 
 type Route = dyn Fn(&Request) -> Reply + Send + Sync;
 
+/// Where the client opens its event connection.
+const WEBSOCKET_PATH: &str = "/api/v4/websocket";
+
+/// What the server and each connection's task share.
+#[derive(Clone)]
+struct Shared {
+    requests: Arc<Mutex<Vec<Request>>>,
+    closed_stalled_requests: Arc<Mutex<Vec<Request>>>,
+    /// Off until asked for, so other tests see the event connection
+    /// refused as before and no reconnect events reach their sessions.
+    accept_websockets: Arc<AtomicBool>,
+    events: broadcast::Sender<String>,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            requests: Arc::default(),
+            closed_stalled_requests: Arc::default(),
+            accept_websockets: Arc::default(),
+            events: broadcast::channel(64).0,
+        }
+    }
+}
+
 /// A local HTTP server with simulated latency and bandwidth.
 pub struct SlowServer {
     addr: SocketAddr,
-    requests: Arc<Mutex<Vec<Request>>>,
-    closed_stalled_requests: Arc<Mutex<Vec<Request>>>,
+    shared: Shared,
+    /// Accepts connections; owns every connection's task, so aborting it
+    /// on drop ends them too.
     task: JoinHandle<()>,
 }
 
@@ -191,29 +230,42 @@ impl SlowServer {
             .set_nonblocking(true)
             .expect("make the listener non-blocking");
         let addr = std_listener.local_addr().expect("read the server address");
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let closed_stalled_requests = Arc::new(Mutex::new(Vec::new()));
         let route: Arc<Route> = Arc::new(route);
-        let log = requests.clone();
-        let closed = closed_stalled_requests.clone();
         let started = Instant::now();
+        let shared = Shared::default();
+        let connections = shared.clone();
         let task = runtime::spawn(async move {
             let listener = TcpListener::from_std(std_listener).expect("adopt the listener");
+            // Dropped, and so aborted, with this task.
+            let mut tasks = JoinSet::new();
             while let Ok((stream, _)) = listener.accept().await {
+                while tasks.try_join_next().is_some() {}
                 let route = route.clone();
-                let log = log.clone();
-                let closed = closed.clone();
-                tokio::spawn(async move {
-                    let _ = serve(stream, network, started, &*route, &log, &closed).await;
+                let shared = connections.clone();
+                tasks.spawn(async move {
+                    let _ = serve(stream, network, started, &*route, &shared).await;
                 });
             }
         });
-        Self {
-            addr,
-            requests,
-            closed_stalled_requests,
-            task,
-        }
+        Self { addr, shared, task }
+    }
+
+    /// Take event connections from now on, greeting each with `hello`.
+    pub fn accept_websockets(self) -> Self {
+        self.shared.accept_websockets.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Send `event`, a Mattermost event such as
+    /// `{"event": "typing", "data": {…}, "broadcast": {…}}`, on every open
+    /// event connection. Returns how many connections it went to.
+    pub fn push(&self, event: serde_json::Value) -> usize {
+        self.shared.events.send(event.to_string()).unwrap_or(0)
+    }
+
+    /// How many event connections are open.
+    pub fn websockets(&self) -> usize {
+        self.shared.events.receiver_count()
     }
 
     /// The server's base URL, as a person would type it.
@@ -223,14 +275,14 @@ impl SlowServer {
 
     /// Every request so far, in arrival order.
     pub fn requests(&self) -> Vec<Request> {
-        self.requests.lock().unwrap().clone()
+        self.shared.requests.lock().unwrap().clone()
     }
 
     /// Requests for stalled responses closed by the client, even during writes.
     /// Select by method
     /// and path, just as with [`Self::requests`], to ignore unrelated traffic.
     pub fn closed_stalled_requests(&self) -> Vec<Request> {
-        self.closed_stalled_requests.lock().unwrap().clone()
+        self.shared.closed_stalled_requests.lock().unwrap().clone()
     }
 }
 
@@ -240,9 +292,10 @@ async fn serve(
     network: Network,
     started: Instant,
     route: &Route,
-    log: &Mutex<Vec<Request>>,
-    closed: &Mutex<Vec<Request>>,
+    shared: &Shared,
 ) -> std::io::Result<()> {
+    let log = &shared.requests;
+    let closed = &shared.closed_stalled_requests;
     stream.set_nodelay(true)?;
     let mut buffer = Vec::new();
     loop {
@@ -262,6 +315,15 @@ async fn serve(
         }
         request.body = buffer[consumed..consumed + body_len].to_vec();
         buffer.drain(..consumed + body_len);
+        if shared.accept_websockets.load(Ordering::SeqCst)
+            && request.path().split('?').next() == Some(WEBSOCKET_PATH)
+            && let Some(key) = request.header("sec-websocket-key")
+        {
+            // The client says nothing before the handshake's answer.
+            let accept = derive_accept_key(key.as_bytes());
+            log.lock().unwrap().push(request);
+            return serve_websocket(stream, &accept, &shared.events).await;
+        }
         log.lock().unwrap().push(request.clone());
 
         let reply = route(&request);
@@ -292,6 +354,49 @@ async fn serve(
             while stream.read(&mut ignored).await.unwrap_or(0) != 0 {}
             closed.lock().unwrap().push(request);
             return Ok(());
+        }
+    }
+}
+
+/// Finish the handshake, greet, then send pushed events until either side
+/// closes. What the client sends (its token, typing) is read and dropped.
+async fn serve_websocket(
+    mut stream: TcpStream,
+    accept: &str,
+    events: &broadcast::Sender<String>,
+) -> std::io::Result<()> {
+    // Subscribe before answering, so nothing pushed after the client sees
+    // the handshake is missed.
+    let mut events = events.subscribe();
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let mut socket = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
+    let hello = r#"{"event":"hello","data":{"server_version":"test"}}"#;
+    if socket.send(Message::text(hello)).await.is_err() {
+        return Ok(());
+    }
+    loop {
+        tokio::select! {
+            message = socket.next() => match message {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Ok(()),
+                Some(Ok(_)) => {}
+            },
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if socket.send(Message::text(event)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
         }
     }
 }
@@ -401,12 +506,11 @@ mod tests {
                 let mut probe = TcpStream::from_std(stream.try_clone()?)?;
                 let stream = TcpStream::from_std(stream)?;
                 let gate = Gate::default();
-                let requests = Arc::new(Mutex::new(Vec::new()));
-                let closed = Arc::new(Mutex::new(Vec::new()));
+                let shared = Shared::default();
+                let requests = shared.requests.clone();
+                let closed = shared.closed_stalled_requests.clone();
                 let task = tokio::spawn({
                     let gate = gate.clone();
-                    let requests = requests.clone();
-                    let closed = closed.clone();
                     async move {
                         let route = move |_: &Request| {
                             Reply::bytes(vec![1, 2])
@@ -418,8 +522,7 @@ mod tests {
                             Network::new(Duration::ZERO),
                             Instant::now(),
                             &route,
-                            &requests,
-                            &closed,
+                            &shared,
                         )
                         .await
                     }
