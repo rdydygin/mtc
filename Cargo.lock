@@ -4562,6 +4562,7 @@ dependencies = [
  "serde_json",
  "session",
  "sha2 0.10.9",
+ "simplecss",
  "tokio",
  "url",
  "usvg 0.46.0",

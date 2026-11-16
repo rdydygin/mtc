@@ -31,6 +31,7 @@ url.workspace = true
 data-url = "0.3"
 imagesize = "0.14"
 roxmltree = "0.21"
+simplecss = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
