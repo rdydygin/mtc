@@ -4543,16 +4543,19 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "data-url",
  "dirs 6.0.0",
  "env_logger",
  "futures",
  "getrandom 0.3.4",
  "gpui-kit",
  "hmac",
+ "imagesize 0.14.0",
  "libc",
  "log",
  "mattermost",
  "reqwest",
+ "roxmltree 0.21.2",
  "security-framework",
  "semver",
  "serde",
@@ -4561,7 +4564,6 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "url",
- "usvg 0.46.0",
  "windows-registry 0.6.1",
 ]
 

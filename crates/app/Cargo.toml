@@ -27,8 +27,10 @@ serde_json.workspace = true
 session.workspace = true
 sha2 = "0.10"
 url.workspace = true
-# The SVG parser GPUI renders images with; the same version and features.
-usvg = { version = "0.46", default-features = false }
+# What usvg, GPUI's SVG renderer, parses with; the same versions.
+data-url = "0.3"
+imagesize = "0.14"
+roxmltree = "0.21"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
