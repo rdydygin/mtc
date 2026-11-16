@@ -268,7 +268,7 @@ impl Composer {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "file".into());
-            let is_image = image_extension(&name);
+            let is_image = image_extension(&name) && is_raster_file(&path);
             self.add_file(name, metadata.len(), FileSource::Path(path), is_image, cx);
         }
     }
@@ -284,11 +284,14 @@ impl Composer {
                 ClipboardEntry::Image(image) => {
                     let name = format!("Pasted image.{}", format_extension(image.format));
                     let size = image.bytes.len() as u64;
+                    // GPUI would render a pasted SVG in the app; it gets no
+                    // preview (see `crate::svg_process`).
+                    let is_image = image.format != ImageFormat::Svg;
                     self.add_file(
                         name,
                         size,
                         FileSource::Pasted(Arc::new(image.clone())),
-                        true,
+                        is_image,
                         cx,
                     );
                     handled = true;
@@ -1094,11 +1097,11 @@ fn render_file(
 ) -> impl IntoElement + use<> {
     let local_id = file.local_id;
     let media = match (&file.source, file.is_image) {
-        (FileSource::Pasted(image), _) => {
+        (FileSource::Pasted(image), true) => {
             AttachmentMedia::new().src(ImageSource::Image(image.clone()))
         }
         (FileSource::Path(path), true) => AttachmentMedia::new().src(path.clone()),
-        (FileSource::Path(_), false) => AttachmentMedia::new().child(Icon::new(IconName::File)),
+        (_, false) => AttachmentMedia::new().child(Icon::new(IconName::File)),
     };
     let description: SharedString = format_size(file.size).into();
     let remove = entity.clone();
@@ -1141,6 +1144,17 @@ fn image_extension(name: &str) -> bool {
     .any(|ext| lower.ends_with(ext))
 }
 
+/// Whether the file at `path` starts as a raster image GPUI decodes. GPUI
+/// renders any other picture file as SVG, in the app, so such a file gets
+/// no preview, whatever its name says (see `crate::svg_process`).
+fn is_raster_file(path: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    let mut header = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(64).read_to_end(&mut header))
+        .is_ok_and(|_| !crate::svg_process::needs_helper(&header))
+}
+
 fn format_extension(format: ImageFormat) -> &'static str {
     match format {
         ImageFormat::Jpeg => "jpg",
@@ -1180,6 +1194,21 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn only_raster_files_get_a_preview() {
+        let directory =
+            std::env::temp_dir().join(format!("mtc-preview-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let disguised = directory.join("disguised.png");
+        std::fs::write(&disguised, br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#).unwrap();
+        let png = directory.join("real.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR").unwrap();
+        assert!(!is_raster_file(&disguised));
+        assert!(is_raster_file(&png));
+        assert!(!is_raster_file(&directory.join("missing.png")));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
