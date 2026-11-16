@@ -2,6 +2,8 @@
 //! first, with All and Unread tabs. The workspace shows the open thread
 //! beside it.
 
+use std::collections::HashSet;
+
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _,
@@ -16,14 +18,18 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, ScrollStrategy,
-    SharedString, Styled as _, Subscription, UniformListScrollHandle, WeakEntity, Window, div,
-    prelude::FluentBuilder as _, rems, uniform_list,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Resource,
+    ScrollStrategy, SharedString, Styled as _, Subscription, UniformListScrollHandle, WeakEntity,
+    Window, div, prelude::FluentBuilder as _, rems, uniform_list,
 };
-use mattermost::{ChannelId, PostId};
-use session::{FollowedThreads, LoadState, Session, ThreadFilter};
+use mattermost::{ChannelId, PostId, UserId};
+use session::{FollowedThread, FollowedThreads, LoadState, Session, ThreadFilter};
 
-use crate::{http::avatar_url, time};
+use crate::{
+    http::avatar_url,
+    image_scope::{ImageStore, image_scope},
+    time,
+};
 
 /// A row's height in rems: the author line, two lines of preview, and the
 /// participants. Rows share one height so the list can be virtualized.
@@ -75,6 +81,11 @@ pub struct ThreadsView {
     row_focus: FocusHandle,
     scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
+    /// The participants' pictures in the rows. The workspace keeps the view
+    /// once it has been shown, across team switches, so pictures of people
+    /// no followed thread shows any more are freed as the threads change
+    /// (see [`Self::release_pictures`]); the rest go with the view.
+    images: Entity<ImageStore>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -92,6 +103,7 @@ impl ThreadsView {
                     threads.update(cx, |t, cx| t.load(filter, cx));
                 }
                 this.sync_rows(window, cx);
+                this.release_pictures(cx);
                 cx.notify()
             }),
             cx.observe(&directory, |_, _, cx| cx.notify()),
@@ -112,6 +124,7 @@ impl ThreadsView {
             row_focus: cx.focus_handle().tab_stop(true),
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
+            images: ImageStore::new(cx),
             _subscriptions: subscriptions,
         }
     }
@@ -137,6 +150,26 @@ impl ThreadsView {
         if owns_focus && previous != self.rows {
             self.focus_selected(window, cx);
         }
+    }
+
+    /// Free the pictures of people no followed thread shows, in either tab,
+    /// such as the last team's after a team switch. Pictures still shown
+    /// stay, so a refresh or a tab switch doesn't redraw them.
+    fn release_pictures(&mut self, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        let threads = session.threads().read(cx);
+        let shown: HashSet<String> = [ThreadFilter::All, ThreadFilter::Unread]
+            .into_iter()
+            .flat_map(|filter| threads.threads(filter))
+            .flat_map(shown_participants)
+            .filter_map(|id| participant_picture(session, id, cx))
+            .collect();
+        self.images.update(cx, |images, cx| {
+            images.retain(
+                |picture| matches!(picture, Resource::Uri(uri) if shown.contains(uri.as_ref())),
+                cx,
+            )
+        });
     }
 
     pub fn focus_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -354,25 +387,19 @@ impl ThreadsView {
             count => format!("{count} replies"),
         };
         let when = time::recent(thread.last_reply_at());
-        // Whoever replied most recently comes first.
-        let participants = thread.participants();
-        let shown: Vec<AnyElement> = participants
-            .iter()
-            .rev()
-            .take(PARTICIPANTS_SHOWN)
+        let shown: Vec<AnyElement> = shown_participants(thread)
             .map(|id| {
-                let mut avatar = Avatar::new().name(directory.display_name(id)).size_5();
-                if let Some(user) = directory.user(id) {
-                    avatar = avatar.src(avatar_url(
-                        session.client(),
-                        id.as_str(),
-                        user.last_picture_update,
-                    ));
-                }
-                avatar.into_any_element()
+                Avatar::new()
+                    .name(directory.display_name(id))
+                    .size_5()
+                    .when_some(participant_picture(session, id, cx), Avatar::src)
+                    .into_any_element()
             })
             .collect();
-        let others = participants.len().saturating_sub(PARTICIPANTS_SHOWN);
+        let others = thread
+            .participants()
+            .len()
+            .saturating_sub(PARTICIPANTS_SHOWN);
 
         let label = format!(
             "{author}{}: {}. {replies}{}{}",
@@ -490,7 +517,7 @@ impl ThreadsView {
         let more_view = view.clone();
         let menu_root = root.clone();
         let more_root = root.clone();
-        h_flex()
+        let row = h_flex()
             .h(rems(ROW_HEIGHT))
             .px_2()
             .py_0p5()
@@ -537,8 +564,10 @@ impl ThreadsView {
                             None => menu,
                         }),
                 )
-            }))
-            .into_any_element()
+            }));
+        // Each row draws inside the store: the list lays rows out while it
+        // prepaints, and their pictures must not reach the app-wide store.
+        image_scope(&self.images, row).into_any_element()
     }
 
     fn render_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -642,6 +671,21 @@ impl ThreadsView {
             })
             .into_any_element()
     }
+}
+
+/// The participants a row shows, whoever replied most recently first.
+fn shown_participants(thread: &FollowedThread) -> impl Iterator<Item = &UserId> {
+    thread.participants().iter().rev().take(PARTICIPANTS_SHOWN)
+}
+
+/// `id`'s picture, once the directory knows them.
+fn participant_picture(session: &Session, id: &UserId, cx: &App) -> Option<String> {
+    let user = session.directory().read(cx).user(id)?;
+    Some(avatar_url(
+        session.client(),
+        id.as_str(),
+        user.last_picture_update,
+    ))
 }
 
 impl Focusable for ThreadsView {
@@ -803,6 +847,92 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         assert_eq!(opened.borrow().last(), Some(&PostId::from("t18")));
+    }
+
+    /// Rows hold their participants' pictures in the view's own store, not
+    /// GPUI's app-wide one. The view stays once shown, so a picture no
+    /// followed thread shows any more is freed, and closing the view frees
+    /// the rest.
+    #[gpui_kit::test]
+    fn participant_pictures_go_with_their_threads_and_the_view(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        use gpui_kit::{ImgResourceLoader, Resource};
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            // Stray local connections reach test ports too: answer by
+            // method and path.
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("GET", "/api/v4/users/me/teams/team/threads") => Reply::json(json!({
+                    "threads": [{
+                        "id": "t0", "reply_count": 1, "last_reply_at": 100,
+                        "participants": [{ "id": "ann" }],
+                        "post": { "id": "t0", "channel_id": "town", "message": "Thread" },
+                    }],
+                    "total": 1,
+                })),
+                ("POST", "/api/v4/users/ids") => Reply::json(json!([
+                    { "id": "ann", "username": "ann", "last_picture_update": 1 },
+                ])),
+                _ => route(request),
+            }
+        });
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| ThreadsView::new(session.clone(), window, cx))
+            })
+            .unwrap()
+        });
+        cx.update(crate::http::PictureClient::install);
+        view.update(cx, |v, cx| v.shown(cx));
+        let ann: UserId = "ann".into();
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, cx| {
+                v.rows.len() == 1 && participant_picture(v.session.read(cx), &ann, cx).is_some()
+            })
+        });
+        let picture = view.read_with(cx, |v, cx| {
+            Resource::Uri(
+                participant_picture(v.session.read(cx), &ann, cx)
+                    .unwrap()
+                    .into(),
+            )
+        });
+        let images = view.read_with(cx, |v, _| v.images.clone());
+        let held = {
+            let (images, picture) = (images.clone(), picture.clone());
+            move |cx: &App| vec![images.read(cx).get(&picture)]
+        };
+        let painted = draw_until_painted(cx, handle, held.clone()).remove(0);
+        assert!(
+            !cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&picture)),
+            "the row's picture stays out of the app-wide store"
+        );
+
+        let threads = session.read_with(cx, |s, _| s.threads().clone());
+        threads.update(cx, |t, cx| t.forget(&"t0".into(), cx));
+        cx.run_until_parked();
+        assert!(
+            images.read_with(cx, |images, _| images.get(&picture).is_none()),
+            "a picture no thread shows is freed"
+        );
+        assert!(!in_atlas(cx, handle, &painted), "from the GPU atlas too");
+
+        threads.update(cx, |t, cx| t.reload(ThreadFilter::All, cx));
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.rows.len() == 1));
+        draw_until_painted(cx, handle, held);
+        drop(images);
+        let images = view.read_with(cx, |v, _| v.images.downgrade());
+        cx.update_window(handle, |_, window, _| window.remove_window())
+            .unwrap();
+        drop(view);
+        // GPUI releases dropped entities when it next flushes effects.
+        cx.update(|_| {});
+        cx.run_until_parked();
+        assert!(images.upgrade().is_none(), "closing frees the pictures");
     }
 
     #[gpui_kit::test]
