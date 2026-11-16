@@ -173,6 +173,7 @@ pub(crate) async fn read_limited(
 }
 
 const RESPONSE_TOO_LARGE: &str = "The server’s response is too large.";
+const FILE_TOO_LARGE: &str = "The file is larger than the server said.";
 
 impl Client {
     /// Sign in with a username or email and password. `mfa_token` is the
@@ -664,7 +665,8 @@ impl Client {
 
     /// The raw bytes of a user's profile picture.
     pub async fn user_image(&self, user: &UserId) -> Result<Vec<u8>> {
-        self.bytes(format!("users/{user}/image")).await
+        self.bytes(format!("users/{user}/image"), MAX_IMAGE_BYTES)
+            .await
     }
 
     /// Upload a file to `channel` so a post can attach it by id.
@@ -720,17 +722,56 @@ impl Client {
         }
     }
 
-    /// The full contents of an uploaded file.
+    /// The full contents of an uploaded file, held in memory, so only for
+    /// files up to [`MAX_API_BYTES`]. [`Self::download_file_to`] saves any
+    /// size.
     pub async fn download_file(&self, file_id: &str) -> Result<Vec<u8>> {
-        self.bytes(format!("files/{file_id}")).await
+        self.bytes(format!("files/{file_id}"), MAX_API_BYTES).await
+    }
+
+    /// Stream an uploaded file into `write` as it arrives, failing once more
+    /// than `limit` bytes arrive after decompression. Returns the bytes
+    /// written. `write` runs on the I/O runtime, where blocking is allowed.
+    pub async fn download_file_to(
+        &self,
+        file_id: &str,
+        limit: u64,
+        mut write: impl FnMut(&[u8]) -> std::io::Result<()> + Send + 'static,
+    ) -> Result<u64> {
+        let inner = self.inner.clone();
+        let path = format!("api/v4/files/{file_id}");
+        runtime::run(async move {
+            let response = inner
+                .http
+                .get(inner.server.join(&path)?)
+                .bearer_auth(&inner.token)
+                .send()
+                .await
+                .map_err(connect_error)?;
+            let mut response = check(response).await?;
+            if response.content_length().is_some_and(|len| len > limit) {
+                bail!(FILE_TOO_LARGE);
+            }
+            let mut written: u64 = 0;
+            while let Some(chunk) = response.chunk().await.map_err(connect_error)? {
+                if chunk.len() as u64 > limit - written {
+                    bail!(FILE_TOO_LARGE);
+                }
+                tokio::task::block_in_place(|| write(&chunk)).context("couldn’t save the file")?;
+                written += chunk.len() as u64;
+            }
+            Ok(written)
+        })
+        .await
     }
 
     /// The raw bytes of an uploaded file's thumbnail.
     pub async fn file_thumbnail(&self, file_id: &str) -> Result<Vec<u8>> {
-        self.bytes(format!("files/{file_id}/thumbnail")).await
+        self.bytes(format!("files/{file_id}/thumbnail"), MAX_IMAGE_BYTES)
+            .await
     }
 
-    async fn bytes(&self, path: String) -> Result<Vec<u8>> {
+    async fn bytes(&self, path: String, limit: usize) -> Result<Vec<u8>> {
         let inner = self.inner.clone();
         runtime::run(async move {
             let url = inner.server.join(&format!("api/v4/{path}"))?;
@@ -741,12 +782,7 @@ impl Client {
                 .send()
                 .await
                 .map_err(connect_error)?;
-            Ok(check(response)
-                .await?
-                .bytes()
-                .await
-                .map_err(connect_error)?
-                .to_vec())
+            read_limited(check(response).await?, limit, FILE_TOO_LARGE).await
         })
         .await
     }
@@ -1643,6 +1679,53 @@ mod tests {
         let downloaded = block_on(client.download_file("file")).unwrap();
         assert!(started.elapsed() > Duration::from_secs(1));
         assert_eq!(downloaded, expected);
+    }
+
+    #[test]
+    fn downloads_stream_into_the_writer_within_their_limit() {
+        let bomb = gzip(&vec![0; 64 * 1024]);
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            match (request.method(), request.path()) {
+                ("GET", "/api/v4/files/small") => Reply::bytes(vec![7; 3000]),
+                ("GET", "/api/v4/files/bomb") => {
+                    Reply::bytes(bomb.clone()).header("Content-Encoding", "gzip")
+                }
+                ("GET", "/api/v4/files/declared") => {
+                    Reply::bytes(vec![0; 64 * 1024]).stall_after(0)
+                }
+                ("GET", "/api/v4/files/thumb/thumbnail") => {
+                    Reply::bytes(bomb.clone()).header("Content-Encoding", "gzip")
+                }
+                _ => Reply::not_found(),
+            }
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let download = |id: &str| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let result = block_on(client.download_file_to(id, 4096, move |chunk| {
+                send.send(chunk.to_vec()).unwrap();
+                Ok(())
+            }));
+            (result, receive.try_iter().flatten().collect::<Vec<u8>>())
+        };
+        let (written, bytes) = download("small");
+        assert_eq!(written.unwrap(), 3000);
+        assert_eq!(bytes, vec![7; 3000]);
+        for id in ["bomb", "declared"] {
+            let (result, bytes) = download(id);
+            assert_eq!(result.unwrap_err().to_string(), FILE_TOO_LARGE, "{id}");
+            assert!(bytes.len() <= 4096, "{id}");
+        }
+        assert!(download("missing").0.is_err());
+
+        let failing = block_on(client.download_file_to("small", 4096, |_| {
+            Err(std::io::ErrorKind::StorageFull.into())
+        }));
+        assert_eq!(failing.unwrap_err().to_string(), "couldn’t save the file");
+
+        // Thumbnails are images, bounded like any other.
+        let thumbnail = block_on(client.file_thumbnail("thumb")).unwrap();
+        assert_eq!(thumbnail.len(), 64 * 1024);
     }
 
     #[test]

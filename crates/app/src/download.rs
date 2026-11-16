@@ -22,19 +22,16 @@ pub fn save(
 ) {
     window
         .spawn(cx, async move |cx| {
-            let result = async {
-                let bytes = client.download_file(&file.id).await?;
-                let name = file.name.clone();
+            let result = {
+                let file = file.clone();
                 cx.background_spawn(async move {
                     let dir = dirs::download_dir()
                         .or_else(dirs::home_dir)
                         .ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
-                    let path = write_download(&dir, &name, &bytes)?;
-                    anyhow::Ok(path)
+                    download_to(&client, &file, &dir).await
                 })
                 .await
-            }
-            .await;
+            };
             let _ = cx.update(|window, cx| match result {
                 Ok(path) => done(&path, window, cx),
                 Err(err) => window.push_notification(
@@ -124,10 +121,48 @@ fn opens_with_system(path: &Path) -> bool {
     )
 }
 
-fn write_download(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
-    let (path, mut file) = create_download(dir, name)?;
+/// Stream `file` into a new file in `dir` as it arrives, rather than holding
+/// it in memory, and return where it went. A failed download leaves nothing
+/// behind.
+async fn download_to(client: &Client, file: &FileInfo, dir: &Path) -> anyhow::Result<PathBuf> {
+    let (path, out) = claim_download(dir, &file.name)?;
+    let written = client
+        .download_file_to(&file.id, download_limit(file.size), move |chunk| {
+            (&out).write_all(chunk)
+        })
+        .await;
+    if let Err(err) = written {
+        if let Err(remove) = std::fs::remove_file(&path) {
+            log::warn!("removing the incomplete {}: {remove}", path.display());
+        }
+        return Err(err);
+    }
+    Ok(path)
+}
+
+/// The most a download may grow to: the size the server gave for the file,
+/// with room to spare, so a server can't fill the disk with an endless body.
+fn download_limit(size: i64) -> u64 {
+    const SLACK: u64 = 16 * 1024 * 1024;
+    let size = u64::try_from(size).unwrap_or(0);
+    size.saturating_add(size / 4).saturating_add(SLACK)
+}
+
+/// Claim a new file in `dir` for `name`, quarantined on macOS before any
+/// content arrives.
+fn claim_download(dir: &Path, name: &str) -> io::Result<(PathBuf, File)> {
+    let (path, file) = create_download(dir, name)?;
     #[cfg(target_os = "macos")]
-    quarantine(&file)?;
+    if let Err(err) = quarantine(&file) {
+        let _ = std::fs::remove_file(&path);
+        return Err(err);
+    }
+    Ok((path, file))
+}
+
+#[cfg(test)]
+fn write_download(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let (path, mut file) = claim_download(dir, name)?;
     file.write_all(bytes)?;
     Ok(path)
 }
@@ -209,6 +244,61 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn downloads_stream_to_disk_and_leave_nothing_when_they_fail() {
+        use mattermost::testing::{Network, Reply, SlowServer};
+        use std::time::Duration;
+
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (request.method(), request.path()) {
+                ("GET", "/api/v4/files/report") => Reply::bytes(b"quarterly".to_vec()),
+                ("GET", "/api/v4/files/endless") => {
+                    Reply::bytes(vec![0; 17 * 1024 * 1024]).stall_after(0)
+                }
+                _ => Reply::not_found(),
+            }
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        let dir = Downloads::new();
+        let file = |id: &str, size: i64| {
+            let mut file = FileInfo::default();
+            file.id = id.into();
+            file.name = "report.pdf".into();
+            file.size = size;
+            file
+        };
+
+        let path =
+            futures::executor::block_on(download_to(&client, &file("report", 9), &dir.0)).unwrap();
+        assert_eq!(path, dir.0.join("report.pdf"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"quarterly");
+
+        // Far more than the server said the file holds; and a missing file.
+        for id in ["endless", "missing"] {
+            assert!(
+                futures::executor::block_on(download_to(&client, &file(id, 0), &dir.0)).is_err(),
+                "{id}"
+            );
+        }
+        let names: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["report.pdf"]);
+    }
+
+    #[test]
+    fn download_limits_follow_the_declared_size() {
+        const SLACK: u64 = 16 * 1024 * 1024;
+        assert_eq!(download_limit(0), SLACK);
+        assert_eq!(download_limit(-5), SLACK);
+        assert_eq!(download_limit(400), 500 + SLACK);
+        assert_eq!(
+            download_limit(i64::MAX),
+            i64::MAX as u64 + (i64::MAX as u64) / 4 + SLACK
+        );
     }
 
     #[test]
