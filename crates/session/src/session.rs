@@ -2064,9 +2064,10 @@ impl Session {
                 if user_id == self.me.id {
                     return;
                 }
-                // Only the typing line for that conversation redraws.
-                self.directory
-                    .update(cx, |d, cx| d.ensure([user_id.clone()], cx));
+                // Nothing else: only a typing line showing that conversation
+                // reacts, and it looks up the names it shows. Looking them up
+                // here would redraw everything that shows users, for typing
+                // in conversations nobody is looking at.
                 self.typing.update(cx, |typing, cx| {
                     typing.start(channel_id, parent_id, user_id, cx)
                 });
@@ -2639,6 +2640,11 @@ mod slow_network_tests {
         });
         // The user's own signal, echoed back, is not someone typing.
         session.update(cx, |s, cx| s.handle_event(signal("town", "", "me"), cx));
+        // Names are for whatever shows the typing line to look up; asking
+        // here would redraw everything that shows users, for every signal.
+        session.read_with(cx, |s, cx| {
+            assert!(!s.directory().read(cx).is_looking_up());
+        });
         cx.run_until_parked();
 
         assert_eq!(
