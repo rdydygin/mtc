@@ -1422,6 +1422,7 @@ mod tests {
     /// GPUI's clock, until `done`.
     fn wait_for_network(
         cx: &mut TestAppContext,
+        what: &str,
         mut done: impl FnMut(&mut TestAppContext) -> bool,
     ) {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1430,7 +1431,7 @@ mod tests {
             if done(cx) {
                 return;
             }
-            assert!(Instant::now() < deadline, "timed out waiting");
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -1438,7 +1439,9 @@ mod tests {
     /// A channel open in a window, with a sidebar in another, on an event
     /// connection the test pushes to. Users the server knows: Ann, Bob,
     /// and Rem (as "New Name"); Tia only from her second lookup; anyone
-    /// else it leaves out, as it does deleted or hidden users.
+    /// else it leaves out, as it does deleted or hidden users. Each load the
+    /// session starts with gets an answer whose handling shows, so the
+    /// fixture can tell when all of them are done.
     struct TypingFixture {
         server: SlowServer,
         session: Entity<Session>,
@@ -1478,20 +1481,59 @@ mod tests {
                         .collect();
                         Reply::json(json!(users))
                     }
+                    ("POST", "/api/v4/users/status/ids") => {
+                        let asked: Vec<String> =
+                            serde_json::from_slice(request.body()).unwrap_or_default();
+                        let statuses: Vec<_> = asked
+                            .iter()
+                            .map(|id| json!({ "user_id": id, "status": "online" }))
+                            .collect();
+                        Reply::json(json!(statuses))
+                    }
+                    ("GET", "/api/v4/users/me/preferences/favorite_channel") => {
+                        Reply::json(json!([{ "user_id": "me", "category": "favorite_channel",
+                                             "name": "town", "value": "true" }]))
+                    }
+                    ("GET", "/api/v4/users/me/preferences/flagged_post") => {
+                        Reply::json(json!([{ "user_id": "me", "category": "flagged_post",
+                                             "name": "n119", "value": "true" }]))
+                    }
+                    ("GET", "/api/v4/teams/team/commands/autocomplete") => {
+                        Reply::json(json!([{ "trigger": "away" }]))
+                    }
+                    ("GET", "/api/v4/emoji") => Reply::json(json!([
+                        { "id": "e1", "creator_id": "ann", "name": "party", "delete_at": 0 },
+                    ])),
+                    ("GET", "/api/v4/users/me/teams/team/threads") => Reply::json(json!({
+                        "total_unread_threads": 1, "total_unread_mentions": 0, "threads": [],
+                    })),
+                    // Opening the channel marks it read, then reads it back.
+                    ("POST", "/api/v4/channels/members/me/view") => {
+                        Reply::json(json!({ "status": "OK" }))
+                    }
+                    ("GET", "/api/v4/channels/town/members/me") => Reply::json(json!({
+                        "channel_id": "town", "user_id": "me", "last_viewed_at": 777,
+                    })),
                     _ => route(request),
                 }
             })
             .accept_websockets();
-            // Online before the channel opens, so no catch-up runs mid-test.
+            // Online before the channel opens, so no catch-up runs mid-test,
+            // and the channel listed, as the workspace only opens listed
+            // ones (and only those are marked read).
             cx.executor().allow_parking();
             cx.update(gpui_kit::init);
+            // Pictures come from memory, not the network.
+            cx.update(crate::http::PictureClient::install);
             let client = Client::new_unverified(&server.url(), "token").unwrap();
             let mut me = User::default();
             me.id = "me".into();
             let session = cx.new(|cx| Session::new(client, me, Some(TeamId::from("team")), cx));
-            wait_for_network(cx, |cx| {
+            wait_for_network(cx, "the event connection and channels", |cx| {
                 server.websockets() > 0
-                    && session.read_with(cx, |s, _| s.connection() == session::Connection::Online)
+                    && session.read_with(cx, |s, _| {
+                        s.connection() == session::Connection::Online && s.is_loaded()
+                    })
             });
             session.update(cx, |s, cx| {
                 s.open_channel(&"town".into(), cx);
@@ -1538,45 +1580,110 @@ mod tests {
             this
         }
 
-        /// Draw, run every GPUI timer and wait for every request to be
-        /// answered and handled, until a few rounds change nothing.
+        /// Wait until every load the session and the view started with has
+        /// been answered and handled, as seen in what each one changes.
         fn settle(&self, cx: &mut TestAppContext) {
             use gpui_kit::test::TestWindowExt as _;
-            let watched = [
-                notifications(&self.session, cx),
-                notifications(&self.directory, cx),
-            ];
-            let changes = || watched.iter().map(|(n, _)| n.get()).sum::<usize>();
-            let mut quiet = 0;
-            for _ in 0..50 {
-                let before = (changes(), self.server.requests().len());
-                for window in cx.update(|cx| cx.windows()) {
-                    cx.update_window(window, |_, window, cx| window.render_frame(cx))
-                        .unwrap();
-                }
-                cx.executor().advance_clock(Duration::from_secs(10));
-                wait_for_network(cx, |cx| {
-                    self.server.answering() == 0
-                        && !self.directory.read_with(cx, |d, _| d.is_looking_up())
-                        && self.session.read_with(cx, |s, _| s.is_loaded())
-                        && self
-                            .view
-                            .read_with(cx, |v, cx| v.timeline.read(cx).entries().len() >= 60)
-                });
-                quiet = if (changes(), self.server.requests().len()) == before {
-                    quiet + 1
-                } else {
-                    0
-                };
-                if quiet == 3 {
+            for window in cx.update(|cx| cx.windows()) {
+                cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                    .unwrap();
+            }
+            // Let the directory's batch, with Ann in it, go out.
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(20));
+            let (ann, me) = (
+                mattermost::UserId::from("ann"),
+                mattermost::UserId::from("me"),
+            );
+            let unfinished = |cx: &mut TestAppContext| {
+                let (session, directory, view) = (&self.session, &self.directory, &self.view);
+                [
+                    ("teams", session.read_with(cx, |s, _| s.teams_loaded())),
+                    ("channels", session.read_with(cx, |s, _| s.is_loaded())),
+                    (
+                        "favorites",
+                        session.read_with(cx, |s, _| s.is_favorite(&"town".into())),
+                    ),
+                    (
+                        "saved",
+                        session.read_with(cx, |s, _| s.is_saved(&"n119".into())),
+                    ),
+                    (
+                        "commands",
+                        session.read_with(cx, |s, _| !s.autocomplete_commands().is_empty()),
+                    ),
+                    (
+                        "emoji",
+                        session.read_with(cx, |s, _| s.custom_emoji().len() == 1),
+                    ),
+                    (
+                        "thread totals",
+                        session.read_with(cx, |s, cx| s.threads().read(cx).unread_threads() == 1),
+                    ),
+                    (
+                        "read state",
+                        session.read_with(cx, |s, _| {
+                            s.channel(&"town".into())
+                                .is_some_and(|c| c.last_viewed_at() == 777)
+                        }),
+                    ),
+                    (
+                        "lookups",
+                        directory
+                            .read_with(cx, |d, _| !d.is_looking_up() && d.user(&ann).is_some()),
+                    ),
+                    (
+                        "own status",
+                        directory.read_with(cx, |d, _| d.status(&me) == mattermost::Status::Online),
+                    ),
+                    (
+                        "posts",
+                        view.read_with(cx, |v, cx| v.timeline.read(cx).entries().len() >= 60),
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(load, done)| (!done).then_some(load))
+                .collect::<Vec<_>>()
+            };
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                cx.run_until_parked();
+                let unfinished = unfinished(cx);
+                if unfinished.is_empty() {
                     break;
                 }
+                assert!(
+                    Instant::now() < deadline,
+                    "startup loads never finished: {unfinished:?}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
             }
-            assert_eq!(quiet, 3, "the session never settled");
-            assert!(
-                self.directory
-                    .read_with(cx, |d, _| d.user(&"ann".into()).is_some())
-            );
+            // Those are all the loads there were, so none is still on its way.
+            const STARTUP: [&str; 14] = [
+                "/api/v4/websocket",
+                "/api/v4/users/me/teams",
+                "/api/v4/users/me/teams/team/channels",
+                "/api/v4/users/me/teams/team/channels/members",
+                "/api/v4/users/me/preferences/favorite_channel",
+                "/api/v4/users/me/preferences/flagged_post",
+                "/api/v4/teams/team/commands/autocomplete",
+                "/api/v4/emoji",
+                "/api/v4/users/me/teams/team/threads",
+                "/api/v4/users/status/ids",
+                "/api/v4/users/ids",
+                "/api/v4/channels/town/posts",
+                "/api/v4/channels/members/me/view",
+                "/api/v4/channels/town/members/me",
+            ];
+            for request in self.server.requests() {
+                let path = request.path().split('?').next().unwrap_or_default();
+                // Other local programs may probe the port; only the client
+                // asks for the API.
+                assert!(
+                    !path.starts_with("/api/") || STARTUP.contains(&path),
+                    "a startup load the fixture doesn't wait for: {path}"
+                );
+            }
         }
 
         /// The typing line as screen readers get it, once drawn.
@@ -1598,7 +1705,7 @@ mod tests {
             assert_eq!(self.server.push(typing_event(channel, user)), 1);
             let kind = TimelineKind::Channel(channel.into());
             let user = mattermost::UserId::from(user);
-            wait_for_network(cx, |cx| {
+            wait_for_network(cx, "the typing event", |cx| {
                 self.typing
                     .read_with(cx, |t, _| t.users(&kind).any(|u| u == &user))
             });
@@ -1610,7 +1717,7 @@ mod tests {
             self.line_text(cx);
             cx.run_until_parked();
             cx.executor().advance_clock(Duration::from_millis(20));
-            wait_for_network(cx, |cx| {
+            wait_for_network(cx, "the name lookups", |cx| {
                 !self.directory.read_with(cx, |d, _| d.is_looking_up())
             });
             self.line_text(cx)

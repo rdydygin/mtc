@@ -17,7 +17,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -186,8 +186,6 @@ const WEBSOCKET_PATH: &str = "/api/v4/websocket";
 struct Shared {
     requests: Arc<Mutex<Vec<Request>>>,
     closed_stalled_requests: Arc<Mutex<Vec<Request>>>,
-    /// Requests read but not yet answered in full.
-    answering: Arc<AtomicUsize>,
     /// Off until asked for, so other tests see the event connection
     /// refused as before and no reconnect events reach their sessions.
     accept_websockets: Arc<AtomicBool>,
@@ -199,26 +197,9 @@ impl Default for Shared {
         Self {
             requests: Arc::default(),
             closed_stalled_requests: Arc::default(),
-            answering: Arc::default(),
             accept_websockets: Arc::default(),
             events: broadcast::channel(64).0,
         }
-    }
-}
-
-/// Counts a request as being answered for as long as it lives.
-struct Answering<'a>(&'a AtomicUsize);
-
-impl<'a> Answering<'a> {
-    fn start(count: &'a AtomicUsize) -> Self {
-        count.fetch_add(1, Ordering::SeqCst);
-        Self(count)
-    }
-}
-
-impl Drop for Answering<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -287,12 +268,6 @@ impl SlowServer {
         self.shared.events.receiver_count()
     }
 
-    /// How many requests have been read but not yet answered in full.
-    /// Event connections don't count.
-    pub fn answering(&self) -> usize {
-        self.shared.answering.load(Ordering::SeqCst)
-    }
-
     /// The server's base URL, as a person would type it.
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
@@ -349,9 +324,6 @@ async fn serve(
             log.lock().unwrap().push(request);
             return serve_websocket(stream, &accept, &shared.events).await;
         }
-        // Counted before it's logged, so a request seen in the log is
-        // either answered or still counted.
-        let _answering = Answering::start(&shared.answering);
         log.lock().unwrap().push(request.clone());
 
         let reply = route(&request);
