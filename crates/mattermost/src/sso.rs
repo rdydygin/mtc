@@ -29,7 +29,11 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::{Client, User, client::normalize_server_url, runtime};
+use crate::{
+    Client, User,
+    client::{normalize_server_url, redirect_policy},
+    runtime,
+};
 
 /// The URL scheme the server's `/login/desktop` page opens for our tokens.
 pub const CALLBACK_SCHEME: &str = "mattermost-dev";
@@ -127,6 +131,7 @@ pub async fn login_options(server: &str) -> Result<LoginOptions> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
+            .redirect(redirect_policy())
             .build()?;
         let url = server.join("api/v4/config/client?format=old")?;
         let config: Value = http
@@ -296,9 +301,12 @@ impl SsoAttempt {
         };
         let server = self.server.clone();
         let (token, user) = runtime::run(async move {
+            // The one-time server token travels in the body, which a 307 or
+            // 308 redirect resends.
             let http = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
+                .redirect(redirect_policy())
                 .build()?;
             let response = http
                 .post(server.join("api/v4/users/login/desktop_token")?)

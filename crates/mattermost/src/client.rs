@@ -107,8 +107,38 @@ pub(crate) fn http_client(timeouts: Timeouts) -> Result<reqwest::Client> {
         // Grow HTTP/2 flow-control windows to the link's bandwidth-delay
         // product, so a high-latency link isn't capped by the default window.
         .http2_adaptive_window(true)
+        .redirect(redirect_policy())
         .build()
         .context("failed to build the HTTP client")
+}
+
+/// How many redirects a request follows, as reqwest's default policy.
+const MAX_REDIRECTS: usize = 10;
+
+/// Follow redirects, but never from HTTPS to anything else.
+///
+/// reqwest drops the `Authorization` header only when a redirect changes the
+/// host or port. A redirect that changes just the scheme, such as
+/// `https://chat.example.com/…` to `http://chat.example.com:443/…`, would
+/// send the session token in clear text. Mattermost's own
+/// `api/v4/image?url=…` redirects to any URL a message names, so other
+/// people's messages can trigger exactly that through an inline image.
+pub(crate) fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else if is_downgrade(attempt.previous(), attempt.url()) {
+            attempt.error("refused a redirect from HTTPS to an insecure address")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// Whether following a redirect to `next` leaves HTTPS once a request in
+/// the chain (`previous`, starting with the original URL) used it.
+fn is_downgrade(previous: &[Url], next: &Url) -> bool {
+    next.scheme() != "https" && previous.iter().any(|url| url.scheme() == "https")
 }
 
 impl Client {
@@ -1287,6 +1317,61 @@ mod tests {
                 json!([{"user_id":"me", "category":"flagged_post", "name":"p", "value":"true"}])
             );
         }
+    }
+
+    #[test]
+    fn redirects_never_leave_https() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        let secure = url("https://chat.example.com/api/v4/image?url=x");
+        for (previous, next, downgrade) in [
+            // Same host and port: reqwest would keep the token.
+            (
+                vec![secure.clone()],
+                "http://chat.example.com:443/steal",
+                true,
+            ),
+            (vec![secure.clone()], "http://chat.example.com/", true),
+            (vec![secure.clone()], "ws://chat.example.com/", true),
+            (
+                vec![secure.clone(), url("https://cdn.example.com/a")],
+                "http://chat.example.com:443/b",
+                true,
+            ),
+            (
+                vec![secure.clone()],
+                "https://chat.example.com/other",
+                false,
+            ),
+            (vec![secure.clone()], "https://cdn.example.com/a", false),
+            // A server the person chose to reach over HTTP stays reachable.
+            (
+                vec![url("http://chat.local/a")],
+                "http://chat.local/b",
+                false,
+            ),
+            (
+                vec![url("http://chat.local/a")],
+                "https://chat.local/b",
+                false,
+            ),
+        ] {
+            assert_eq!(is_downgrade(&previous, &url(next)), downgrade, "{next}");
+        }
+    }
+
+    #[test]
+    fn follows_redirects_that_keep_the_scheme() {
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (request.method(), request.path()) {
+                ("GET", "/api/v4/users/me") => Reply::bytes(Vec::new())
+                    .status(302)
+                    .header("Location", "/api/v4/users/moved"),
+                ("GET", "/api/v4/users/moved") => Reply::json(json!({"id": "me"})),
+                _ => Reply::not_found(),
+            }
+        });
+        let client = Client::new_unverified(&server.url(), "token").unwrap();
+        assert_eq!(block_on(client.me()).unwrap().id, "me".into());
     }
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {
