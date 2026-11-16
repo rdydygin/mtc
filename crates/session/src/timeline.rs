@@ -191,6 +191,24 @@ impl Entry {
         changed
     }
 
+    /// Whether the message or attachments name any of the custom emoji
+    /// `names`, the only way custom emoji reach the prepared text.
+    fn uses_custom_emoji(&self, names: &HashSet<String>) -> bool {
+        if names.is_empty() {
+            return false;
+        }
+        let names_any = |text: &str| {
+            custom_emoji_names(text)
+                .iter()
+                .any(|name| names.contains(name.as_ref()))
+        };
+        names_any(&self.post.message)
+            || self
+                .attachments
+                .iter()
+                .any(|attachment| names_any(attachment.emoji_source()))
+    }
+
     /// The newest moment this post changed, for incremental refresh.
     fn changed_at(&self) -> Millis {
         self.post
@@ -198,6 +216,28 @@ impl Entry {
             .max(self.post.create_at)
             .max(self.post.edit_at)
     }
+}
+
+/// Prepare again, for `custom`, the entries that `previous` may have shown
+/// differently: only those naming an emoji that changed between the two,
+/// since preparing is a Markdown parse or two per post. Returns the
+/// indices whose display text changed.
+fn reprepare_changed(
+    entries: &mut [Entry],
+    previous: &CustomEmojis,
+    custom: &CustomEmojis,
+) -> Vec<usize> {
+    let changed = previous.changed_names(custom);
+    entries
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, entry)| {
+            changed
+                .as_ref()
+                .is_none_or(|names| entry.uses_custom_emoji(names))
+        })
+        .filter_map(|(ix, entry)| entry.reprepare(custom).then_some(ix))
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -438,9 +478,7 @@ impl Timeline {
     fn adopt(&self, prepared: Prepared) -> Vec<Entry> {
         let mut entries = prepared.entries;
         if prepared.custom_emoji != self.custom_emoji {
-            for entry in &mut entries {
-                entry.reprepare(&self.custom_emoji);
-            }
+            reprepare_changed(&mut entries, &prepared.custom_emoji, &self.custom_emoji);
         }
         entries
     }
@@ -815,15 +853,12 @@ impl Timeline {
         if custom == self.custom_emoji {
             return;
         }
-        self.custom_emoji = custom;
-        let mut changed = false;
-        for (ix, entry) in self.entries.iter_mut().enumerate() {
-            if entry.reprepare(&self.custom_emoji) {
-                cx.emit(TimelineEvent::Updated(ix));
-                changed = true;
-            }
+        let previous = std::mem::replace(&mut self.custom_emoji, custom);
+        let changed = reprepare_changed(&mut self.entries, &previous, &self.custom_emoji);
+        for &ix in &changed {
+            cx.emit(TimelineEvent::Updated(ix));
         }
-        if changed {
+        if !changed.is_empty() {
             cx.notify();
         }
     }
@@ -1031,6 +1066,78 @@ mod tests {
                 "Updated"
             )
         });
+    }
+
+    #[gpui_kit::test]
+    fn new_custom_emoji_reprepare_only_posts_that_name_them(cx: &mut TestAppContext) {
+        let (timeline, events) = timeline(cx);
+        let mut party = post("party", 1);
+        party.message = "time to :party:".into();
+        let mut link = post("link", 2);
+        // Colons alone, as in links and times, don't name an emoji.
+        link.message = "at 10:30 see https://example.com/a:b and :other:".into();
+        let mut bot = post("bot", 3);
+        bot.message.clear();
+        bot.props.insert(
+            "attachments".into(),
+            serde_json::json!([{"text":"deploy :party:"}]),
+        );
+        timeline.update(cx, |t, cx| {
+            for post in [party, link, bot] {
+                t.upsert(post, cx);
+            }
+        });
+        let texts = |cx: &mut TestAppContext| {
+            timeline.read_with(cx, |t, _| {
+                t.entries()
+                    .iter()
+                    .map(|e| e.message().text().clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = texts(cx);
+        events.borrow_mut().clear();
+        let first = CustomEmojis::new([("party".into(), "https://example.com/p.png".into())]);
+        timeline.update(cx, |t, cx| t.set_custom_emoji(first.clone(), cx));
+        assert_eq!(
+            *events.borrow(),
+            [TimelineEvent::Updated(0), TimelineEvent::Updated(2)]
+        );
+        let after = texts(cx);
+        assert!(after[0].contains("![:party:](https://example.com/p.png)"));
+        assert!(
+            Arc::ptr_eq(&before[1], &after[1]),
+            "a post naming no changed emoji is not prepared again"
+        );
+        timeline.read_with(cx, |t, _| {
+            assert!(
+                t.entries()[2].attachments()[0]
+                    .text()
+                    .full()
+                    .text()
+                    .contains("![:party:]")
+            );
+        });
+
+        // Another emoji arriving leaves the posts that don't use it alone.
+        events.borrow_mut().clear();
+        let mut second = first.clone();
+        second.insert("other".into(), "https://example.com/o.png".into());
+        timeline.update(cx, |t, cx| t.set_custom_emoji(second.clone(), cx));
+        assert_eq!(*events.borrow(), [TimelineEvent::Updated(1)]);
+        let latest = texts(cx);
+        assert!(Arc::ptr_eq(&after[0], &latest[0]));
+
+        // A removed emoji is shown as written again.
+        events.borrow_mut().clear();
+        let mut third = second;
+        third.remove("party");
+        timeline.update(cx, |t, cx| t.set_custom_emoji(third, cx));
+        assert_eq!(
+            *events.borrow(),
+            [TimelineEvent::Updated(0), TimelineEvent::Updated(2)]
+        );
+        assert!(!texts(cx)[0].contains("![:party:]"));
     }
 
     #[gpui_kit::test]
