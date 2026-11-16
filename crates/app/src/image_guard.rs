@@ -60,10 +60,15 @@ pub fn is_safe_image(body: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(body) else {
         return true;
     };
-    // Parsing itself is quadratic in the attributes of one tag and worse in
-    // namespace declarations, here and again in usvg, so documents that
-    // could cost that much are refused before either parses them.
-    if has_crowded_tag(text) || declares_markup_entity(text) || declares_many_namespaces(text) {
+    // Parsing itself is quadratic in the attributes of one tag, and worse in
+    // namespace declarations and entity references, here and again in usvg,
+    // so documents that could cost that much are refused before either
+    // parses them.
+    if has_crowded_tag(text)
+        || declares_markup_entity(text)
+        || declares_many_namespaces(text)
+        || entities_cost_too_much(text)
+    {
         return false;
     }
     // usvg parses with exactly these options, so entities expand the same
@@ -134,23 +139,74 @@ fn has_crowded_tag(text: &str) -> bool {
 /// leaves its attributes to the next tag: referencing many such entities
 /// builds one tag of any size. SVG uses entities for namespace names and
 /// the like, not for markup, so any `<` in a value refuses the document.
-///
-/// The value is the first quoted string after `<!ENTITY`: the name and the
-/// optional `%` before it hold no quote. Both searches stop at the next `<`,
-/// before the next declaration, so each byte is read at most twice.
 fn declares_markup_entity(text: &str) -> bool {
-    text.match_indices("<!ENTITY").any(|(start, _)| {
+    entity_values(text).any(|value| value.contains('<'))
+}
+
+/// The most work resolving entity references may take, in name bytes
+/// compared and value bytes copied; see [`entities_cost_too_much`].
+/// Illustrator declares a dozen namespace names as entities, and its older
+/// files one per distinct style, referenced from every element: a few
+/// thousand references among fifty entities of a hundred bytes cost a few
+/// million. At this bound the worst body parses in a few tenths of a second,
+/// and expands to at most 64 MB of text.
+const MAX_ENTITY_WORK: usize = 1 << 26;
+
+/// Whether resolving entity references could cost more than
+/// [`MAX_ENTITY_WORK`]. roxmltree finds a referenced entity by comparing its
+/// name with each declaration's in turn, at most its length plus one per
+/// comparison, then reads the value in its place. So `r` references with
+/// names of `b` bytes in all, among `d` declarations whose longest value is
+/// `l`, cost at most `d·(r + b) + r·l`. A value that references another
+/// multiplies that by up to 255 for every reference to it, without a single
+/// extra declaration; SVG editors never nest entities, so that refuses the
+/// document outright.
+fn entities_cost_too_much(text: &str) -> bool {
+    let (mut declarations, mut longest) = (0usize, 0);
+    for value in entity_values(text) {
+        if entity_references(value).0 > 0 {
+            return true;
+        }
+        declarations += 1;
+        longest = longest.max(value.len());
+    }
+    let (references, names) = entity_references(text);
+    let lookups = declarations.saturating_mul(references.saturating_add(names));
+    lookups.saturating_add(references.saturating_mul(longest)) > MAX_ENTITY_WORK
+}
+
+/// The value of each `<!ENTITY` declaration: the first quoted string after
+/// it, as the name and the optional `%` before it hold no quote. The search
+/// for the opening quote stops at the next `<`, before the next
+/// declaration, and no value starts inside another that uses the same
+/// quote, so each byte is read at most three times.
+fn entity_values(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices("<!ENTITY").filter_map(|(start, _)| {
         let declaration = &text[start + "<!ENTITY".len()..];
-        let Some(open) = declaration.find(['<', '"', '\'']) else {
-            return false;
-        };
-        let quote = declaration.as_bytes()[open];
-        quote != b'<'
-            && declaration[open + 1..]
-                .bytes()
-                .find(|&byte| byte == quote || byte == b'<')
-                == Some(b'<')
+        let open = declaration.find(['<', '"', '\''])?;
+        let quote = declaration[open..].chars().next()?;
+        if quote == '<' {
+            return None;
+        }
+        let value = &declaration[open + 1..];
+        Some(&value[..value.find(quote).unwrap_or(value.len())])
     })
+}
+
+/// How many entity references `text` holds, and their names' length in all.
+/// Every `&` starts one in a valid document, outside comments and CDATA,
+/// but character references and the five names XML predefines resolve
+/// without a lookup. Each piece between two `&` is read once.
+fn entity_references(text: &str) -> (usize, usize) {
+    const PREDEFINED: [&str; 5] = ["lt;", "gt;", "amp;", "apos;", "quot;"];
+    text.split('&')
+        .skip(1)
+        .filter(|after| {
+            !after.starts_with('#') && !PREDEFINED.iter().any(|name| after.starts_with(name))
+        })
+        .fold((0, 0), |(count, names), after| {
+            (count + 1, names + after.find(';').unwrap_or(after.len()))
+        })
 }
 
 /// The most namespace declarations a document may make. roxmltree gives
@@ -749,6 +805,72 @@ mod tests {
             <!ENTITY red "#f00">
         ]><svg xmlns="&ns_svg;" xmlns:xlink="&ns_xlink;" width="1" height="1"><rect width="1" height="1" fill="&red;"/></svg>"##;
         assert!(is_safe_image(names.as_bytes()));
+    }
+
+    #[test]
+    fn costly_entity_references_are_refused_before_parsing() {
+        let doc = |dtd: &str, inner: &str| {
+            format!(
+                r#"<!DOCTYPE svg [{dtd}]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">{inner}</svg>"#
+            )
+        };
+        // Each reference compared with 30 000 declarations: 830 KB that
+        // took over a second to parse.
+        let dtd: String = (0..30_000).map(|i| format!("<!ENTITY e{i} 'x'>")).collect();
+        let lookups = doc(&dtd, &"&e29999;".repeat(30_000));
+        // An entity referencing another 255 times, which roxmltree allows
+        // under each of 2 000 references, every one compared with 10 000
+        // declarations: within the bound if each counted once.
+        let unused: String = (0..10_000).map(|i| format!("<!ENTITY d{i} ''>")).collect();
+        let nested = doc(
+            &format!("{unused}<!ENTITY b ''><!ENTITY a '{}'>", "&b;".repeat(255)),
+            &"&a;".repeat(2_000),
+        );
+        // 100 KB copied in 10 000 times: a gigabyte of text from 130 KB.
+        let expanding = doc(
+            &format!("<!ENTITY x '{}'>", "x".repeat(100_000)),
+            &format!("<text>{}</text>", "&x;".repeat(10_000)),
+        );
+        let started = std::time::Instant::now();
+        for hostile in [&lookups, &nested, &expanding] {
+            assert!(!is_safe_image(hostile.as_bytes()));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn entities_as_editors_write_them_still_render() {
+        // Illustrator's namespace names, and older files' style per
+        // entity, referenced from every element.
+        let mut dtd = String::from(
+            r#"<!ENTITY ns_extend "http://ns.adobe.com/Extensibility/1.0/">
+            <!ENTITY ns_ai "http://ns.adobe.com/AdobeIllustrator/10.0/">
+            <!ENTITY ns_graphs "http://ns.adobe.com/Graphs/1.0/">
+            <!ENTITY ns_svg "http://www.w3.org/2000/svg">
+            <!ENTITY ns_xlink "http://www.w3.org/1999/xlink">"#,
+        );
+        for style in 0..50 {
+            dtd.push_str(&format!(
+                r#"<!ENTITY st{style} "fill:none;stroke:#{style:06};stroke-width:2;stroke-miterlimit:10;">"#
+            ));
+        }
+        let shapes: String = (0..5_000)
+            .map(|i| format!(r#"<rect width="1" height="1" style="&st{};"/>"#, i % 50))
+            .collect();
+        let illustrator = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd" [{dtd}]><svg xmlns:x="&ns_extend;" xmlns:i="&ns_ai;" xmlns:graph="&ns_graphs;" xmlns="&ns_svg;" xmlns:xlink="&ns_xlink;" width="10" height="10">{shapes}<text>Fish &amp; chips &lt;3 &#x41;&#65;</text></svg>"#
+        );
+        assert!(is_safe_image(illustrator.as_bytes()));
+        // Escapes alone need no lookup, however many.
+        let escapes = svg(&format!(
+            "<text>{}</text>",
+            "&amp;&lt;&#65;".repeat(100_000)
+        ));
+        assert!(is_safe_image(escapes.as_bytes()));
     }
 
     #[test]
