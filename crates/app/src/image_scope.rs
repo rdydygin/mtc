@@ -13,7 +13,7 @@
 //! on their own, so scopes go around rows and popover content, never around
 //! a view that changes often, such as the composer.
 
-use std::{collections::HashMap, panic::Location};
+use std::{collections::HashMap, panic::Location, sync::Arc};
 
 use gpui_kit::{
     AnyElement, AnyImageCache, App, AppContext as _, Bounds, Element, ElementId, Entity,
@@ -45,13 +45,36 @@ impl ImageStore {
         store
     }
 
+    /// Free the pictures loaded from resources `keep` turns down, from
+    /// memory and the GPU atlas, for a part of the interface that outlives
+    /// what it shows. Loads still running are cancelled.
+    pub(crate) fn retain(&mut self, keep: impl Fn(&Resource) -> bool, cx: &mut App) {
+        let mut freed = Vec::new();
+        self.images.retain(|resource, item| {
+            if keep(resource) {
+                return true;
+            }
+            freed.extend(item.get().and_then(Result::ok));
+            false
+        });
+        // A window being updated is out of GPUI's list until the update
+        // ends, and drop_image only reaches the windows in it.
+        if !freed.is_empty() {
+            cx.defer(move |cx| {
+                for image in freed {
+                    cx.drop_image(image, None);
+                }
+            });
+        }
+    }
+
     /// The picture at `resource`: `None` while it loads or if it was never
     /// asked for.
     #[cfg(test)]
     pub(crate) fn get(
         &self,
         resource: &Resource,
-    ) -> Option<Result<std::sync::Arc<RenderImage>, ImageCacheError>> {
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         self.images.get(resource)?.get()
     }
 }
@@ -62,7 +85,7 @@ impl ImageCache for ImageStore {
         resource: &Resource,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Result<std::sync::Arc<RenderImage>, ImageCacheError>> {
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         self.images
             .entry(resource.clone())
             .or_insert_with(|| ImageCacheItem::new(resource, cx))
@@ -157,5 +180,61 @@ impl Element for ImageScope {
     ) {
         let child = &mut self.child;
         window.with_image_cache(Some(self.images.clone()), |window| child.paint(window, cx));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::Arc;
+
+    use gpui_kit::{
+        AnyWindowHandle, App, AppContext as _, ImageCacheError, RenderImage, TestAppContext,
+    };
+
+    /// Draw `window` until every picture `pictures` looks up has decoded and
+    /// been painted into the window's GPU atlas, and return them. Pictures
+    /// served by [`crate::http::PictureClient`] load on the test executor,
+    /// so a few frames settle them.
+    pub(crate) fn draw_until_painted(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        pictures: impl Fn(&App) -> Vec<Option<Result<Arc<RenderImage>, ImageCacheError>>>,
+    ) -> Vec<Arc<RenderImage>> {
+        use gpui_kit::test::TestWindowExt as _;
+        for _ in 0..20 {
+            cx.run_until_parked();
+            let painted = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    pictures(cx)
+                        .into_iter()
+                        .map(|picture| match picture {
+                            Some(Ok(image)) if window.has_image_atlas_entry(&image) => Some(image),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .unwrap();
+            if let Some(painted) = painted {
+                return painted;
+            }
+        }
+        let states = cx.update(|cx| {
+            pictures(cx)
+                .into_iter()
+                .map(|picture| picture.map(|result| result.is_ok()))
+                .collect::<Vec<_>>()
+        });
+        panic!("pictures never painted from their store: {states:?}");
+    }
+
+    /// Whether `window`'s GPU atlas still holds `image`.
+    pub(crate) fn in_atlas(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        image: &RenderImage,
+    ) -> bool {
+        cx.update_window(window, |_, window, _| window.has_image_atlas_entry(image))
+            .unwrap()
     }
 }
