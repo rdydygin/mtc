@@ -17,7 +17,7 @@ use futures::future::BoxFuture;
 use gpui_kit::http_client::{AsyncBody, HttpClient, Request, Response, Url, http::HeaderValue};
 use mattermost::Client;
 
-use crate::cache;
+use crate::{cache, image_guard::is_safe_image};
 
 pub struct ServerHttpClient {
     client: Client,
@@ -54,11 +54,20 @@ impl HttpClient for ServerHttpClient {
         let generation = self.generation;
         Box::pin(async move {
             if keep && let Some(body) = cache::image(&uri) {
+                if !is_safe_image(&body) {
+                    return refused();
+                }
                 return Ok(Response::builder()
                     .status(200)
                     .body(AsyncBody::from(body))?);
             }
             let fetched = client.fetch(&uri).await?;
+            if !is_safe_image(&fetched.body) {
+                log::warn!(
+                    "not showing an SVG image that reads local files or nests compressed SVG"
+                );
+                return refused();
+            }
             if keep && fetched.status == 200 && !fetched.body.is_empty() {
                 cache::save_image(generation, &uri, &fetched.body);
             }
@@ -69,6 +78,13 @@ impl HttpClient for ServerHttpClient {
             Ok(response.body(AsyncBody::from(fetched.body))?)
         })
     }
+}
+
+/// A failed response, which GPUI shows as a picture that can't be shown.
+fn refused() -> anyhow::Result<Response<AsyncBody>> {
+    Ok(Response::builder()
+        .status(415)
+        .body(AsyncBody::from(Vec::new()))?)
 }
 
 /// The URL of a user's profile picture. `version` changes when the user

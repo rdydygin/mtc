@@ -386,7 +386,15 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(20), async {
                 let listener = TcpListener::bind("127.0.0.1:0").await?;
                 let mut client = TcpStream::connect(listener.local_addr()?).await?;
-                let (stream, _) = listener.accept().await?;
+                // Other local programs may connect too; take the client's own
+                // connection.
+                let ours = client.local_addr()?;
+                let stream = loop {
+                    let (stream, peer) = listener.accept().await?;
+                    if peer == ours {
+                        break stream;
+                    }
+                };
                 let stream = stream.into_std()?;
                 // Observe the reset on a duplicate of the server socket before
                 // allowing the response write. No scheduling delay is involved.

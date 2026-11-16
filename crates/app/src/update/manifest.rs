@@ -40,6 +40,12 @@ pub struct Download {
 impl Manifest {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let manifest: Self = serde_json::from_slice(bytes).context("unreadable release feed")?;
+        // The page is handed to the system's URL opener when the person
+        // clicks Download, so a `file:` path or another app's scheme must
+        // never get that far.
+        if !is_secure(&manifest.page, cfg!(debug_assertions)) {
+            bail!("release feed links to a release page that isn’t over HTTPS");
+        }
         for download in manifest.downloads.values() {
             if !is_sha256(&download.sha256) {
                 bail!("release feed has a malformed checksum");
@@ -88,6 +94,11 @@ pub(super) fn allowed_url(source: &url::Url, target: &url::Url, debug: bool) -> 
 
 impl Manifest {
     pub(super) fn validate_downloads(&self, feed: &url::Url) -> Result<()> {
+        let page = url::Url::parse(&self.page)?;
+        anyhow::ensure!(
+            allowed_url(feed, &page, cfg!(debug_assertions)),
+            "release pages require HTTPS (loopback HTTP only for debug testing)"
+        );
         for download in self.downloads.values() {
             let target = url::Url::parse(&download.url)?;
             anyhow::ensure!(
@@ -279,6 +290,34 @@ mod tests {
                 "{target}"
             );
         }
+    }
+
+    #[test]
+    fn release_pages_must_be_web_pages() {
+        let official = "https://github.com/rdydygin/mtc/releases/tag/v0.2.0";
+        for (page, allowed) in [
+            (official, true),
+            ("file:///Applications/Calculator.app", false),
+            ("file:///tmp/evil.command", false),
+            ("javascript:alert(1)", false),
+            ("mattermost-dev://callback", false),
+            ("x-apple.systempreferences:com.apple.preference", false),
+            ("smb://attacker.example/share", false),
+            ("http://example.com/release", false),
+            ("https://user:password@example.com/release", false),
+            ("/Applications/Calculator.app", false),
+        ] {
+            let feed = FEED.replace(official, page);
+            assert_eq!(Manifest::parse(feed.as_bytes()).is_ok(), allowed, "{page}");
+        }
+        // A loopback page is only for a loopback debug feed, never an HTTPS one.
+        let mut manifest = Manifest::parse(FEED.as_bytes()).unwrap();
+        manifest.page = "http://127.0.0.1/page".into();
+        assert!(
+            manifest
+                .validate_downloads(&url::Url::parse(FEED_URL).unwrap())
+                .is_err()
+        );
     }
 
     #[test]
