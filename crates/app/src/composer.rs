@@ -60,7 +60,12 @@ struct PendingFile {
     name: SharedString,
     size: u64,
     source: FileSource,
-    is_image: bool,
+    /// The picture the attachment shows, if it is one: bytes the app holds,
+    /// whose raster format was read from those same bytes. GPUI is never
+    /// given a path to read again, which by then could hold an SVG it would
+    /// render in the app (see `crate::svg_process`). Without one the
+    /// attachment shows a file icon.
+    preview: Option<Arc<Image>>,
     status: AttachmentStatus,
     uploaded: Option<FileInfo>,
     error: Option<SharedString>,
@@ -268,9 +273,31 @@ impl Composer {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "file".into());
-            let is_image = image_extension(&name) && is_raster_file(&path);
-            self.add_file(name, metadata.len(), FileSource::Path(path), is_image, cx);
+            let wants_preview = image_extension(&name);
+            let source = FileSource::Path(path.clone());
+            let local_id = self.add_file(name, metadata.len(), source, None, cx);
+            if wants_preview {
+                self.load_preview(local_id, path, cx);
+            }
         }
+    }
+
+    /// Read the picture at `path` once, off the UI thread, and show those
+    /// bytes if they are a raster image.
+    fn load_preview(&mut self, local_id: u64, path: PathBuf, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let preview = cx
+                .background_spawn(async move { read_preview(&path) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(file) = this.files.iter_mut().find(|f| f.local_id == local_id) {
+                    file.preview = preview;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Attach images from a paste; returns whether the paste was handled.
@@ -284,16 +311,11 @@ impl Composer {
                 ClipboardEntry::Image(image) => {
                     let name = format!("Pasted image.{}", format_extension(image.format));
                     let size = image.bytes.len() as u64;
-                    // GPUI would render a pasted SVG in the app; it gets no
-                    // preview (see `crate::svg_process`).
-                    let is_image = image.format != ImageFormat::Svg;
-                    self.add_file(
-                        name,
-                        size,
-                        FileSource::Pasted(Arc::new(image.clone())),
-                        is_image,
-                        cx,
-                    );
+                    let image = Arc::new(image.clone());
+                    // GPUI decodes a pasted image by the format it claims.
+                    let preview =
+                        (raster_format(&image.bytes) == Some(image.format)).then(|| image.clone());
+                    self.add_file(name, size, FileSource::Pasted(image), preview, cx);
                     handled = true;
                 }
                 ClipboardEntry::ExternalPaths(paths) => {
@@ -311,9 +333,9 @@ impl Composer {
         name: String,
         size: u64,
         source: FileSource,
-        is_image: bool,
+        preview: Option<Arc<Image>>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> u64 {
         let local_id = self.next_file_id;
         self.next_file_id += 1;
         self.files.push(PendingFile {
@@ -321,13 +343,14 @@ impl Composer {
             name: name.into(),
             size,
             source,
-            is_image,
+            preview,
             status: AttachmentStatus::Uploading,
             uploaded: None,
             error: None,
             _upload: None,
         });
         self.upload(local_id, cx);
+        local_id
     }
 
     fn upload(&mut self, local_id: u64, cx: &mut Context<Self>) {
@@ -1096,12 +1119,9 @@ fn render_file(
     cx: &gpui_kit::App,
 ) -> impl IntoElement + use<> {
     let local_id = file.local_id;
-    let media = match (&file.source, file.is_image) {
-        (FileSource::Pasted(image), true) => {
-            AttachmentMedia::new().src(ImageSource::Image(image.clone()))
-        }
-        (FileSource::Path(path), true) => AttachmentMedia::new().src(path.clone()),
-        (_, false) => AttachmentMedia::new().child(Icon::new(IconName::File)),
+    let media = match &file.preview {
+        Some(image) => AttachmentMedia::new().src(ImageSource::Image(image.clone())),
+        None => AttachmentMedia::new().child(Icon::new(IconName::File)),
     };
     let description: SharedString = format_size(file.size).into();
     let remove = entity.clone();
@@ -1144,15 +1164,32 @@ fn image_extension(name: &str) -> bool {
     .any(|ext| lower.ends_with(ext))
 }
 
-/// Whether the file at `path` starts as a raster image GPUI decodes. GPUI
-/// renders any other picture file as SVG, in the app, so such a file gets
-/// no preview, whatever its name says (see `crate::svg_process`).
-fn is_raster_file(path: &std::path::Path) -> bool {
+/// The most bytes read to preview a picked file: as many as a picture
+/// from the server may have.
+const MAX_PREVIEW_BYTES: usize = crate::svg_process::MAX_INPUT;
+
+/// The file at `path`, read once and held, if it is a raster image of at
+/// most [`MAX_PREVIEW_BYTES`].
+fn read_preview(path: &std::path::Path) -> Option<Arc<Image>> {
     use std::io::Read as _;
-    let mut header = Vec::new();
+    let mut bytes = Vec::new();
     std::fs::File::open(path)
-        .and_then(|file| file.take(64).read_to_end(&mut header))
-        .is_ok_and(|_| !crate::svg_process::needs_helper(&header))
+        .ok()?
+        .take(MAX_PREVIEW_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_PREVIEW_BYTES {
+        return None;
+    }
+    let format = raster_format(&bytes)?;
+    Some(Arc::new(Image::from_bytes(format, bytes)))
+}
+
+/// The raster format `bytes` are in, if GPUI decodes it. GPUI renders any
+/// other picture as SVG, in the app, whatever its name or claimed format.
+fn raster_format(bytes: &[u8]) -> Option<ImageFormat> {
+    let format = image::guess_format(bytes).ok()?;
+    ImageFormat::from_mime_type(format.to_mime_type()).filter(|f| *f != ImageFormat::Svg)
 }
 
 fn format_extension(format: ImageFormat) -> &'static str {
@@ -1195,18 +1232,80 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn only_raster_files_get_a_preview() {
-        let directory =
-            std::env::temp_dir().join(format!("mtc-preview-test-{}", std::process::id()));
+    /// Gradients that inherit from each other in a cycle: usvg, GPUI's SVG
+    /// renderer, follows them forever.
+    const HANG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><linearGradient id="a" xlink:href="#b"/><linearGradient id="b" xlink:href="#c"/><linearGradient id="c" xlink:href="#b"/><rect width="9" height="9" fill="url(#a)"/></svg>"##;
+
+    fn png() -> Vec<u8> {
+        use image::ImageEncoder as _;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[255; 16], 2, 2, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        png
+    }
+
+    fn scratch_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("mtc-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn previews_only_bytes_that_are_a_raster_image() {
+        let directory = scratch_directory("preview-bytes");
         let disguised = directory.join("disguised.png");
-        std::fs::write(&disguised, br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#).unwrap();
-        let png = directory.join("real.png");
-        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR").unwrap();
-        assert!(!is_raster_file(&disguised));
-        assert!(is_raster_file(&png));
-        assert!(!is_raster_file(&directory.join("missing.png")));
+        std::fs::write(&disguised, HANG).unwrap();
+        let picture = directory.join("picture.png");
+        std::fs::write(&picture, png()).unwrap();
+        assert!(read_preview(&disguised).is_none());
+        let preview = read_preview(&picture).unwrap();
+        assert_eq!(
+            (preview.format(), preview.bytes()),
+            (ImageFormat::Png, &png()[..])
+        );
+        assert!(read_preview(&directory.join("missing.png")).is_none());
+        assert_eq!(raster_format(HANG), None);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A picked picture is read once; replacing the file afterwards, here
+    /// with an SVG that would hang GPUI's renderer, changes nothing GPUI
+    /// draws, and GPUI never reads the path itself.
+    #[gpui_kit::test]
+    fn a_picked_picture_shows_the_bytes_it_was_admitted_with(cx: &mut TestAppContext) {
+        let (handle, composer) = open_composer(cx);
+        // Attaching also starts an upload, which fails on the I/O runtime.
+        cx.executor().allow_parking();
+        let directory = scratch_directory("preview-swap");
+        let path = directory.join("picture.png");
+        std::fs::write(&path, png()).unwrap();
+        composer.update(cx, |c, cx| c.attach_paths([path.clone()], cx));
+        wait_until(cx, |cx| {
+            composer.read_with(cx, |c, _| c.files[0].preview.is_some())
+        });
+
+        std::fs::write(&path, HANG).unwrap();
+        let redraw = |cx: &mut TestAppContext| {
+            cx.update(|cx| handle.update(cx, |_, window, _| window.refresh()).unwrap());
+            cx.run_until_parked();
+        };
+        redraw(cx);
+        let preview = composer.read_with(cx, |c, _| c.files[0].preview.clone().unwrap());
+        assert_eq!(
+            (preview.format(), preview.bytes()),
+            (ImageFormat::Png, &png()[..])
+        );
+        cx.update(|cx| {
+            assert!(preview.is_asset_cached(cx), "GPUI draws the bytes read");
+            assert!(!ImageSource::from(path.clone()).is_asset_cached(cx));
+        });
+
+        // Picked again, the file is read as the SVG it now is: no preview.
+        composer.update(cx, |c, cx| c.attach_paths([path.clone()], cx));
+        redraw(cx);
+        composer.read_with(cx, |c, _| assert!(c.files[1].preview.is_none()));
+        cx.update(|cx| assert!(!ImageSource::from(path.clone()).is_asset_cached(cx)));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -1739,7 +1838,7 @@ mod tests {
                         name: format!("draft-{id}.txt").into(),
                         size: 10,
                         source: FileSource::Path("draft.txt".into()),
-                        is_image: false,
+                        preview: None,
                         status: match id {
                             0 => AttachmentStatus::Uploading,
                             1 => AttachmentStatus::Failed,
