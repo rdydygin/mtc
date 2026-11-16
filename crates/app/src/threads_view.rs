@@ -27,7 +27,7 @@ use session::{FollowedThread, FollowedThreads, LoadState, Session, ThreadFilter}
 
 use crate::{
     http::avatar_url,
-    image_scope::{ImageStore, image_scope},
+    image_scope::{ImageStore, image_scope, release_replaced_avatars},
     time,
 };
 
@@ -84,7 +84,8 @@ pub struct ThreadsView {
     /// The participants' pictures in the rows. The workspace keeps the view
     /// once it has been shown, across team switches, so pictures of people
     /// no followed thread shows any more are freed as the threads change
-    /// (see [`Self::release_pictures`]); the rest go with the view.
+    /// (see [`Self::release_pictures`]), a replaced profile picture frees
+    /// its old version, and the rest go with the view.
     images: Entity<ImageStore>,
     _subscriptions: Vec<Subscription>,
 }
@@ -95,6 +96,7 @@ impl ThreadsView {
     pub fn new(session: Entity<Session>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let threads = session.read(cx).threads().clone();
         let directory = session.read(cx).directory().clone();
+        let images = ImageStore::new(cx);
         let subscriptions = vec![
             cx.observe_in(&threads, window, |this, threads, window, cx| {
                 // A team switch empties the lists; fill the current one again.
@@ -107,6 +109,7 @@ impl ThreadsView {
                 cx.notify()
             }),
             cx.observe(&directory, |_, _, cx| cx.notify()),
+            release_replaced_avatars(&images, &session, cx),
             // Channel names, and which thread is open.
             cx.observe(&session, |_, _, cx| cx.notify()),
         ];
@@ -124,7 +127,7 @@ impl ThreadsView {
             row_focus: cx.focus_handle().tab_stop(true),
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
-            images: ImageStore::new(cx),
+            images,
             _subscriptions: subscriptions,
         }
     }
@@ -923,7 +926,29 @@ mod tests {
 
         threads.update(cx, |t, cx| t.reload(ThreadFilter::All, cx));
         wait_until(cx, |cx| view.read_with(cx, |v, _| v.rows.len() == 1));
-        draw_until_painted(cx, handle, held);
+        let painted = draw_until_painted(cx, handle, held).remove(0);
+
+        // A new picture for Ann, with the rows unchanged, frees the old one.
+        let directory = session.read_with(cx, |s, _| s.directory().clone());
+        directory.update(cx, |d, cx| {
+            d.update_user(&ann, |ann| ann.last_picture_update = 5, cx)
+        });
+        let replaced = view.read_with(cx, |v, cx| {
+            Resource::Uri(
+                participant_picture(v.session.read(cx), &ann, cx)
+                    .unwrap()
+                    .into(),
+            )
+        });
+        draw_until_painted(cx, handle, {
+            let images = images.clone();
+            move |cx: &App| vec![images.read(cx).get(&replaced)]
+        });
+        assert!(
+            images.read_with(cx, |images, _| images.get(&picture).is_none()),
+            "a replaced picture's old version is freed"
+        );
+        assert!(!in_atlas(cx, handle, &painted), "from the GPU atlas too");
         drop(images);
         let images = view.read_with(cx, |v, _| v.images.downgrade());
         cx.update_window(handle, |_, window, _| window.remove_window())

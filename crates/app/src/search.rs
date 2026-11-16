@@ -33,7 +33,7 @@ use session::{CustomEmojis, SearchScope, Session};
 
 use crate::{
     http::avatar_url,
-    image_scope::{ImageStore, image_scope},
+    image_scope::{ImageStore, image_scope, release_replaced_avatars},
     time,
 };
 
@@ -90,7 +90,8 @@ pub struct SearchView {
     /// The authors' pictures in the results. The view stays for the
     /// workspace's life, kept while hidden, so each new set of results
     /// frees the pictures the last one showed that it doesn't (see
-    /// [`Self::release_pictures`]); the rest go with the view.
+    /// [`Self::release_pictures`]), a replaced profile picture frees its
+    /// old version, and the rest go with the view.
     images: Entity<ImageStore>,
     _search: Option<Task<()>>,
     /// The next page loading. Kept apart from `_search` so asking for more
@@ -116,6 +117,7 @@ impl SearchView {
         let placeholder = search_placeholder(&session, &scope, cx);
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let directory = session.read(cx).directory().clone();
+        let images = ImageStore::new(cx);
         let subscriptions = vec![
             cx.subscribe_in(&input, window, |this, _, event, _, cx| match event {
                 InputEvent::Change => this.search(Some(DEBOUNCE), cx),
@@ -129,6 +131,7 @@ impl SearchView {
             }),
             // Authors' names and pictures arrive after the results.
             cx.observe(&directory, |_, _, cx| cx.notify()),
+            release_replaced_avatars(&images, &session, cx),
         ];
         Self {
             collection: None,
@@ -157,7 +160,7 @@ impl SearchView {
             more_failed: false,
             selected: None,
             scroll: ScrollHandle::new(),
-            images: ImageStore::new(cx),
+            images,
             _search: None,
             _more: None,
             _subscriptions: subscriptions,
@@ -1575,6 +1578,65 @@ mod tests {
         assert!(!in_atlas(cx, window, &painted[0]), "from the GPU atlas too");
         assert!(images.read_with(cx, |images, _| images.get(&bob).is_some()));
         assert!(in_atlas(cx, window, &painted[1]), "the kept row's stays");
+    }
+
+    /// A new profile picture for someone in the results frees the old one,
+    /// though the results stay the same.
+    #[gpui_kit::test]
+    fn a_replaced_profile_picture_frees_its_old_version(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("POST", "/api/v4/users/ids") => Reply::json(json!([
+                    { "id": "ann", "username": "ann", "last_picture_update": 1 },
+                    { "id": "bob", "username": "bob", "last_picture_update": 2 },
+                ])),
+                ("POST", "/api/v4/teams/team/posts/search") => Reply::json(json!({
+                    "order": ["ann", "bob"],
+                    "posts": {
+                        "ann": { "id": "ann", "channel_id": "town", "user_id": "ann",
+                                 "message": "hello", "create_at": 2 },
+                        "bob": { "id": "bob", "channel_id": "town", "user_id": "bob",
+                                 "message": "hello", "create_at": 1 },
+                    },
+                })),
+                _ => route(request),
+            }
+        });
+        let (window, view) = open_search(&server, cx);
+        cx.update(crate::http::PictureClient::install);
+        cx.update_window(window, |_, window, cx| window.input("hello", cx))
+            .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 2));
+        let (old, bob) = author_pictures(&view, cx);
+        let images = view.read_with(cx, |v, _| v.images.clone());
+        let lookup = |pictures: Vec<Resource>| {
+            let images = images.clone();
+            move |cx: &App| {
+                pictures
+                    .iter()
+                    .map(|picture| images.read(cx).get(picture))
+                    .collect()
+            }
+        };
+        let painted = draw_until_painted(cx, window, lookup(vec![old.clone(), bob.clone()]));
+
+        let directory = view.read_with(cx, |v, cx| v.session.read(cx).directory().clone());
+        directory.update(cx, |d, cx| {
+            d.update_user(&"ann".into(), |ann| ann.last_picture_update = 5, cx)
+        });
+        let (new, _) = author_pictures(&view, cx);
+        assert_ne!(new, old);
+        draw_until_painted(cx, window, lookup(vec![new]));
+        assert!(
+            images.read_with(cx, |images, _| images.get(&old).is_none()),
+            "the old version goes"
+        );
+        assert!(!in_atlas(cx, window, &painted[0]), "from the GPU atlas too");
+        assert!(in_atlas(cx, window, &painted[1]), "others' pictures stay");
     }
 
     #[gpui_kit::test]

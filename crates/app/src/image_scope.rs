@@ -23,8 +23,11 @@ use std::{
 use gpui_kit::{
     AnyElement, AnyImageCache, App, AppContext as _, Bounds, Context, Element, ElementId, Entity,
     EntityId, GlobalElementId, Image, ImageCache, ImageCacheError, ImageCacheItem, ImageSource,
-    InspectorElementId, IntoElement, LayoutId, Pixels, RenderImage, Resource, Task, Window,
+    InspectorElementId, IntoElement, LayoutId, Pixels, RenderImage, Resource, Subscription, Task,
+    Window,
 };
+use mattermost::UserId;
+use session::Session;
 
 type Loaded = Result<Arc<RenderImage>, ImageCacheError>;
 
@@ -169,6 +172,53 @@ impl ImageCache for ImageStore {
             .or_insert_with(|| ImageCacheItem::new(resource, cx))
             .use_image(window)
     }
+}
+
+/// Keep `images` free of profile pictures `session`'s directory has
+/// replaced: when a known user's picture changes, the old version's goes.
+/// The store's avatars are checked only when a picture changed, not on
+/// presence or name updates, and never while drawing.
+pub(crate) fn release_replaced_avatars<V: 'static>(
+    images: &Entity<ImageStore>,
+    session: &Entity<Session>,
+    cx: &mut Context<V>,
+) -> Subscription {
+    let client = session.read(cx).client().clone();
+    let directory = session.read(cx).directory().clone();
+    let mut seen = directory.read(cx).pictures_revision();
+    let images = images.downgrade();
+    cx.observe(&directory, move |_, directory, cx| {
+        let revision = directory.read(cx).pictures_revision();
+        if revision == seen {
+            return;
+        }
+        seen = revision;
+        let Some(images) = images.upgrade() else {
+            return;
+        };
+        let directory = directory.read(cx);
+        let replaced: HashSet<Resource> = images
+            .read(cx)
+            .images
+            .keys()
+            .filter(|resource| {
+                let Resource::Uri(uri) = resource else {
+                    return false;
+                };
+                crate::http::avatar_version(&client, uri.as_ref()).is_some_and(|(id, version)| {
+                    directory
+                        .user(&UserId::from(id))
+                        .is_some_and(|user| user.last_picture_update != version)
+                })
+            })
+            .cloned()
+            .collect();
+        if !replaced.is_empty() {
+            images.update(cx, |images, cx| {
+                images.retain(|resource| !replaced.contains(resource), cx)
+            });
+        }
+    })
 }
 
 /// `image`, a picture whose bytes the app holds, drawn from `images`
