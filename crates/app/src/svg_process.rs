@@ -66,6 +66,12 @@ pub const MAX_OUTPUT: usize = MAX_PIXELS as usize * 4 + (1 << 20);
 /// The most bytes a helper reads: a server image is never larger.
 pub const MAX_INPUT: usize = 32 * 1024 * 1024;
 
+/// The stack a helper renders on. usvg recurses as it follows references,
+/// and a main thread's stack differs by platform: 8 MiB on macOS and Linux,
+/// 1 MiB on Windows. The helper gives its renderer this one everywhere, so
+/// how deep a document may go can be bounded once.
+pub const RENDER_STACK: usize = 16 * 1024 * 1024;
+
 /// Whether GPUI would render `body` as SVG: its raster decoders don't
 /// recognize it. GPUI asks exactly this.
 pub fn needs_helper(body: &[u8]) -> bool {

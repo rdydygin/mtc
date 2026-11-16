@@ -89,6 +89,25 @@ fn an_svg_drawn_by_the_helper_matches_gpui_drawing_it() {
 }
 
 #[test]
+fn a_deep_reference_chain_renders_in_the_helper() {
+    // About a kilobyte of stack a link: more than a 1 MiB main thread has,
+    // as on Windows, well within the helper's render stack.
+    let mut svg = String::from(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><clipPath id="c0"><rect width="4" height="4"/></clipPath>"#,
+    );
+    for i in 1..=2000 {
+        svg.push_str(&format!(
+            r#"<clipPath id="c{i}" clip-path="url(#c{})"><rect width="4" height="4"/></clipPath>"#,
+            i - 1
+        ));
+    }
+    svg.push_str(r##"<rect width="4" height="4" fill="#f00" clip-path="url(#c2000)"/></svg>"##);
+    let helpers = helpers(TIMEOUT);
+    let raster = futures::executor::block_on(helpers.rasterize(svg.into_bytes()));
+    assert!(raster.is_some());
+}
+
+#[test]
 fn a_hanging_svg_times_out_without_holding_a_thread() {
     let helpers = helpers(TIMEOUT);
     // Both are driven on this one thread. Were the hang to hold it, the

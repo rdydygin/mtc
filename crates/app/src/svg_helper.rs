@@ -20,7 +20,7 @@ use image::ImageEncoder as _;
 use crate::{
     assets::AppAssets,
     image_guard::is_safe_image,
-    svg_process::{GRACE, HELPER_ARG, MAX_INPUT, MAX_PIXELS, TIMEOUT, needs_helper},
+    svg_process::{GRACE, HELPER_ARG, MAX_INPUT, MAX_PIXELS, RENDER_STACK, TIMEOUT, needs_helper},
 };
 
 /// Runs the helper and exits, if this process was started as one.
@@ -52,10 +52,23 @@ fn serve() -> Option<()> {
     if svg.len() > MAX_INPUT {
         return None;
     }
-    let png = rasterize(&svg)?;
+    let png = on_render_stack(move || rasterize(&svg))??;
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(&png).ok()?;
     stdout.flush().ok()
+}
+
+/// `render`'s result, run on a thread of its own with a stack of
+/// [`RENDER_STACK`]; `None` if it panics. Running out of that stack ends
+/// the process, which the app takes as a failed render.
+fn on_render_stack<T: Send + 'static>(render: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    std::thread::Builder::new()
+        .name("svg-render".into())
+        .stack_size(RENDER_STACK)
+        .spawn(render)
+        .ok()?
+        .join()
+        .ok()
 }
 
 /// `svg` as a PNG, drawn as GPUI draws an SVG image and at most
@@ -147,6 +160,39 @@ mod tests {
         assert!((width * height) as u64 <= MAX_PIXELS);
         // The shape survives the cap.
         assert!(width.abs_diff(height * 2) <= 2, "{width}×{height}");
+    }
+
+    /// `depth` clip paths, each clipped by the one before: usvg follows
+    /// the chain recursively, about a kilobyte of stack a link.
+    fn clip_chain(depth: usize) -> Vec<u8> {
+        let mut svg = String::from(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><clipPath id="c0"><rect width="4" height="4"/></clipPath>"#,
+        );
+        for i in 1..=depth {
+            svg.push_str(&format!(
+                r#"<clipPath id="c{i}" clip-path="url(#c{})"><rect width="4" height="4"/></clipPath>"#,
+                i - 1
+            ));
+        }
+        svg.push_str(&format!(
+            r##"<rect width="4" height="4" fill="#f00" clip-path="url(#c{depth})"/></svg>"##
+        ));
+        svg.into_bytes()
+    }
+
+    #[test]
+    fn renders_on_a_thread_of_its_own() {
+        let name = on_render_stack(|| std::thread::current().name().map(str::to_owned));
+        assert_eq!(name, Some(Some("svg-render".to_owned())));
+    }
+
+    #[test]
+    fn a_deep_reference_chain_renders_on_the_render_stack() {
+        // Drawn on this test thread's 2 MiB stack, this chain overflows it.
+        let svg = clip_chain(2000);
+        assert!(is_safe_image(&svg));
+        let png = on_render_stack(move || rasterize(&svg)).flatten().unwrap();
+        assert_eq!(png_size(&png), (8, 8));
     }
 
     #[test]
