@@ -10,16 +10,23 @@
 //! its own.
 //!
 //! A scope also stops gpui-fast from building the views nested in it again
-//! on their own, so scopes go around rows and popover content, never around
-//! a view that changes often, such as the composer.
+//! on their own, so scopes go around rows, popover content and parts of a
+//! view that hold no other view, such as the composer's suggestions and
+//! uploads, never around a view that changes often, such as the composer.
 
-use std::{collections::HashMap, panic::Location, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    panic::Location,
+    sync::Arc,
+};
 
 use gpui_kit::{
-    AnyElement, AnyImageCache, App, AppContext as _, Bounds, Element, ElementId, Entity,
-    GlobalElementId, ImageCache, ImageCacheError, ImageCacheItem, InspectorElementId, IntoElement,
-    LayoutId, Pixels, RenderImage, Resource, Window,
+    AnyElement, AnyImageCache, App, AppContext as _, Bounds, Context, Element, ElementId, Entity,
+    EntityId, GlobalElementId, Image, ImageCache, ImageCacheError, ImageCacheItem, ImageSource,
+    InspectorElementId, IntoElement, LayoutId, Pixels, RenderImage, Resource, Task, Window,
 };
+
+type Loaded = Result<Arc<RenderImage>, ImageCacheError>;
 
 /// The pictures decoded for one part of the interface, such as a
 /// conversation or the image viewer, kept until it goes and then freed from
@@ -27,18 +34,35 @@ use gpui_kit::{
 /// but cannot say what it holds.
 pub(crate) struct ImageStore {
     images: HashMap<Resource, ImageCacheItem>,
+    /// Pictures whose bytes the app already holds, such as a pasted image,
+    /// by [`Image::id`]. GPUI decodes those into its app-wide store, even
+    /// inside an image cache; [`held_image`] decodes them here instead.
+    held: HashMap<u64, HeldImage>,
+}
+
+enum HeldImage {
+    /// Decoding; the views waiting for it are drawn again when it is done.
+    Decoding {
+        waiting: HashSet<EntityId>,
+        _decode: Task<()>,
+    },
+    Decoded(Loaded),
 }
 
 impl ImageStore {
     pub(crate) fn new(cx: &mut App) -> Entity<Self> {
         let store = cx.new(|_| Self {
             images: HashMap::new(),
+            held: HashMap::new(),
         });
         cx.observe_release(&store, |store, cx| {
-            for (_, item) in store.images.drain() {
-                if let Some(Ok(image)) = item.get() {
-                    cx.drop_image(image, None);
-                }
+            let images = store.images.drain().filter_map(|(_, item)| item.get());
+            let held = store.held.drain().filter_map(|(_, held)| match held {
+                HeldImage::Decoded(result) => Some(result),
+                HeldImage::Decoding { .. } => None,
+            });
+            for image in images.chain(held).flatten() {
+                cx.drop_image(image, None);
             }
         })
         .detach();
@@ -68,6 +92,51 @@ impl ImageStore {
         }
     }
 
+    /// `image`, decoded off the UI thread into this store; `None` while it
+    /// decodes. `view`, which draws it, is drawn again once it is ready.
+    fn load_held(
+        &mut self,
+        image: &Arc<Image>,
+        view: EntityId,
+        cx: &mut Context<Self>,
+    ) -> Option<Loaded> {
+        let id = image.id;
+        match self.held.get_mut(&id) {
+            Some(HeldImage::Decoded(result)) => return Some(result.clone()),
+            Some(HeldImage::Decoding { waiting, .. }) => {
+                waiting.insert(view);
+                return None;
+            }
+            None => {}
+        }
+        let renderer = cx.svg_renderer();
+        let source = image.clone();
+        let decode = cx
+            .background_executor()
+            .spawn(async move { source.to_image_data(renderer).map_err(Into::into) });
+        let task = cx.spawn(async move |store, cx| {
+            let result = decode.await;
+            store
+                .update(cx, |store, cx| {
+                    let previous = store.held.insert(id, HeldImage::Decoded(result));
+                    if let Some(HeldImage::Decoding { waiting, .. }) = previous {
+                        for view in waiting {
+                            App::notify(cx, view);
+                        }
+                    }
+                })
+                .ok();
+        });
+        self.held.insert(
+            id,
+            HeldImage::Decoding {
+                waiting: HashSet::from([view]),
+                _decode: task,
+            },
+        );
+        None
+    }
+
     /// The picture at `resource`: `None` while it loads or if it was never
     /// asked for.
     #[cfg(test)]
@@ -76,6 +145,15 @@ impl ImageStore {
         resource: &Resource,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         self.images.get(resource)?.get()
+    }
+
+    /// The held picture `image`, as [`Self::get`] reports a resource.
+    #[cfg(test)]
+    pub(crate) fn get_held(&self, image: &Image) -> Option<Loaded> {
+        match self.held.get(&image.id)? {
+            HeldImage::Decoded(result) => Some(result.clone()),
+            HeldImage::Decoding { .. } => None,
+        }
     }
 }
 
@@ -91,6 +169,18 @@ impl ImageCache for ImageStore {
             .or_insert_with(|| ImageCacheItem::new(resource, cx))
             .use_image(window)
     }
+}
+
+/// `image`, a picture whose bytes the app holds, drawn from `images`
+/// rather than GPUI's app-wide store. It draws nothing once `images` goes.
+pub(crate) fn held_image(images: &Entity<ImageStore>, image: Arc<Image>) -> ImageSource {
+    let images = images.downgrade();
+    ImageSource::Custom(Arc::new(move |window, cx| {
+        let view = window.current_view();
+        images
+            .upgrade()?
+            .update(cx, |images, cx| images.load_held(&image, view, cx))
+    }))
 }
 
 /// `child`, drawn with its images held by `images`.

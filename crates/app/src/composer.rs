@@ -31,15 +31,18 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity, EntityInputHandler as _,
-    EventEmitter, FocusHandle, Focusable, Image, ImageFormat, ImageSource, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Render, SharedString,
+    EventEmitter, FocusHandle, Focusable, Image, ImageFormat, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ParentElement as _, PathPromptOptions, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div,
     prelude::FluentBuilder as _,
 };
 use mattermost::{ChannelId, Client, FileInfo, TeamId, UserAutocomplete};
 use session::Session;
 
-use crate::extensions;
+use crate::{
+    extensions,
+    image_scope::{ImageStore, held_image, image_scope},
+};
 
 /// Where attached files are uploaded.
 #[derive(Clone)]
@@ -64,6 +67,8 @@ struct PendingFile {
     status: AttachmentStatus,
     uploaded: Option<FileInfo>,
     error: Option<SharedString>,
+    /// The thumbnail, freed with the file when it is removed or sent.
+    images: Entity<ImageStore>,
     _upload: Option<Task<()>>,
 }
 
@@ -100,6 +105,9 @@ pub struct Composer {
     target: UploadTarget,
     files: Vec<PendingFile>,
     next_file_id: u64,
+    /// Pictures in the suggestions: people's avatars and custom emoji,
+    /// freed with the composer.
+    images: Entity<ImageStore>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -183,6 +191,7 @@ impl Composer {
             target,
             files: Vec::new(),
             next_file_id: 0,
+            images: ImageStore::new(cx),
             _subscriptions: vec![subscription, caret, focus_in, focus_out, emoji_updates],
         }
     }
@@ -322,6 +331,7 @@ impl Composer {
             status: AttachmentStatus::Uploading,
             uploaded: None,
             error: None,
+            images: ImageStore::new(cx),
             _upload: None,
         });
         self.upload(local_id, cx);
@@ -865,59 +875,58 @@ impl Composer {
         }
         let selected = self.selected_index(&matches);
         let theme = cx.theme();
-        Some(
-            v_flex()
-                .py_1()
-                .border_b_1()
-                .border_color(theme.border)
-                .children(matches.into_iter().enumerate().map(|(ix, suggestion)| {
-                    let completion = suggestion.completion.clone();
-                    let avatar = suggestion.user.as_ref().map(|user| {
-                        Avatar::new().name(suggestion.label.clone()).size_6().src(
-                            crate::http::avatar_url(
-                                &self.target.client,
-                                user.id.as_str(),
-                                user.last_picture_update,
+        let suggestions = v_flex()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .children(matches.into_iter().enumerate().map(|(ix, suggestion)| {
+                let completion = suggestion.completion.clone();
+                let avatar = suggestion.user.as_ref().map(|user| {
+                    Avatar::new().name(suggestion.label.clone()).size_6().src(
+                        crate::http::avatar_url(
+                            &self.target.client,
+                            user.id.as_str(),
+                            user.last_picture_update,
+                        ),
+                    )
+                });
+                ListItem::new(SharedString::from(suggestion.id))
+                    .selected(ix == selected)
+                    .aria_selected(ix == selected)
+                    .accessibility_label(format!("{}: {}", suggestion.label, suggestion.detail))
+                    .text_sm()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .min_w_0()
+                            .children(avatar)
+                            .when(suggestion.completion.starts_with(':'), |row| {
+                                row.child(crate::status::emoji_element(
+                                    suggestion.completion.trim_matches(':'),
+                                    self.emoji_search.read(cx).custom(cx),
+                                ))
+                            })
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_semibold()
+                                    .child(suggestion.label),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.muted_foreground)
+                                    .child(suggestion.detail),
                             ),
-                        )
-                    });
-                    ListItem::new(SharedString::from(suggestion.id))
-                        .selected(ix == selected)
-                        .aria_selected(ix == selected)
-                        .accessibility_label(format!("{}: {}", suggestion.label, suggestion.detail))
-                        .text_sm()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .min_w_0()
-                                .children(avatar)
-                                .when(suggestion.completion.starts_with(':'), |row| {
-                                    row.child(crate::status::emoji_element(
-                                        suggestion.completion.trim_matches(':'),
-                                        self.emoji_search.read(cx).custom(cx),
-                                    ))
-                                })
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .font_semibold()
-                                        .child(suggestion.label),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_color(theme.muted_foreground)
-                                        .child(suggestion.detail),
-                                ),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.complete_suggestion(&completion, window, cx)
-                        }))
-                })),
-        )
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.complete_suggestion(&completion, window, cx)
+                    }))
+            }));
+        Some(image_scope(&self.images, suggestions))
     }
 }
 
@@ -1095,7 +1104,7 @@ fn render_file(
     let local_id = file.local_id;
     let media = match (&file.source, file.is_image) {
         (FileSource::Pasted(image), _) => {
-            AttachmentMedia::new().src(ImageSource::Image(image.clone()))
+            AttachmentMedia::new().src(held_image(&file.images, image.clone()))
         }
         (FileSource::Path(path), true) => AttachmentMedia::new().src(path.clone()),
         (FileSource::Path(_), false) => AttachmentMedia::new().child(Icon::new(IconName::File)),
@@ -1103,7 +1112,7 @@ fn render_file(
     let description: SharedString = format_size(file.size).into();
     let remove = entity.clone();
     let retry = entity.clone();
-    v_flex()
+    let card = v_flex()
         .child(
             Attachment::new()
                 .id(SharedString::from(format!("upload-{local_id}")))
@@ -1129,7 +1138,10 @@ fn render_file(
                 ),
                 cx,
             ))
-        })
+        });
+    // A file's own store: a picked file's thumbnail loads from its path into
+    // it, and a pasted one decodes into it.
+    image_scope(&file.images, card)
 }
 
 fn image_extension(name: &str) -> bool {
@@ -1718,6 +1730,7 @@ mod tests {
                         },
                         uploaded: (id == 2).then(FileInfo::default),
                         error: (id == 1).then(|| "Upload failed".into()),
+                        images: ImageStore::new(cx),
                         _upload: None,
                     });
                 }
@@ -1744,6 +1757,134 @@ mod tests {
             assert!(c.files[2].uploaded.is_some());
         });
         assert_eq!(&*events.borrow(), &[("Saved edit".into(), 0)]);
+    }
+
+    /// An uploaded file, as one that finished uploading, with its own store.
+    fn uploaded_file(local_id: u64, source: FileSource, cx: &mut gpui_kit::App) -> PendingFile {
+        PendingFile {
+            local_id,
+            name: format!("picture-{local_id}.png").into(),
+            size: 74,
+            source,
+            is_image: true,
+            status: AttachmentStatus::Complete,
+            uploaded: Some(FileInfo::default()),
+            error: None,
+            images: ImageStore::new(cx),
+            _upload: None,
+        }
+    }
+
+    /// Upload thumbnails, picked from disk or pasted, paint from each
+    /// file's own store, not GPUI's app-wide one, and go when the file is
+    /// removed or sent.
+    #[gpui_kit::test]
+    fn upload_thumbnails_go_when_removed_or_sent(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        use gpui_kit::{ImgResourceLoader, Resource};
+        let (handle, composer) = open_composer(cx);
+        let png = crate::http::PictureClient::PNG.to_vec();
+        let path =
+            std::env::temp_dir().join(format!("mtc-upload-thumbnail-{}.png", std::process::id()));
+        std::fs::write(&path, &png).unwrap();
+        let picked = Resource::Path(path.clone().into());
+        let pasted = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+        let stores = composer.update(cx, |c, cx| {
+            c.files
+                .push(uploaded_file(0, FileSource::Path(path.clone()), cx));
+            c.files
+                .push(uploaded_file(1, FileSource::Pasted(pasted.clone()), cx));
+            cx.notify();
+            [c.files[0].images.clone(), c.files[1].images.clone()]
+        });
+        let painted = draw_until_painted(cx, handle, {
+            let (stores, picked, pasted) = (stores.clone(), picked.clone(), pasted.clone());
+            move |cx| {
+                vec![
+                    stores[0].read(cx).get(&picked),
+                    stores[1].read(cx).get_held(&pasted),
+                ]
+            }
+        });
+        assert!(!cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&picked)));
+        assert!(
+            !cx.update(|cx| pasted.is_asset_cached(cx)),
+            "a pasted picture stays out of the app-wide store"
+        );
+        let [picked_store, pasted_store] = stores.map(|store| store.downgrade());
+
+        composer.update(cx, |c, cx| c.remove_file(0, cx));
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            picked_store.upgrade().is_none(),
+            "removing frees the file's"
+        );
+        assert!(!in_atlas(cx, handle, &painted[0]), "from the GPU atlas too");
+        assert!(in_atlas(cx, handle, &painted[1]), "and only that file's");
+
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("", window, cx));
+            window.click("send", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(composer.read_with(cx, |c, _| c.files.is_empty()));
+        assert!(pasted_store.upgrade().is_none(), "sending frees the rest");
+        assert!(!in_atlas(cx, handle, &painted[1]));
+        std::fs::remove_file(path).ok();
+    }
+
+    /// People's pictures in the suggestions paint from the composer's own
+    /// store, which goes with the composer.
+    #[gpui_kit::test]
+    fn suggestion_pictures_belong_to_the_composer(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::draw_until_painted;
+        use gpui_kit::{ImgResourceLoader, Resource};
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        cx.update(crate::http::PictureClient::install);
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("", window, cx));
+            window.input("@an", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            composer.read_with(cx, |c, cx| {
+                c.suggestion_matches(cx)
+                    .iter()
+                    .any(|s| s.user.as_ref().is_some_and(|u| u.id.as_str() == "ann"))
+            })
+        });
+        let (avatar, images) = composer.read_with(cx, |c, _| {
+            let url = crate::http::avatar_url(&c.target.client, "ann", 0);
+            (Resource::Uri(url.into()), c.images.clone())
+        });
+        draw_until_painted(cx, handle, {
+            let (images, avatar) = (images.clone(), avatar.clone());
+            move |cx| vec![images.read(cx).get(&avatar)]
+        });
+        assert!(
+            !cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&avatar)),
+            "the suggestion's picture stays out of the app-wide store"
+        );
+        let images = {
+            let weak = images.downgrade();
+            drop(images);
+            weak
+        };
+        cx.update_window(handle, |_, window, _| window.remove_window())
+            .unwrap();
+        drop(composer);
+        // GPUI releases dropped entities when it next flushes effects.
+        cx.update(|_| {});
+        cx.run_until_parked();
+        assert!(
+            images.upgrade().is_none(),
+            "the composer's pictures go with it"
+        );
     }
 
     #[gpui_kit::test]
