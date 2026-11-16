@@ -4568,6 +4568,7 @@ dependencies = [
  "url",
  "usvg 0.46.0",
  "windows-registry 0.6.1",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
