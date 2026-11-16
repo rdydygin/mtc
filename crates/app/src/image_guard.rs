@@ -116,9 +116,13 @@ enum Cost {
     ReferenceLoop,
     /// An `href` chain longer than [`MAX_HREF_CHAIN`].
     HrefChain,
+    /// Drawing that recurses deeper than [`MAX_RENDER_DEPTH`].
+    RenderDepth,
     /// Parsing stylesheets and `style` attributes; see
     /// [`MAX_STYLE_PARSING`].
     Style,
+    /// Sorting the rules of many stylesheets; see [`MAX_STYLE_SORTING`].
+    StyleSheets,
     /// Links style rules add; see [`MAX_STYLE_LINKS`].
     StyleLinks,
     /// `tref` lookups; see [`MAX_TREF_SEARCH`].
@@ -676,6 +680,23 @@ const GRADIENTS: [&str; 2] = ["linearGradient", "radialGradient"];
 /// a third.
 const MAX_HREF_CHAIN: u32 = 16;
 
+/// How deep usvg's drawing may recurse, in levels of nesting, each
+/// reference it follows to draw something counted as [`REFERENCE_DEPTH`]
+/// levels. usvg draws nested elements by recursion, and refuses more than
+/// 1 024 levels of them, so nesting alone stays under this bound. But the
+/// content a reference draws nests from where the reference is: on a 2 MB
+/// thread, a chain of 330 patterns each filling the next overflowed, of
+/// 101 with ten groups in each, of 700 masks, of 1 600 clip paths.
+/// Inheriting from a parent and two references to one element add nothing.
+/// Editors nest a few dozen levels, and follow a reference or two.
+const MAX_RENDER_DEPTH: u32 = 1024;
+
+/// The levels of nesting a reference counts as in [`MAX_RENDER_DEPTH`]:
+/// what drawing a pattern or marker costs usvg's stack, about four levels'
+/// worth, the most of any reference. A level took about 1.5 KB, so at the
+/// bound usvg needs about 1.5 MB.
+const REFERENCE_DEPTH: u32 = 5;
+
 /// The most links style rules may add, summed over the elements each could
 /// apply to; see [`LinkRules`]. Illustrator writes a rule per gradient and
 /// clip path, `.cls-12{fill:url(#linear-gradient-3)}`, for the elements of
@@ -692,6 +713,14 @@ const MAX_STYLE_LINKS: usize = 1 << 22;
 /// of a second. Illustrator's sheets, a few hundred rules, cost tens of
 /// millions, and a `style` a few thousand.
 const MAX_STYLE_PARSING: usize = 1 << 30;
+
+/// The most work sorting style rules may take usvg, in bytes of stylesheet
+/// sorted. usvg parses every `<style>` into one list of rules, and after
+/// each sorts all the rules gathered so far: `n` sheets cost `n²/2` sheets'
+/// worth. 20 000 one-rule sheets, 540 KB, took it 0.8 seconds; at this
+/// bound, 6 700 such sheets take a tenth of a second. Editors write one to
+/// three sheets, which cost about their length.
+const MAX_STYLE_SORTING: usize = 1 << 28;
 
 /// The most work usvg's `tref` lookups may take, in nodes read: it looks
 /// for each one's target from the start of the document. 50 000 of them in
@@ -725,6 +754,15 @@ fn reference_cost(document: &Document, ids: &Ids) -> Option<Cost> {
         });
     if parsing > MAX_STYLE_PARSING {
         return Some(Cost::Style);
+    }
+    let mut gathered = 0usize;
+    let mut sorting = 0usize;
+    for sheet in style_sheets(document) {
+        gathered += sheet.len();
+        sorting = sorting.saturating_add(gathered);
+    }
+    if sorting > MAX_STYLE_SORTING {
+        return Some(Cost::StyleSheets);
     }
     let rules = LinkRules::new(document, ids);
     let mut style_links = 0;
@@ -796,31 +834,35 @@ struct LinkRules {
 
 impl LinkRules {
     fn new(document: &Document, ids: &Ids) -> Self {
-        let mut sheet = simplecss::StyleSheet::new();
-        for text in style_sheets(document) {
-            sheet.parse_more(text);
-        }
         let mut rules = Self::default();
-        for rule in &sheet.rules {
-            let mut links = Declared::default();
-            for declaration in &rule.declarations {
-                links.declare(ids, declaration.name, declaration.value);
-            }
-            if links.count() == 1 && !links.inherits_own {
-                continue;
-            }
-            let at = rules.links.len();
-            rules.links.push(links);
-            let needs = RefCell::new(Need::Nothing);
-            rule.selector.matches(&Probe::Subject(&needs));
-            match needs.into_inner() {
-                Need::Id(id) => rules.by_id.entry(id).or_default().push(at),
-                Need::Class(class) => rules.by_class.entry(class).or_default().push(at),
-                Need::Name(name) => rules.by_name.entry(name).or_default().push(at),
-                Need::Nothing => rules.anywhere.push(at),
+        // One sheet at a time: simplecss sorts every rule gathered so far
+        // after each sheet it parses, and the order doesn't matter here.
+        for text in style_sheets(document) {
+            for rule in simplecss::StyleSheet::parse(text).rules {
+                rules.add(ids, &rule);
             }
         }
         rules
+    }
+
+    fn add(&mut self, ids: &Ids, rule: &simplecss::Rule) {
+        let mut links = Declared::default();
+        for declaration in &rule.declarations {
+            links.declare(ids, declaration.name, declaration.value);
+        }
+        if links.count() == 1 && !links.inherits_own {
+            return;
+        }
+        let at = self.links.len();
+        self.links.push(links);
+        let needs = RefCell::new(Need::Nothing);
+        rule.selector.matches(&Probe::Subject(&needs));
+        match needs.into_inner() {
+            Need::Id(id) => self.by_id.entry(id).or_default().push(at),
+            Need::Class(class) => self.by_class.entry(class).or_default().push(at),
+            Need::Name(name) => self.by_name.entry(name).or_default().push(at),
+            Need::Nothing => self.anywhere.push(at),
+        }
     }
 
     /// The links of every rule that could apply to `element`. Ids and
@@ -858,16 +900,26 @@ enum Need {
     Id(String),
 }
 
-/// A stand-in for the element a selector matches, and for everything
-/// around it, that matches every part of the selector. Matching one
-/// records the most telling thing the selector needs of its element.
+/// A stand-in for the element a selector matches, which matches its every
+/// requirement and records the most telling. simplecss reads all of the
+/// selector's last compound against the element first, then recurses into
+/// the element's relatives, once per combinator; the stand-in has one
+/// relative and that has none, so a selector of any length costs two
+/// calls deep. (simplecss doesn't expose a selector's parts.)
 #[derive(Clone, Copy)]
 enum Probe<'a> {
     Subject(&'a RefCell<Need>),
-    Around,
+    Relative,
 }
 
 impl Probe<'_> {
+    fn relative(&self) -> Option<Self> {
+        match self {
+            Self::Subject(_) => Some(Self::Relative),
+            Self::Relative => None,
+        }
+    }
+
     fn needs(&self, need: Need) {
         if let Self::Subject(needs) = self {
             let mut needs = needs.borrow_mut();
@@ -880,11 +932,11 @@ impl Probe<'_> {
 
 impl simplecss::Element for Probe<'_> {
     fn parent_element(&self) -> Option<Self> {
-        Some(Self::Around)
+        self.relative()
     }
 
     fn prev_sibling_element(&self) -> Option<Self> {
-        Some(Self::Around)
+        self.relative()
     }
 
     fn has_local_name(&self, name: &str) -> bool {
@@ -1024,10 +1076,11 @@ impl References {
         &self.targets[self.starts[node as usize] as usize..self.starts[node as usize + 1] as usize]
     }
 
-    /// Whether the graph has a loop or an `href` chain longer than
-    /// [`MAX_HREF_CHAIN`]: one depth-first search, each node and link
-    /// visited once. A node is finished only after everything it links to,
-    /// so the longest chain from it is known then.
+    /// Whether the graph has a loop, an `href` chain longer than
+    /// [`MAX_HREF_CHAIN`] or drawing deeper than [`MAX_RENDER_DEPTH`]: one
+    /// depth-first search, each node and link visited once. A node is
+    /// finished only after everything it links to, so the longest chain and
+    /// the deepest drawing from it are known then.
     fn cost(&self) -> Option<Cost> {
         const NEW: u8 = 0;
         const OPEN: u8 = 1;
@@ -1037,6 +1090,8 @@ impl References {
         let mut state = vec![NEW; all];
         // The most elements an `href` chain from each node holds.
         let mut chain = vec![0u32; all];
+        // How deep drawing from each node recurses.
+        let mut depth = vec![0u32; all];
         let mut stack: Vec<(u32, usize)> = Vec::new();
         for root in 0..all as u32 {
             if state[root as usize] != NEW {
@@ -1074,6 +1129,27 @@ impl References {
                 };
                 if chain[node as usize] > MAX_HREF_CHAIN {
                     return Some(Cost::HrefChain);
+                }
+                // A reference recurses, as does drawing a child; nothing
+                // else does.
+                let draws_child = |target: u32| {
+                    node < elements && node % PARTS == DRAWN && target % PARTS == DRAWN
+                };
+                depth[node as usize] = self
+                    .links(node)
+                    .iter()
+                    .map(|&target| {
+                        let step = if target >= elements {
+                            REFERENCE_DEPTH
+                        } else {
+                            u32::from(draws_child(target))
+                        };
+                        step + depth[target as usize]
+                    })
+                    .max()
+                    .unwrap_or(0);
+                if depth[node as usize] > MAX_RENDER_DEPTH {
+                    return Some(Cost::RenderDepth);
                 }
             }
         }
@@ -1264,6 +1340,8 @@ mod tests {
     /// each must still render.
     fn references_as_editors_write_them() -> Vec<String> {
         [
+            // Three stylesheets: an editor's, a pasted icon's, a font's.
+            r##"<defs><style>.cls-1{fill:url(#lg);}.cls-2{clip-path:url(#clip);}</style><linearGradient id="lg"><stop offset="0"/><stop offset="1" stop-color="red"/></linearGradient><clipPath id="clip"><rect width="8" height="8"/></clipPath></defs><style type="text/css">.st0{fill:#1d1d1b;} .st1 { fill: url(#lg) }</style><style>@font-face{font-family:x;} text{font-family:x, sans-serif;}</style><g class="cls-2"><rect class="cls-1" width="10" height="10"/><path class="st0" d="M0 0h5v5z"/><circle class="st1" r="2"/></g>"##,
             // Inkscape: gradients sharing the stops of another, of either kind.
             r##"<defs><linearGradient id="linearGradient1"><stop offset="0" style="stop-color:#ff0000"/><stop offset="1" style="stop-color:#0000ff"/></linearGradient><linearGradient xlink:href="#linearGradient1" id="linearGradient2" x1="0" y1="0" x2="10" y2="10" gradientUnits="userSpaceOnUse"/><radialGradient xlink:href="#linearGradient1" id="radialGradient3" cx="5" cy="5" r="5" gradientUnits="userSpaceOnUse"/></defs><rect width="10" height="10" style="fill:url(#linearGradient2)"/><circle cx="5" cy="5" r="5" style="fill:url(#radialGradient3)"/>"##,
             // Stops and attributes inherited through three links.
@@ -1451,7 +1529,8 @@ mod tests {
     /// billions of steps.
     fn large_documents() -> Vec<(String, bool)> {
         const REFERENCES: usize = 50_000;
-        const DEPTH: usize = 5_000;
+        // As deep as usvg draws: it refuses 1 024 levels of nesting.
+        const DEPTH: usize = 1_000;
 
         // Many feImages naming one rect, inside unused <defs>.
         let mut many = String::from(r#"<defs><rect id="r" width="1" height="1"/><filter id="f">"#);
@@ -1752,7 +1831,7 @@ mod tests {
         let sheet = svg(&format!("<style>{rules}</style>"));
         assert_eq!(reference_cost_of(&sheet), Some(Cost::Style));
         // Split into sheets, it costs each sheet's share.
-        let rules: String = (0..16_000)
+        let rules: String = (0..1_000)
             .map(|i| format!("<style>.c{i}{{fill:red}}</style>"))
             .collect();
         assert_eq!(reference_cost_of(&svg(&rules)), None);
@@ -1765,6 +1844,171 @@ mod tests {
         assert_eq!(reference_cost_of(&one), Some(Cost::Style));
         let each = svg(&r#"<rect width="1" height="1" style="fill:red;"/>"#.repeat(40_000));
         assert_eq!(reference_cost_of(&each), None);
+    }
+
+    /// The reviewed 600 KB selector: 100 000 descendant combinators, each
+    /// once a frame of recursion in the guard.
+    #[test]
+    fn long_selectors_are_read_without_recursion() {
+        let selector = "g ".repeat(100_000);
+        let unused = svg(&format!(
+            "<style>{selector}rect{{fill:url(#p)}}</style><linearGradient id='p'/>"
+        ));
+        assert_eq!(reference_cost_of(&unused), None);
+        // What the rule needs of its element, a rect, is still read.
+        let looping = svg(&format!(
+            r#"<style>{selector}rect{{fill:url(#p)}}</style><pattern id="p" width="1" height="1"><rect width="1" height="1"/></pattern>"#
+        ));
+        assert_eq!(reference_cost_of(&looping), Some(Cost::ReferenceLoop));
+    }
+
+    #[test]
+    fn many_stylesheets_are_refused() {
+        let sheets = |count: usize| svg(&"<style>.x{fill:red}</style>".repeat(count));
+        // The reviewed 2.6 MB: five billion rules sorted in usvg, and in the
+        // guard before it parsed each sheet alone.
+        assert_eq!(reference_cost_of(&sheets(100_000)), Some(Cost::StyleSheets));
+        // The most sheets of one rule allowed, and one more.
+        let sheet = ".x{fill:red}".len();
+        let most = (1..)
+            .take_while(|&n: &usize| sheet * n * (n + 1) / 2 <= MAX_STYLE_SORTING)
+            .last()
+            .unwrap();
+        assert_eq!(reference_cost_of(&sheets(most)), None);
+        assert_eq!(
+            reference_cost_of(&sheets(most + 1)),
+            Some(Cost::StyleSheets)
+        );
+    }
+
+    /// A chain of `count` references of one kind, each element drawing the
+    /// next, drawn once.
+    fn reference_chain(kind: &str, count: usize) -> String {
+        let rect = r#"<rect width="1" height="1"/>"#;
+        let mut inner = String::new();
+        for i in 0..count {
+            let next = i + 1;
+            let last = next == count;
+            let link = |attribute: &str| {
+                if last {
+                    rect.to_string()
+                } else {
+                    format!(r##"<rect width="1" height="1" {attribute}="url(#e{next})"/>"##)
+                }
+            };
+            inner.push_str(&match kind {
+                "clip-path" if last => format!(r#"<clipPath id="e{i}">{rect}</clipPath>"#),
+                "clip-path" => format!(r##"<clipPath id="e{i}" clip-path="url(#e{next})">{rect}</clipPath>"##),
+                "clip-path content" => format!(r#"<clipPath id="e{i}">{}</clipPath>"#, link("clip-path")),
+                "mask" => format!(r#"<mask id="e{i}">{}</mask>"#, link("mask")),
+                "pattern" => format!(r#"<pattern id="e{i}" width="1" height="1">{}</pattern>"#, link("fill")),
+                "inherited paint" if last => format!(r#"<pattern id="e{i}" width="1" height="1">{rect}</pattern>"#),
+                "inherited paint" => format!(r##"<g fill="url(#e{next})"><pattern id="e{i}" width="1" height="1"><g>{rect}</g></pattern></g>"##),
+                "marker" => format!(r#"<marker id="e{i}">{}</marker>"#, link("marker-end").replace("<rect", "<path d='M0 0L1 0'")),
+                "filter" if last => format!(r#"<filter id="e{i}"><feFlood/></filter>"#),
+                "filter" => format!(r##"<filter id="e{i}"><feImage href="#r{next}"/></filter><rect id="r{next}" width="1" height="1" filter="url(#e{next})"/>"##),
+                "use" if last => format!(r#"<rect id="e{i}" width="1" height="1"/>"#),
+                "use" => format!(r##"<g id="e{i}"><use href="#e{next}"/></g>"##),
+                _ => unreachable!("{kind}"),
+            });
+        }
+        inner.push_str(match kind {
+            "clip-path" | "clip-path content" => {
+                r##"<rect width="5" height="5" clip-path="url(#e0)"/>"##
+            }
+            "mask" => r##"<rect width="5" height="5" mask="url(#e0)"/>"##,
+            "pattern" | "inherited paint" => r##"<rect width="5" height="5" fill="url(#e0)"/>"##,
+            "marker" => r##"<path d="M0 0L5 5" marker-end="url(#e0)"/>"##,
+            "filter" => r##"<rect width="5" height="5" filter="url(#e0)"/>"##,
+            "use" => r##"<use href="#e0"/>"##,
+            _ => unreachable!(),
+        });
+        svg(&inner)
+    }
+
+    #[test]
+    fn deep_drawing_is_refused() {
+        let kinds = [
+            "clip-path",
+            "clip-path content",
+            "mask",
+            "pattern",
+            "inherited paint",
+            "marker",
+            "filter",
+            "use",
+        ];
+        for kind in kinds {
+            // 20 000 clip paths overflowed usvg's stack, each clipping with
+            // the next; a few hundred of the others did.
+            assert_eq!(
+                reference_cost_of(&reference_chain(kind, 20_000)),
+                Some(Cost::RenderDepth),
+                "{kind}"
+            );
+            assert_eq!(
+                reference_cost_of(&reference_chain(kind, 250)),
+                Some(Cost::RenderDepth),
+                "{kind}"
+            );
+            // A filter drawing the next counts twice: `filter`, `feImage`.
+            assert_eq!(
+                reference_cost_of(&reference_chain(kind, 50)),
+                None,
+                "{kind}"
+            );
+        }
+
+        // Nesting alone: the root, then `levels` groups, then a shape.
+        let nested = |levels: usize, inside: &str| {
+            svg(&format!(
+                "{}{inside}{}",
+                "<g>".repeat(levels),
+                "</g>".repeat(levels)
+            ))
+        };
+        let rect = r#"<rect width="1" height="1"/>"#;
+        let most = MAX_RENDER_DEPTH as usize - 1;
+        assert_eq!(reference_cost_of(&nested(most, rect)), None);
+        assert_eq!(
+            reference_cost_of(&nested(most + 1, rect)),
+            Some(Cost::RenderDepth)
+        );
+        // A reference counts as REFERENCE_DEPTH levels: the groups, the
+        // shape filled, the reference, then the pattern's shape.
+        let pattern =
+            r##"<pattern id="p" width="1" height="1"><rect width="1" height="1"/></pattern>"##;
+        let filled = r##"<rect width="1" height="1" fill="url(#p)"/>"##;
+        let most = (MAX_RENDER_DEPTH - REFERENCE_DEPTH - 2) as usize;
+        let inside = |levels: usize| {
+            format!(
+                "{pattern}{}{filled}{}",
+                "<g>".repeat(levels),
+                "</g>".repeat(levels)
+            )
+        };
+        assert_eq!(reference_cost_of(&svg(&inside(most))), None);
+        assert_eq!(
+            reference_cost_of(&svg(&inside(most + 1))),
+            Some(Cost::RenderDepth)
+        );
+
+        // Inheriting from each of 900 ancestors, and 5 000 shapes sharing a
+        // marker and a chain of 100 patterns, count no more than once.
+        let inherited = svg(&format!(
+            r##"<linearGradient id="g"/><g fill="url(#g)">{}</g>"##,
+            nested(900, rect)
+        ));
+        assert_eq!(reference_cost_of(&inherited), None);
+        let chain = reference_chain("pattern", 100);
+        let shared = chain.replace(
+            "</svg>",
+            &format!(
+                r##"<marker id="m"><path d="M0 0L1 0"/></marker>{}</svg>"##,
+                r##"<path d="M0 0L1 1" fill="url(#e0)" marker-end="url(#m)"/>"##.repeat(5_000)
+            ),
+        );
+        assert_eq!(reference_cost_of(&shared), None);
     }
 
     #[test]
