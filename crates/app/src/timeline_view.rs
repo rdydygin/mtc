@@ -1404,20 +1404,6 @@ mod tests {
         })
     }
 
-    /// The typing line as screen readers get it, once drawn.
-    fn typing_line(handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) -> String {
-        use gpui_kit::test::TestWindowExt as _;
-        cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            window
-                .find("typing")
-                .label()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .unwrap()
-    }
-
     /// How many `users/ids` lookups asked for `user`.
     fn lookups(server: &SlowServer, user: &str) -> usize {
         let quoted = format!("\"{user}\"");
@@ -1432,134 +1418,225 @@ mod tests {
             .count()
     }
 
-    #[gpui_kit::test]
-    fn typing_redraws_only_the_typing_line_of_its_conversation(cx: &mut TestAppContext) {
-        // Bob is a user the server knows; Zed and Yan it leaves out, as it
-        // does for deleted or hidden users.
-        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
-            match (
-                request.method(),
-                request.path().split('?').next().unwrap_or_default(),
-            ) {
-                ("POST", "/api/v4/users/ids") => {
-                    let asked = String::from_utf8_lossy(request.body()).into_owned();
-                    let users: Vec<_> = ["ann", "bob"]
-                        .into_iter()
-                        .filter(|id| asked.contains(&format!("\"{id}\"")))
-                        .map(|id| json!({ "id": id, "username": id }))
-                        .collect();
-                    Reply::json(json!(users))
-                }
-                _ => route(request),
-            }
-        })
-        .accept_websockets();
-        // Online before the channel opens, so no catch-up runs mid-test.
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let client = Client::new_unverified(&server.url(), "token").unwrap();
-        let mut me = User::default();
-        me.id = "me".into();
-        let session = cx.new(|cx| Session::new(client, me, Some(TeamId::from("team")), cx));
-        wait_until(cx, |cx| {
-            server.websockets() > 0
-                && session.read_with(cx, |s, _| s.connection() == session::Connection::Online)
-        });
-        session.update(cx, |s, cx| {
-            s.open_channel(&"town".into(), cx);
-        });
-        let (handle, view) = cx.update(|cx| {
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: point(px(0.), px(0.)),
-                    size: size(px(800.), px(600.)),
-                })),
-                ..Default::default()
-            };
-            let kind = TimelineKind::Channel("town".into());
-            let session = session.clone();
-            gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| TimelineView::new(kind, session, None, window, cx))
-            })
-            .unwrap()
-        });
-        let line = view.read_with(cx, |v, _| v.typing.clone());
-        let sidebar = cx.update(|cx| {
-            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
-                cx.new(|cx| crate::sidebar::SidebarView::new(session.clone(), window, cx))
-            })
-            .unwrap()
-            .1
-        });
-        // Every post is Ann's: know her before counting, so her name can't
-        // arrive mid-test.
-        let directory = session.read_with(cx, |s, _| s.directory().clone());
-        directory.update(cx, |d, cx| d.ensure(["ann".into()], cx));
-        wait_until(cx, |cx| {
-            view.read_with(cx, |v, cx| v.timeline.read(cx).entries().len() >= 60)
-                && directory.read_with(cx, |d, _| d.user(&"ann".into()).is_some())
-        });
-        // Let loading and pictures finish before counting: draw, move
-        // GPUI's clock and wait for the real network, until the session and
-        // the directory stop changing.
-        use gpui_kit::test::TestWindowExt as _;
-        let settling = [notifications(&session, cx), notifications(&directory, cx)];
-        let changes = || settling.iter().map(|(n, _)| n.get()).sum::<usize>();
-        let mut quiet = 0;
-        for _ in 0..100 {
-            let before = changes();
-            for window in cx.update(|cx| cx.windows()) {
-                cx.update_window(window, |_, window, cx| window.render_frame(cx))
-                    .unwrap();
-            }
-            cx.executor().advance_clock(Duration::from_secs(10));
-            cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(20));
-            cx.run_until_parked();
-            quiet = if changes() == before { quiet + 1 } else { 0 };
-            if quiet == 3 {
-                break;
-            }
-        }
-        assert_eq!(quiet, 3, "the session and directory never settled");
-        // Even settled, something in the view's tree notifies it every
-        // 1.3 s of GPUI time, typing or not. Start just after one, so the
-        // next is well clear of the little time the first step moves.
-        let (ticks, _ticks) = notifications(&view, cx);
-        for _ in 0..40 {
-            cx.executor().advance_clock(Duration::from_millis(50));
-            cx.run_until_parked();
-            if ticks.get() > 0 {
-                break;
-            }
-        }
-        assert!(ticks.get() > 0, "the view's own tick never came");
-        let typing = session.read_with(cx, |s, _| s.typing().clone());
-        let (session_notes, _s) = notifications(&session, cx);
-        let (directory_notes, _d) = notifications(&directory, cx);
-        let (view_notes, _v) = notifications(&view, cx);
-        let (sidebar_notes, _b) = notifications(&sidebar, cx);
-        let (line_notes, _l) = notifications(&line, cx);
-        let elsewhere = TimelineKind::Channel("elsewhere".into());
-
-        // Someone nobody has a name for, typing in a channel nobody is
-        // looking at: nothing redraws, and no one asks for the name.
-        assert_eq!(server.push(typing_event("elsewhere", "zed")), 1);
-        // Wait in real time only: the frame comes over the network.
+    /// Run GPUI's work while the real network answers, without moving
+    /// GPUI's clock, until `done`.
+    fn wait_for_network(
+        cx: &mut TestAppContext,
+        mut done: impl FnMut(&mut TestAppContext) -> bool,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(20);
-        while typing.read_with(cx, |t, _| t.users(&elsewhere).next().is_none()) {
-            assert!(Instant::now() < deadline, "the typing event never came");
+        loop {
             cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting");
             std::thread::sleep(Duration::from_millis(5));
         }
-        // Past the directory's batching window, in case anything asked it.
-        cx.executor().advance_clock(Duration::from_millis(100));
-        // A lookup would go over the real network: give one time to come back.
-        let deadline = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < deadline {
-            cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(10));
+    }
+
+    /// A channel open in a window, with a sidebar in another, on an event
+    /// connection the test pushes to. Users the server knows: Ann, Bob,
+    /// and Rem (as "New Name"); Tia only from her second lookup; anyone
+    /// else it leaves out, as it does deleted or hidden users.
+    struct TypingFixture {
+        server: SlowServer,
+        session: Entity<Session>,
+        directory: Entity<session::Directory>,
+        typing: Entity<session::Typing>,
+        view: Entity<TimelineView>,
+        line: Entity<crate::typing_indicator::TypingIndicator>,
+        sidebar: Entity<crate::sidebar::SidebarView>,
+        window: gpui_kit::AnyWindowHandle,
+    }
+
+    impl TypingFixture {
+        fn open(cx: &mut TestAppContext) -> Self {
+            let tia_asked = std::sync::atomic::AtomicUsize::new(0);
+            let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+                match (
+                    request.method(),
+                    request.path().split('?').next().unwrap_or_default(),
+                ) {
+                    ("POST", "/api/v4/users/ids") => {
+                        let asked = String::from_utf8_lossy(request.body()).into_owned();
+                        let asks = |id: &str| asked.contains(&format!("\"{id}\""));
+                        if asks("tia")
+                            && tia_asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                        {
+                            return Reply::not_found().status(503);
+                        }
+                        let users: Vec<_> = [
+                            json!({ "id": "ann", "username": "ann" }),
+                            json!({ "id": "bob", "username": "bob" }),
+                            json!({ "id": "tia", "username": "tia" }),
+                            json!({ "id": "rem", "username": "rem",
+                                    "first_name": "New", "last_name": "Name" }),
+                        ]
+                        .into_iter()
+                        .filter(|user| asks(user["id"].as_str().unwrap()))
+                        .collect();
+                        Reply::json(json!(users))
+                    }
+                    _ => route(request),
+                }
+            })
+            .accept_websockets();
+            // Online before the channel opens, so no catch-up runs mid-test.
+            cx.executor().allow_parking();
+            cx.update(gpui_kit::init);
+            let client = Client::new_unverified(&server.url(), "token").unwrap();
+            let mut me = User::default();
+            me.id = "me".into();
+            let session = cx.new(|cx| Session::new(client, me, Some(TeamId::from("team")), cx));
+            wait_for_network(cx, |cx| {
+                server.websockets() > 0
+                    && session.read_with(cx, |s, _| s.connection() == session::Connection::Online)
+            });
+            session.update(cx, |s, cx| {
+                s.open_channel(&"town".into(), cx);
+            });
+            let (window, view) = cx.update(|cx| {
+                let options = WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: point(px(0.), px(0.)),
+                        size: size(px(800.), px(600.)),
+                    })),
+                    ..Default::default()
+                };
+                let kind = TimelineKind::Channel("town".into());
+                let session = session.clone();
+                gpui_kit::open_window(options, cx, |window, cx| {
+                    cx.new(|cx| TimelineView::new(kind, session, None, window, cx))
+                })
+                .unwrap()
+            });
+            let line = view.read_with(cx, |v, _| v.typing.clone());
+            let sidebar = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| crate::sidebar::SidebarView::new(session.clone(), window, cx))
+                })
+                .unwrap()
+                .1
+            });
+            let (directory, typing) =
+                session.read_with(cx, |s, _| (s.directory().clone(), s.typing().clone()));
+            let this = Self {
+                server,
+                session,
+                directory,
+                typing,
+                view,
+                line,
+                sidebar,
+                window,
+            };
+            // Every post is Ann's: know her before counting.
+            this.directory
+                .update(cx, |d, cx| d.ensure(["ann".into()], cx));
+            this.settle(cx);
+            this
         }
+
+        /// Draw, run every GPUI timer and wait for every request to be
+        /// answered and handled, until a few rounds change nothing.
+        fn settle(&self, cx: &mut TestAppContext) {
+            use gpui_kit::test::TestWindowExt as _;
+            let watched = [
+                notifications(&self.session, cx),
+                notifications(&self.directory, cx),
+            ];
+            let changes = || watched.iter().map(|(n, _)| n.get()).sum::<usize>();
+            let mut quiet = 0;
+            for _ in 0..50 {
+                let before = (changes(), self.server.requests().len());
+                for window in cx.update(|cx| cx.windows()) {
+                    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                        .unwrap();
+                }
+                cx.executor().advance_clock(Duration::from_secs(10));
+                wait_for_network(cx, |cx| {
+                    self.server.answering() == 0
+                        && !self.directory.read_with(cx, |d, _| d.is_looking_up())
+                        && self.session.read_with(cx, |s, _| s.is_loaded())
+                        && self
+                            .view
+                            .read_with(cx, |v, cx| v.timeline.read(cx).entries().len() >= 60)
+                });
+                quiet = if (changes(), self.server.requests().len()) == before {
+                    quiet + 1
+                } else {
+                    0
+                };
+                if quiet == 3 {
+                    break;
+                }
+            }
+            assert_eq!(quiet, 3, "the session never settled");
+            assert!(
+                self.directory
+                    .read_with(cx, |d, _| d.user(&"ann".into()).is_some())
+            );
+        }
+
+        /// The typing line as screen readers get it, once drawn.
+        fn line_text(&self, cx: &mut TestAppContext) -> String {
+            use gpui_kit::test::TestWindowExt as _;
+            cx.update_window(self.window, |_, window, cx| {
+                window.render_frame(cx);
+                window
+                    .find("typing")
+                    .label()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .unwrap()
+        }
+
+        /// Push `user` typing in `channel` and wait until it arrives.
+        fn type_in(&self, channel: &str, user: &str, cx: &mut TestAppContext) {
+            assert_eq!(self.server.push(typing_event(channel, user)), 1);
+            let kind = TimelineKind::Channel(channel.into());
+            let user = mattermost::UserId::from(user);
+            wait_for_network(cx, |cx| {
+                self.typing
+                    .read_with(cx, |t, _| t.users(&kind).any(|u| u == &user))
+            });
+        }
+
+        /// Draw the line, so it asks for the names it shows, let the
+        /// directory's batch go out and wait for the answer; then the text.
+        fn line_after_lookups(&self, cx: &mut TestAppContext) -> String {
+            self.line_text(cx);
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(20));
+            wait_for_network(cx, |cx| {
+                !self.directory.read_with(cx, |d, _| d.is_looking_up())
+            });
+            self.line_text(cx)
+        }
+
+        /// Let every typing signal run out.
+        fn expire(&self, cx: &mut TestAppContext) {
+            cx.executor().advance_clock(Duration::from_secs(7));
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn typing_redraws_only_the_typing_line_of_its_conversation(cx: &mut TestAppContext) {
+        let f = TypingFixture::open(cx);
+        let (session_notes, _s) = notifications(&f.session, cx);
+        let (directory_notes, _d) = notifications(&f.directory, cx);
+        let (view_notes, _v) = notifications(&f.view, cx);
+        let (sidebar_notes, _b) = notifications(&f.sidebar, cx);
+        let (line_notes, _l) = notifications(&f.line, cx);
+
+        // Someone nobody has a name for, typing in a channel nobody is
+        // looking at: nothing redraws, and no one asks for the name. GPUI's
+        // clock stays put, so only the typing could have changed anything.
+        f.type_in("elsewhere", "zed", cx);
+        assert!(!f.directory.read_with(cx, |d, _| d.is_looking_up()));
         assert_eq!(
             [
                 session_notes.get(),
@@ -1569,40 +1646,63 @@ mod tests {
                 line_notes.get()
             ],
             [0; 5],
-            "session, directory, timeline, sidebar, typing line; zed looked up {} times",
-            lookups(&server, "zed")
+            "session, directory, timeline, sidebar, typing line"
         );
-        assert_eq!(lookups(&server, "zed"), 0);
-        assert_eq!(typing_line(handle, cx), "");
+        assert_eq!(f.line_text(cx), "");
+        assert_eq!(lookups(&f.server, "zed"), 0);
 
-        // In the open channel, the line names whoever types, looking the
-        // name up itself.
-        server.push(typing_event("town", "bob"));
-        wait_until(cx, |cx| typing_line(handle, cx) == "bob is typing…");
-        assert_eq!(lookups(&server, "bob"), 1);
-        assert_eq!(session_notes.get(), 0);
+        // In the open channel, the line names whoever types, asking the
+        // directory for the name itself.
+        f.type_in("town", "bob", cx);
+        assert_eq!(line_notes.get(), 1);
+        assert_eq!(f.line_after_lookups(cx), "bob is typing…");
+        assert_eq!(lookups(&f.server, "bob"), 1);
 
-        // A name the server leaves out is asked for once, not again each
-        // time that person starts typing.
-        server.push(typing_event("town", "yan"));
-        wait_until(cx, |cx| {
-            typing_line(handle, cx) == "bob and Someone are typing…"
-        });
-        wait_until(cx, |_| lookups(&server, "yan") == 1);
+        // A name the server leaves out is asked for once while that person
+        // keeps typing, however often the line redraws.
+        f.type_in("town", "yan", cx);
+        assert_eq!(f.line_after_lookups(cx), "bob and Someone are typing…");
         let directory_after_lookup = directory_notes.get();
+        f.type_in("town", "yan", cx);
+        assert_eq!(f.line_after_lookups(cx), "bob and Someone are typing…");
+        assert_eq!(f.line_after_lookups(cx), "bob and Someone are typing…");
+        assert_eq!(lookups(&f.server, "yan"), 1);
+        assert_eq!(directory_notes.get(), directory_after_lookup);
 
         // Both run out, and the line clears.
-        cx.executor().advance_clock(Duration::from_secs(7));
-        cx.run_until_parked();
-        assert_eq!(typing_line(handle, cx), "");
-
-        server.push(typing_event("town", "yan"));
-        wait_until(cx, |cx| typing_line(handle, cx) == "Someone is typing…");
-        cx.executor().advance_clock(Duration::from_secs(1));
-        cx.run_until_parked();
-        assert_eq!(lookups(&server, "yan"), 1);
-        assert_eq!(directory_notes.get(), directory_after_lookup);
+        f.expire(cx);
+        assert_eq!(f.line_text(cx), "");
+        assert_eq!(lookups(&f.server, "zed"), 0);
         assert_eq!(session_notes.get(), 0);
+    }
+
+    #[gpui_kit::test]
+    fn a_failed_name_lookup_is_retried_when_they_type_again(cx: &mut TestAppContext) {
+        let f = TypingFixture::open(cx);
+        f.type_in("town", "tia", cx);
+        assert_eq!(f.line_after_lookups(cx), "Someone is typing…");
+        assert_eq!(lookups(&f.server, "tia"), 1);
+
+        f.expire(cx);
+        assert_eq!(f.line_text(cx), "");
+        f.type_in("town", "tia", cx);
+        assert_eq!(f.line_after_lookups(cx), "tia is typing…");
+        assert_eq!(lookups(&f.server, "tia"), 2);
+    }
+
+    #[gpui_kit::test]
+    fn a_remembered_typer_is_confirmed_and_shows_their_new_name(cx: &mut TestAppContext) {
+        let f = TypingFixture::open(cx);
+        let mut rem = User::default();
+        rem.id = "rem".into();
+        rem.username = "rem".into();
+        rem.first_name = "Old".into();
+        f.directory.update(cx, |d, cx| d.remember([rem], cx));
+
+        f.type_in("town", "rem", cx);
+        assert_eq!(f.line_text(cx), "Old is typing…");
+        assert_eq!(f.line_after_lookups(cx), "New Name is typing…");
+        assert_eq!(lookups(&f.server, "rem"), 1);
     }
 
     #[gpui_kit::test]

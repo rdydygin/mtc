@@ -26,8 +26,10 @@ pub struct TypingIndicator {
     kind: TimelineKind,
     typing: Entity<Typing>,
     directory: Entity<Directory>,
-    /// Typers already looked up, so a name the server can't give is asked
-    /// for once, not again with every signal.
+    /// Typers already handed to the directory while they keep typing, so a
+    /// name it can't get is asked for once per stretch of typing, not with
+    /// every signal. Only current typers; one who stops is forgotten and
+    /// asked about afresh next time, so a failed lookup gets retried.
     asked: HashSet<UserId>,
     /// The directory's names when this line last looked, so presence and
     /// avatar changes don't redraw it.
@@ -42,8 +44,11 @@ impl TypingIndicator {
         let directory = session.directory().clone();
         let names_revision = directory.read(cx).names_revision();
         let _subscriptions = [
-            cx.subscribe(&typing, |this, _, TypingChanged(kind), cx| {
+            cx.subscribe(&typing, |this, typing, TypingChanged(kind), cx| {
                 if kind == &this.kind {
+                    let typing = typing.read(cx);
+                    this.asked
+                        .retain(|id| typing.users(&this.kind).any(|user| user == id));
                     cx.notify();
                 }
             }),
@@ -83,16 +88,17 @@ impl Render for TypingIndicator {
             ),
             _ => "Several people are typing…".to_string(),
         };
-        // Look up the names shown here, once each, after this frame.
+        // Have the directory look up the names shown here, after this frame.
+        // It decides who needs asking: unknown users, and remembered ones
+        // it hasn't confirmed this run.
         if typers.len() <= NAMED {
-            let unknown: Vec<UserId> = typers
+            let new: Vec<UserId> = typers
                 .into_iter()
-                .filter(|id| directory.user(id).is_none() && !self.asked.contains(id))
+                .filter(|id| self.asked.insert(id.clone()))
                 .collect();
-            if !unknown.is_empty() {
-                self.asked.extend(unknown.iter().cloned());
+            if !new.is_empty() {
                 let directory = self.directory.clone();
-                cx.defer(move |cx| directory.update(cx, |d, cx| d.ensure(unknown, cx)));
+                cx.defer(move |cx| directory.update(cx, |d, cx| d.ensure(new, cx)));
             }
         }
         // Fixed height: the composer must not jump when someone types.

@@ -76,8 +76,7 @@ impl Directory {
     }
 
     /// Whether any user has been asked for and not yet answered.
-    #[cfg(test)]
-    pub(crate) fn is_looking_up(&self) -> bool {
+    pub fn is_looking_up(&self) -> bool {
         !self.queued.is_empty() || !self.in_flight.is_empty()
     }
 
