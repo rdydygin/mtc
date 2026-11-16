@@ -18,8 +18,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, InteractiveElement as _, IntoElement, KeyDownEvent, ObjectFit,
-    ParentElement as _, Pixels, RetainAllImageCache, SharedString, Size, Styled as _,
-    StyledImage as _, WeakEntity, Window, div, img, px, size,
+    ParentElement as _, Pixels, SharedString, Size, Styled as _, StyledImage as _, WeakEntity,
+    Window, div, img, px, size,
 };
 use mattermost::{Client, FileInfo};
 
@@ -64,7 +64,7 @@ pub(crate) fn open_remote(
     url: SharedString,
     window: &mut Window,
     cx: &mut App,
-) -> Option<WeakEntity<RetainAllImageCache>> {
+) -> Option<WeakEntity<crate::image_scope::ImageStore>> {
     let mut file = FileInfo::default();
     file.name = "Attachment image".into();
     open_images(None, vec![ViewerImage { file, url }], 0, window, cx)
@@ -78,14 +78,14 @@ fn open_images(
     index: usize,
     window: &mut Window,
     cx: &mut App,
-) -> Option<WeakEntity<RetainAllImageCache>> {
+) -> Option<WeakEntity<crate::image_scope::ImageStore>> {
     if images.is_empty() || window.has_active_dialog(cx) {
         return None;
     }
     let images: Rc<[ViewerImage]> = images.into();
     // Full-size pictures are the largest images drawn. Held by the dialog,
     // not GPUI's app-wide store, they are freed when the viewer closes.
-    let pictures = RetainAllImageCache::new(cx);
+    let pictures = crate::image_scope::ImageStore::new(cx);
     let shown_pictures = pictures.downgrade();
     let current = cx.new(|_| index.min(images.len() - 1));
     let focus = cx.focus_handle();
@@ -297,19 +297,35 @@ mod tests {
                 .unwrap()
                 .0
         });
+        cx.update(crate::http::PictureClient::install);
         let url = "https://example.com/full.png";
+        let shared = Resource::Uri(url.into());
         let pictures = cx
             .update_window(window, |_, window, cx| {
                 let pictures = open_remote(url.into(), window, cx).unwrap();
                 window.render_frame(cx);
-                window.render_frame(cx);
                 pictures
             })
             .unwrap();
-        let held = pictures.upgrade().unwrap();
-        assert_eq!(held.read_with(cx, |pictures, _| pictures.len()), 1);
-        drop(held);
-        let shared = Resource::Uri(url.into());
+        // The picture is fetched and decoded on the test executor, then
+        // painted from the viewer's store.
+        let mut painted = None;
+        for _ in 0..20 {
+            cx.run_until_parked();
+            painted = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    match pictures.upgrade()?.read(cx).get(&shared) {
+                        Some(Ok(image)) if window.has_image_atlas_entry(&image) => Some(image),
+                        _ => None,
+                    }
+                })
+                .unwrap();
+            if painted.is_some() {
+                break;
+            }
+        }
+        let painted = painted.expect("the viewer paints its picture");
         assert!(!cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&shared)));
         cx.update_window(window, |_, window, cx| {
             window.press("escape", cx);
@@ -319,6 +335,13 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         assert!(pictures.upgrade().is_none(), "closing frees the pictures");
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                !window.has_image_atlas_entry(&painted),
+                "and takes them out of the GPU atlas"
+            );
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

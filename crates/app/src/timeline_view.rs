@@ -15,8 +15,8 @@ use gpui_kit::component::{
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    RetainAllImageCache, SharedString, StatefulInteractiveElement as _, StyleRefinement,
-    Styled as _, Subscription, Task, WeakEntity, Window, div, prelude::FluentBuilder as _,
+    SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription,
+    Task, WeakEntity, Window, div, prelude::FluentBuilder as _,
 };
 use mattermost::{ChannelId, ChannelType, FileInfo, Millis, Post, PostId};
 use session::{Delivery, LoadState, Session, Timeline, TimelineEvent, TimelineKind};
@@ -61,7 +61,7 @@ pub struct TimelineView {
     /// image for the whole run; these go, from memory and the GPU atlas,
     /// with the view. Only rows and popover content draw inside it (see
     /// [`crate::image_scope`]), so the composer still redraws on its own.
-    images: Entity<RetainAllImageCache>,
+    images: Entity<crate::image_scope::ImageStore>,
     /// Row identities before the next timeline event, for scroll anchoring.
     row_ids: Vec<PostId>,
     /// Parsed Markdown for live rich posts, kept so
@@ -148,7 +148,7 @@ impl TimelineView {
             timeline,
             scroller,
             composer,
-            images: RetainAllImageCache::new(cx),
+            images: crate::image_scope::ImageStore::new(cx),
             row_ids: Vec::new(),
             rich_text: HashMap::new(),
             attachment_cards: HashMap::new(),
@@ -1321,11 +1321,20 @@ mod tests {
         cx: &mut TestAppContext,
     ) -> (SlowServer, Entity<TimelineView>, gpui_kit::AnyWindowHandle) {
         let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
-            match request.path().split('?').next().unwrap_or_default() {
-                "/api/v4/users/ids" => Reply::json(json!([
+            // Stray local connections reach test ports too: answer by method
+            // and path.
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("POST", "/api/v4/users/ids") => Reply::json(json!([
                     { "id": "ann", "username": "ann", "last_picture_update": 1 },
                 ])),
-                "/api/v4/channels/town/posts" if !request.path().contains("before=") => {
+                // Nothing older, so Ann's group keeps starting at n60.
+                ("GET", "/api/v4/channels/town/posts") if request.path().contains("before=") => {
+                    Reply::json(json!({}))
+                }
+                ("GET", "/api/v4/channels/town/posts") => {
                     let mut page = posts(60..120);
                     page["posts"]["n60"]["message"] = json!(format!("**look** ![pic]({PICTURE})"));
                     Reply::json(page)
@@ -1334,7 +1343,9 @@ mod tests {
             }
         });
         let (view, _) = open_channel(&server, cx);
+        cx.update(crate::http::PictureClient::install);
         let ann = mattermost::UserId::from("ann");
+        // The directory asks the test server, over the network, about Ann.
         wait_until(cx, |cx| {
             view.read_with(cx, |v, cx| {
                 let session = v.session.read(cx);
@@ -1345,11 +1356,6 @@ mod tests {
         view.update(cx, |v, cx| {
             v.scroller.update(cx, |s, cx| s.scroll_to_item(0, cx));
         });
-        cx.update_window(handle, |_, window, cx| {
-            use gpui_kit::test::TestWindowExt as _;
-            window.render_frame(cx);
-        })
-        .unwrap();
         (server, view, handle)
     }
 
@@ -1360,40 +1366,67 @@ mod tests {
         })
     }
 
+    /// Draw until each of `pictures` has decoded, in the view's own store,
+    /// and been painted into the window's atlas. The pictures come from
+    /// [`crate::http::PictureClient`] and decode on the test executor, and
+    /// Markdown is parsed there too, so a few frames settle it.
+    fn draw_until_painted(
+        view: &Entity<TimelineView>,
+        handle: gpui_kit::AnyWindowHandle,
+        pictures: &[gpui_kit::Resource],
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        for _ in 0..20 {
+            cx.run_until_parked();
+            let painted = cx
+                .update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    let store = view.read(cx).images.read(cx);
+                    pictures.iter().all(|picture| {
+                        matches!(
+                            store.get(picture),
+                            Some(Ok(image)) if window.has_image_atlas_entry(&image)
+                        )
+                    })
+                })
+                .unwrap();
+            if painted {
+                return;
+            }
+        }
+        let states = view.read_with(cx, |v, cx| {
+            let store = v.images.read(cx);
+            pictures
+                .iter()
+                .map(|picture| format!("{picture:?}: {:?}", store.get(picture).map(|r| r.is_ok())))
+                .collect::<Vec<_>>()
+        });
+        panic!("pictures never painted from the view's store: {states:?}");
+    }
+
     #[gpui_kit::test]
     fn post_images_belong_to_the_view_and_go_with_it(cx: &mut TestAppContext) {
         use gpui_kit::{ImgResourceLoader, Resource};
         let (_server, view, handle) = open_with_author_avatar(cx);
-        let images = view.read_with(cx, |v, _| v.images.downgrade());
+        let pictures = [ann_avatar(&view, cx), Resource::Uri(PICTURE.into())];
         // The avatar draws at once; the Markdown picture once the message
         // is parsed, off the UI thread.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while images
-            .upgrade()
-            .unwrap()
-            .read_with(cx, |images, _| images.len())
-            < 2
-        {
-            assert!(Instant::now() < deadline, "the row's pictures never loaded");
-            cx.run_until_parked();
-            cx.update_window(handle, |_, window, cx| {
-                use gpui_kit::test::TestWindowExt as _;
-                window.render_frame(cx);
-            })
-            .unwrap();
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        draw_until_painted(&view, handle, &pictures, cx);
         // Rows are laid out while the list prepaints, and Markdown pictures
         // while the text prepaints: neither may reach the app-wide store.
-        for picture in [ann_avatar(&view, cx), Resource::Uri(PICTURE.into())] {
+        for picture in &pictures {
             assert!(
-                !cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&picture)),
+                !cx.update(|cx| cx.has_asset::<ImgResourceLoader>(picture)),
                 "{picture:?} stays out of the app-wide store"
             );
         }
+        let images = view.read_with(cx, |v, _| v.images.downgrade());
         cx.update_window(handle, |_, window, _| window.remove_window())
             .unwrap();
         drop(view);
+        // GPUI releases dropped entities when it next flushes effects.
+        cx.update(|_| {});
         cx.run_until_parked();
         assert!(
             images.upgrade().is_none(),
@@ -1401,17 +1434,18 @@ mod tests {
         );
     }
 
-    /// Popovers paint after the rest of the window, outside the view's
-    /// cache wrapper; their pictures must not fall back to the app-wide
+    /// Popovers paint after the rest of the window, outside the row's
+    /// image scope; their pictures must not fall back to the app-wide
     /// store, which keeps them for the whole run.
     #[gpui_kit::test]
     fn profile_popover_pictures_paint_from_the_view_cache(cx: &mut TestAppContext) {
         use gpui_kit::test::TestWindowExt as _;
         let (_server, view, handle) = open_with_author_avatar(cx);
         let avatar = ann_avatar(&view, cx);
+        draw_until_painted(&view, handle, std::slice::from_ref(&avatar), cx);
         cx.update_window(handle, |_, window, cx| {
-            window.within("n60").click("author-avatar", cx);
             window.render_frame(cx);
+            window.within("n60").click("author-avatar", cx);
             window.render_frame(cx);
             assert!(
                 !window.find_all("profile-message").is_empty(),
@@ -1419,7 +1453,7 @@ mod tests {
             );
         })
         .unwrap();
-        cx.run_until_parked();
+        draw_until_painted(&view, handle, std::slice::from_ref(&avatar), cx);
         assert!(
             !cx.update(|cx| cx.has_asset::<gpui_kit::ImgResourceLoader>(&avatar)),
             "the popover's picture stays out of the app-wide store"

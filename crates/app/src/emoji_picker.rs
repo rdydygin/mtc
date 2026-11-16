@@ -14,8 +14,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, Context, Entity, Focusable, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, RetainAllImageCache, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window, div,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, Window, div,
 };
 use mattermost::{Client, Emoji};
 use session::{CustomEmojis, EmojiStore};
@@ -287,7 +287,7 @@ pub struct ReactionPicker {
     fallback_focus: Option<gpui_kit::FocusHandle>,
     /// The cache of the conversation the picker opens in, for the custom
     /// emoji it paints after the rest of the window.
-    images: Option<Entity<RetainAllImageCache>>,
+    images: Option<Entity<crate::image_scope::ImageStore>>,
     _release: Subscription,
 }
 
@@ -297,7 +297,7 @@ impl ReactionPicker {
         store: Entity<EmojiStore>,
         on_action: PostActionHandler,
         fallback_focus: Option<gpui_kit::FocusHandle>,
-        images: Option<Entity<RetainAllImageCache>>,
+        images: Option<Entity<crate::image_scope::ImageStore>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {

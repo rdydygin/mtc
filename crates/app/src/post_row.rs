@@ -34,9 +34,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     Anchor, AnyElement, App, ClickEvent, ElementId, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, Pixels, Point, RenderOnce, RetainAllImageCache,
-    SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _,
-    Window, canvas, div, img, prelude::FluentBuilder as _, px, relative,
+    IntoElement, MouseButton, ParentElement as _, Pixels, Point, RenderOnce, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, Window,
+    canvas, div, img, prelude::FluentBuilder as _, px, relative,
 };
 use mattermost::{Client, FileInfo, Status, User, UserId};
 use session::{CustomEmojis, Delivery, Directory, Entry, UsernameLookup};
@@ -107,7 +107,7 @@ pub struct PostRow {
     custom_emoji: CustomEmojis,
     emoji_store: Option<Entity<session::EmojiStore>>,
     reaction_focus_fallback: Option<FocusHandle>,
-    images: Option<Entity<RetainAllImageCache>>,
+    images: Option<Entity<crate::image_scope::ImageStore>>,
     saved: bool,
     has_permalink: bool,
     on_action: PostActionHandler,
@@ -228,7 +228,7 @@ impl PostRow {
     }
 
     /// The image cache the row is drawn in, for its popovers to paint from.
-    pub fn image_cache(mut self, images: Entity<RetainAllImageCache>) -> Self {
+    pub fn image_cache(mut self, images: Entity<crate::image_scope::ImageStore>) -> Self {
         self.images = Some(images);
         self
     }
