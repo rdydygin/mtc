@@ -60,24 +60,15 @@ pub fn is_safe_image(body: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(body) else {
         return true;
     };
-    // Parsing itself is quadratic in the attributes of one tag, and worse in
-    // namespace declarations and entity references, here and again in usvg,
-    // so documents that could cost that much are refused before either
-    // parses them.
-    if has_crowded_tag(text)
-        || declares_markup_entity(text)
-        || declares_many_namespaces(text)
-        || entities_cost_too_much(text)
-    {
+    // Parsing costs more than one pass over the body in places, here and
+    // again in usvg, so a document that could cost too much there is
+    // refused before either parses it.
+    if parse_cost(text).is_some() {
         return false;
     }
     // usvg parses with exactly these options, so entities expand the same
     // way, and a document that fails here fails there before loading anything.
-    let options = ParsingOptions {
-        allow_dtd: true,
-        ..ParsingOptions::default()
-    };
-    let Ok(document) = Document::parse_with_options(text, options) else {
+    let Ok(document) = Document::parse_with_options(text, parsing_options()) else {
         return true;
     };
     // Every check below is linear in what it reads, and links are looked up
@@ -89,90 +80,144 @@ pub fn is_safe_image(body: &[u8]) -> bool {
         .all(|node| is_self_contained(&ids, &node))
 }
 
+fn parsing_options<'a>() -> ParsingOptions<'a> {
+    ParsingOptions {
+        allow_dtd: true,
+        ..ParsingOptions::default()
+    }
+}
+
+/// What would make a document too costly to read: work that grows faster
+/// than its size, in roxmltree's parser or in usvg.
+#[derive(Debug, PartialEq, Eq)]
+enum Cost {
+    /// An entity's value holds markup; see [`Entities::markup`].
+    MarkupEntity,
+    /// Resolving entity references; see [`Entities::work`].
+    EntityReferences,
+    /// A tag with more than [`MAX_ATTRIBUTES`] attributes, or tags whose
+    /// attributes take more than [`MAX_ATTRIBUTE_PAIRS`] comparisons.
+    CrowdedTag,
+    /// Comparing the namespace names of prefixed attributes; see
+    /// [`Markup::prefixed_pairs`].
+    PrefixedAttributes,
+    /// Copying and searching the namespaces in scope; see
+    /// [`Markup::namespace_lookups`].
+    NamespaceScopes,
+}
+
+/// What would make parsing `text` too costly, read in linear time before
+/// parsing it. The entities come first: the markup scan relies on them
+/// holding none.
+fn parse_cost(text: &str) -> Option<Cost> {
+    let entities = Entities::scan(text);
+    if entities.markup {
+        return Some(Cost::MarkupEntity);
+    }
+    let (lookups, expanded) = entities.work(text);
+    if entities.nested || lookups > MAX_ENTITY_WORK || expanded > MAX_ENTITY_TEXT {
+        return Some(Cost::EntityReferences);
+    }
+    let markup = Markup::scan(text, entities.longest);
+    if markup.widest_tag > MAX_ATTRIBUTES || markup.attribute_pairs > MAX_ATTRIBUTE_PAIRS {
+        return Some(Cost::CrowdedTag);
+    }
+    // Attributes with the `xml` prefix are compared by its namespace name.
+    let uri = markup.longest_uri.max(XML_NS.len());
+    if markup.prefixed_pairs.saturating_mul(uri) > MAX_NAMESPACE_WORK {
+        return Some(Cost::PrefixedAttributes);
+    }
+    // Each comparison reads at most one prefix as long as the longest.
+    let lookups = markup.namespace_lookups;
+    if lookups.saturating_mul(1 + markup.longest_prefix) > MAX_NAMESPACE_WORK {
+        return Some(Cost::NamespaceScopes);
+    }
+    None
+}
+
 /// The most attributes, namespace declarations included, a start tag may
 /// carry. roxmltree compares each attribute of a tag with every earlier one,
 /// and each namespace declaration with every earlier one, so a tag with `n`
 /// costs about `n²/2` comparisons. Real SVG elements carry a few dozen at
 /// most: every presentation attribute written out, or an editor's root
-/// element declaring its namespaces. At this bound the largest body we
-/// download, 32 MB of such tags, parses in a second or two, a few times as
-/// long as ordinary tags take; one tag of 50 000 took two seconds alone.
-const MAX_ATTRIBUTES: usize = 256;
+/// element declaring its namespaces.
+const MAX_ATTRIBUTES: usize = 128;
 
-/// Whether some start tag roxmltree reads could carry more than
-/// [`MAX_ATTRIBUTES`] attributes. Counts the quoted strings from each `<` to
-/// the next `>` outside quotes: every attribute and namespace declaration
-/// has exactly one. roxmltree's tags contain no other `<`, not even in a
-/// value, so every tag it reads restarts the count, whatever the scan took
-/// the text before it for: a comment, CDATA, the DTD. There, the count is
-/// only ever too high. One pass over the bytes.
-fn has_crowded_tag(text: &str) -> bool {
-    let mut in_markup = false;
-    let mut quote = None;
-    let mut strings = 0;
-    for byte in text.bytes() {
-        match (byte, quote) {
-            (b'<', _) => {
-                in_markup = true;
-                quote = None;
-                strings = 0;
-            }
-            (_, Some(open)) if byte == open => quote = None,
-            (_, Some(_)) => {}
-            (b'>', None) => in_markup = false,
-            (b'"' | b'\'', None) if in_markup => {
-                quote = Some(byte);
-                strings += 1;
-                if strings > MAX_ATTRIBUTES {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-    }
-    false
+/// The most attribute comparisons a document may take, in the units of
+/// [`Markup::attribute_pairs`]. A tag at [`MAX_ATTRIBUTES`] costs 16 384,
+/// so 32 MB of such tags would cost about two seconds to parse; a typical
+/// element has ten or fewer, so 100 000 of them cost ten million. At this
+/// bound the comparisons take about a tenth of a second.
+const MAX_ATTRIBUTE_PAIRS: usize = 1 << 26;
+
+/// The most work namespace names may take roxmltree, in bytes compared:
+/// see [`Markup::prefixed_pairs`] and [`Markup::namespace_lookups`].
+/// Inkscape declares eight namespaces on the root and writes a few
+/// prefixed attributes on most elements, which costs a few hundred bytes
+/// per element: tens of millions for the largest drawings.
+const MAX_NAMESPACE_WORK: usize = 1 << 28;
+
+/// What a document's entity declarations hold, read as roxmltree reads
+/// them.
+#[derive(Default)]
+struct Entities {
+    declarations: usize,
+    /// The longest value.
+    longest: usize,
+    /// Whether a value holds markup. roxmltree parses an entity's value as
+    /// content wherever it is referenced, so its tags aren't in the body as
+    /// written, and a tag cut off by the end of the value leaves its
+    /// attributes to the next tag: referencing many such entities builds
+    /// one tag of any size. SVG uses entities for namespace names and the
+    /// like, not for markup, so any `<` in a value refuses the document.
+    markup: bool,
+    /// Whether a value references another entity. That multiplies the work
+    /// of [`Entities::work`] by up to 255 for every reference to it, without
+    /// a single extra declaration; SVG editors never nest entities, so it
+    /// refuses the document outright.
+    nested: bool,
 }
 
-/// Whether an `<!ENTITY` declaration's value holds markup. roxmltree parses
-/// an entity's value as content wherever it is referenced, so its tags
-/// aren't in the body as written, and a tag cut off by the end of the value
-/// leaves its attributes to the next tag: referencing many such entities
-/// builds one tag of any size. SVG uses entities for namespace names and
-/// the like, not for markup, so any `<` in a value refuses the document.
-fn declares_markup_entity(text: &str) -> bool {
-    entity_values(text).any(|value| value.contains('<'))
-}
-
-/// The most work resolving entity references may take, in name bytes
-/// compared and value bytes copied; see [`entities_cost_too_much`].
-/// Illustrator declares a dozen namespace names as entities, and its older
-/// files one per distinct style, referenced from every element: a few
-/// thousand references among fifty entities of a hundred bytes cost a few
-/// million. At this bound the worst body parses in a few tenths of a second,
-/// and expands to at most 64 MB of text.
+/// The most work looking up entities may take, in name bytes compared; see
+/// [`Entities::work`]. Illustrator declares a dozen namespace names as
+/// entities, and its older files one per distinct style, referenced from
+/// every element: a few thousand references among fifty entities cost a
+/// few hundred thousand. At this bound the lookups take a few hundredths
+/// of a second.
 const MAX_ENTITY_WORK: usize = 1 << 26;
 
-/// Whether resolving entity references could cost more than
-/// [`MAX_ENTITY_WORK`]. roxmltree finds a referenced entity by comparing its
-/// name with each declaration's in turn, at most its length plus one per
-/// comparison, then reads the value in its place. So `r` references with
-/// names of `b` bytes in all, among `d` declarations whose longest value is
-/// `l`, cost at most `d·(r + b) + r·l`. A value that references another
-/// multiplies that by up to 255 for every reference to it, without a single
-/// extra declaration; SVG editors never nest entities, so that refuses the
-/// document outright.
-fn entities_cost_too_much(text: &str) -> bool {
-    let (mut declarations, mut longest) = (0usize, 0);
-    for value in entity_values(text) {
-        if entity_references(value).0 > 0 {
-            return true;
+/// The most text entity references may expand to, in bytes; see
+/// [`Entities::work`]. Illustrator's style entities, a hundred bytes each
+/// on 50 000 elements, expand to 5 MB. Expanded text costs usvg about what
+/// text in the body does: at this bound, a few hundredths of a second.
+const MAX_ENTITY_TEXT: usize = 1 << 23;
+
+impl Entities {
+    fn scan(text: &str) -> Self {
+        let mut entities = Self::default();
+        for value in entity_values(text) {
+            entities.declarations += 1;
+            entities.longest = entities.longest.max(value.len());
+            entities.markup |= value.contains('<');
+            entities.nested |= entity_references(value).0 > 0;
         }
-        declarations += 1;
-        longest = longest.max(value.len());
+        entities
     }
-    let (references, names) = entity_references(text);
-    let lookups = declarations.saturating_mul(references.saturating_add(names));
-    lookups.saturating_add(references.saturating_mul(longest)) > MAX_ENTITY_WORK
+
+    /// What resolving the references in `text` costs: the lookups, then the
+    /// text they expand to. roxmltree finds a referenced entity by comparing
+    /// its name with each declaration's in turn, at most its length plus one
+    /// per comparison, then reads the value in its place. So `r` references
+    /// with names of `b` bytes in all, among `d` declarations whose longest
+    /// value is `l`, cost `d·(r + b)` and `r·l` at most, unless entities
+    /// nest.
+    fn work(&self, text: &str) -> (usize, usize) {
+        let (references, names) = entity_references(text);
+        let lookups = self
+            .declarations
+            .saturating_mul(references.saturating_add(names));
+        (lookups, references.saturating_mul(self.longest))
+    }
 }
 
 /// The value of each `<!ENTITY` declaration: the first quoted string after
@@ -209,26 +254,247 @@ fn entity_references(text: &str) -> (usize, usize) {
         })
 }
 
-/// The most namespace declarations a document may make. roxmltree gives
-/// each element that declares one a copy of every namespace in scope,
-/// checking each copy against those already made, and finds the namespace
-/// of every element and prefixed attribute by walking all in scope. With
-/// `n` declarations in all, at most `n` elements declare, at most `n + 1`
-/// namespaces are ever in scope, and parsing costs about `n³` steps plus
-/// `n` per element and attribute. Editors declare a handful, mostly on the
-/// root. At this bound the worst body we download parses in under half a
-/// second, twice as long as with none; 3 000 nested elements declaring one
-/// each, 80 KB, took twelve seconds.
-const MAX_NAMESPACE_DECLARATIONS: usize = 64;
+/// What a document's tags cost roxmltree beyond reading them once,
+/// measured by [`Markup::scan`]. Every sum only grows as the scan goes on,
+/// so it bounds the cost of any part of the document roxmltree reads before
+/// it fails.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Markup {
+    /// The most attributes, namespace declarations included, on one tag.
+    widest_tag: usize,
+    /// The sum over tags of the square of their attributes, namespace
+    /// declarations included: each is compared with every earlier one.
+    attribute_pairs: usize,
+    /// The sum over tags of the square of their prefixed attributes.
+    /// roxmltree checks each attribute of a tag against every earlier one
+    /// by namespace name and then local name, and compares the namespace
+    /// names in full when both are prefixed: up to the longest namespace
+    /// name per pair, even for two in the same namespace.
+    prefixed_pairs: usize,
+    /// The longest namespace name a declaration gives, an entity reference
+    /// in it counted as the longest entity value.
+    longest_uri: usize,
+    /// The longest prefix a declaration binds.
+    longest_prefix: usize,
+    /// Prefix comparisons. Each element that declares a namespace gets a
+    /// copy of every one in scope, each checked against those it has so far;
+    /// each of its declarations is checked against the earlier ones; and
+    /// its own prefix and each prefixed attribute's are looked up among all
+    /// in scope. Counts at most `inherited × in scope + declared²` for an
+    /// element that declares and `(1 + prefixed) × in scope` for every one.
+    /// Repeating a declaration on siblings costs little; nesting new ones
+    /// makes every element below pay for all.
+    namespace_lookups: usize,
+}
 
-/// Whether the document might make more than [`MAX_NAMESPACE_DECLARATIONS`]
-/// namespace declarations. Counts `xmlns` wherever it appears: every
-/// declaration is an attribute named `xmlns` or `xmlns:…`, written out in
-/// the body because entities hold no markup.
-fn declares_many_namespaces(text: &str) -> bool {
-    text.matches("xmlns")
-        .nth(MAX_NAMESPACE_DECLARATIONS)
-        .is_some()
+impl Markup {
+    /// Reads `text` as roxmltree's tokenizer does: comments, CDATA,
+    /// processing instructions and the doctype end where roxmltree ends
+    /// them, so the tags found are the ones roxmltree reads, and open
+    /// elements are tracked to know how many namespaces are in scope.
+    /// Where roxmltree would fail, the scan stops, since it parses nothing
+    /// after. `longest_entity` is the longest entity value, which an entity
+    /// reference in a namespace name can stand for. One pass: every read
+    /// ends where the next begins.
+    fn scan(text: &str, longest_entity: usize) -> Self {
+        let mut markup = Self::default();
+        // For each open element, how many namespaces are in scope at most.
+        let mut scopes = Vec::new();
+        let mut at = 0;
+        while let Some(offset) = text[at..].find('<') {
+            let rest = &text[at + offset..];
+            let read = if rest.starts_with("<!--") {
+                length_through(rest, "<!--", "-->")
+            } else if rest.starts_with("<![CDATA[") {
+                length_through(rest, "<![CDATA[", "]]>")
+            } else if rest.starts_with("<!DOCTYPE") {
+                doctype_length(rest)
+            } else if rest.starts_with("<?") {
+                length_through(rest, "<?", "?>")
+            } else if rest.starts_with("<!") {
+                None
+            } else if rest.starts_with("</") {
+                scopes.pop();
+                rest.find('>').map(|end| end + 1)
+            } else {
+                markup.start_tag(rest, longest_entity, &mut scopes)
+            };
+            let Some(read) = read else {
+                break;
+            };
+            at += offset + read;
+        }
+        markup
+    }
+
+    /// Reads the start tag `text` begins with, as roxmltree does: a name,
+    /// then attributes, each a name, `=` and a quoted value that holds no
+    /// `<`, then `>` or `/>`. Returns its length, or `None` where roxmltree
+    /// would fail.
+    fn start_tag(
+        &mut self,
+        text: &str,
+        longest_entity: usize,
+        scopes: &mut Vec<usize>,
+    ) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let space = |at: usize| bytes.get(at).is_some_and(|byte| XML_SPACE.contains(byte));
+        let name_byte = |at: usize| {
+            bytes
+                .get(at)
+                .is_some_and(|byte| !XML_SPACE.contains(byte) && !b"=/<>\"'".contains(byte))
+        };
+        let mut at = 1;
+        while name_byte(at) {
+            at += 1;
+        }
+        let (mut attributes, mut prefixed, mut declarations) = (0, 0, 0);
+        let open = loop {
+            while space(at) {
+                at += 1;
+            }
+            match *bytes.get(at)? {
+                b'>' => break true,
+                b'/' if bytes.get(at + 1) == Some(&b'>') => {
+                    at += 1;
+                    break false;
+                }
+                _ => {}
+            }
+            let name_start = at;
+            while name_byte(at) {
+                at += 1;
+            }
+            let name = &text[name_start..at];
+            while space(at) {
+                at += 1;
+            }
+            if name.is_empty() || bytes.get(at) != Some(&b'=') {
+                return None;
+            }
+            at += 1;
+            while space(at) {
+                at += 1;
+            }
+            let quote = *bytes.get(at).filter(|byte| matches!(byte, b'"' | b'\''))?;
+            at += 1;
+            let length = bytes[at..]
+                .iter()
+                .position(|&byte| byte == quote || byte == b'<')?;
+            if bytes[at + length] == b'<' {
+                return None;
+            }
+            let value = &text[at..at + length];
+            at += length + 1;
+            attributes += 1;
+            if let Some(prefix) = declared_prefix(name) {
+                declarations += 1;
+                self.longest_prefix = self.longest_prefix.max(prefix.len());
+                let references = entity_references(value).0;
+                let uri = value
+                    .len()
+                    .saturating_add(references.saturating_mul(longest_entity));
+                self.longest_uri = self.longest_uri.max(uri);
+            } else if name.contains(':') {
+                prefixed += 1;
+            }
+        };
+        self.widest_tag = self.widest_tag.max(attributes);
+        self.attribute_pairs = self.attribute_pairs.saturating_add(attributes * attributes);
+        self.prefixed_pairs = self.prefixed_pairs.saturating_add(prefixed * prefixed);
+        let inherited = scopes.last().copied().unwrap_or(0);
+        let scope = inherited.saturating_add(declarations);
+        let mut lookups = (1 + prefixed).saturating_mul(scope);
+        if declarations > 0 {
+            lookups = lookups
+                .saturating_add(inherited.saturating_mul(scope))
+                .saturating_add(declarations * declarations);
+        }
+        self.namespace_lookups = self.namespace_lookups.saturating_add(lookups);
+        if open {
+            scopes.push(scope);
+        }
+        Some(at + 1)
+    }
+}
+
+/// The whitespace roxmltree skips.
+const XML_SPACE: [u8; 4] = *b" \t\n\r";
+
+/// `text` without the whitespace it begins with.
+fn skip_space(text: &str) -> &str {
+    text.trim_start_matches([' ', '\t', '\n', '\r'])
+}
+
+/// The prefix an attribute named `name` declares a namespace for, empty for
+/// the default one, as roxmltree reads it: `xmlns`, `xmlns:p`, and also
+/// `p:xmlns`, which declares the default.
+fn declared_prefix(name: &str) -> Option<&str> {
+    match name.split_once(':') {
+        None => (name == "xmlns").then_some(""),
+        Some(("xmlns", prefix)) => Some(prefix),
+        Some((_, "xmlns")) => Some(""),
+        Some(_) => None,
+    }
+}
+
+/// The length of `text`, which begins with `start`, through the first `end`
+/// after it.
+fn length_through(text: &str, start: &str, end: &str) -> Option<usize> {
+    let found = text[start.len()..].find(end)?;
+    Some(start.len() + found + end.len())
+}
+
+/// Where the first of `targets` outside quotes is in `text`.
+fn find_unquoted(text: &str, targets: &[u8]) -> Option<usize> {
+    let mut quote = None;
+    text.bytes().position(|byte| match quote {
+        Some(open) => {
+            if byte == open {
+                quote = None;
+            }
+            false
+        }
+        None if matches!(byte, b'"' | b'\'') => {
+            quote = Some(byte);
+            false
+        }
+        None => targets.contains(&byte),
+    })
+}
+
+/// The length of the doctype `text` begins with, as roxmltree reads it: to
+/// the first `>` or `[` outside the quoted external id, then through the
+/// internal subset, whose entity declarations end at their first `>`
+/// outside quotes and whose other declarations at their first `>`, to `]`
+/// and `>`. `None` where roxmltree would fail.
+fn doctype_length(text: &str) -> Option<usize> {
+    let mut at = find_unquoted(text, b"[>")?;
+    if text.as_bytes()[at] == b'>' {
+        return Some(at + 1);
+    }
+    at += 1;
+    loop {
+        let rest = skip_space(&text[at..]);
+        at = text.len() - rest.len();
+        at += if let Some(after) = rest.strip_prefix(']') {
+            let after = skip_space(after);
+            return after.starts_with('>').then(|| text.len() - after.len() + 1);
+        } else if rest.starts_with("<!--") {
+            length_through(rest, "<!--", "-->")?
+        } else if rest.starts_with("<?") {
+            length_through(rest, "<?", "?>")?
+        } else if rest.starts_with("<!ENTITY") {
+            find_unquoted(rest, b">")? + 1
+        } else if ["<!ELEMENT", "<!ATTLIST", "<!NOTATION"]
+            .iter()
+            .any(|declaration| rest.starts_with(declaration))
+        {
+            rest.find('>')? + 1
+        } else {
+            return None;
+        };
+    }
 }
 
 /// The elements usvg can link to by `id`, found in one pass.
@@ -641,6 +907,28 @@ mod tests {
         );
     }
 
+    /// Why `text` is refused for what it costs to read, if it is.
+    fn cost(text: &str) -> Option<Cost> {
+        parse_cost(text)
+    }
+
+    /// A document with an internal DTD.
+    fn with_dtd(dtd: &str, inner: &str) -> String {
+        format!(
+            r#"<!DOCTYPE svg [{dtd}]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">{inner}</svg>"#
+        )
+    }
+
+    /// Runs `check`, which refuses an attack, and fails if it takes longer
+    /// than an unoptimized build on a busy machine should: each attack took
+    /// seconds or more to parse or render unguarded.
+    fn quickly(check: impl FnOnce()) {
+        let started = std::time::Instant::now();
+        check();
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
     /// A rect with `count` attributes in all, each value holding what could
     /// throw a count off: `>`, `=` and the other quote.
     fn rect_with_attributes(count: usize) -> String {
@@ -651,31 +939,72 @@ mod tests {
     }
 
     #[test]
-    fn crowded_tags_are_refused_before_parsing() {
-        let attributes: String = (0..50_000).map(|i| format!(" a{i}=''")).collect();
-        let crowded = svg(&format!("<rect{attributes}/>"));
-        let declarations: String = (0..50_000)
-            .map(|i| format!(" xmlns:p{i}='urn:{i}'"))
-            .collect();
-        let declaring = svg(&format!("<g{declarations}/>"));
-        let started = std::time::Instant::now();
-        assert!(!is_safe_image(crowded.as_bytes()));
-        assert!(!is_safe_image(declaring.as_bytes()));
-        // Half a megabyte each; parsing either took two seconds, growing
-        // with the square of the size.
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "{:?}",
-            started.elapsed()
+    fn the_markup_scan_reads_tags_as_roxmltree_does() {
+        let scan = |text: &str| Markup::scan(text, 0);
+        let one = scan("<a x='1' p:y='2' xmlns:p='u'/>");
+        assert_eq!(
+            one,
+            Markup {
+                widest_tag: 3,
+                attribute_pairs: 9,
+                prefixed_pairs: 1,
+                longest_uri: 1,
+                longest_prefix: 1,
+                // Its own prefix and `p:y`'s looked up among one namespace,
+                // and its one declaration checked.
+                namespace_lookups: 3,
+            }
         );
+        // `p:xmlns` declares the default namespace, so binds no prefix.
+        assert_eq!(scan("<a p:xmlns='uri'/>").longest_prefix, 0);
+        assert_eq!(scan("<a p:xmlns='uri'/>").longest_uri, 3);
+        // An entity reference in a namespace name counts as the longest
+        // entity value.
+        assert_eq!(Markup::scan("<a xmlns:p='&e;'/>", 1000).longest_uri, 1003);
+
+        // Each nested declaration copies all those above: element `i`
+        // costs `i² + 1`.
+        let nested = "<a xmlns:a='u'><b xmlns:b='u'><c xmlns:c='u'/></b></a>";
+        assert_eq!(scan(nested).namespace_lookups, 2 + 5 + 10);
+        // Siblings repeating one cost the same each.
+        let siblings =
+            |count: usize| format!("<r xmlns:a='u'>{}</r>", "<g xmlns:a='u'/>".repeat(count));
+        assert_eq!(scan(&siblings(1_000)).namespace_lookups, 2 + 5 * 1_000);
+
+        // An end tag takes its element's namespaces out of scope.
+        let closed = "<r><a xmlns:a='u'></a><b xmlns:b='u'/></r>";
+        assert_eq!(scan(closed).namespace_lookups, 2 + 2);
+
+        // Nothing inside these is a tag, and an end tag in them closes
+        // nothing: the second `g` still has the first's namespace in scope.
+        for hidden in [
+            "<!-- </g> <x a='1' b='2' c='3'/> -->",
+            "<![CDATA[ </g> <x a='1' b='2' c='3'/> ]]>",
+            "<?pi </g> <x a='1' b='2' c='3'/> ?>",
+        ] {
+            let text = format!("<g xmlns:a='u'>{hidden}<g xmlns:b='v'/></g>");
+            let markup = scan(&text);
+            assert_eq!(markup.namespace_lookups, 2 + 5, "{text}");
+            assert_eq!(markup.widest_tag, 1, "{text}");
+        }
+        let dtd = r#"<!DOCTYPE svg PUBLIC "a>b" "[c]" [
+            <!ENTITY e "</g> <x a='1' b='2' c='3'/>">
+            <!ATTLIST svg a CDATA "x">
+            <!-- </g> --> <?pi </g> ?>
+        ]>"#;
+        let markup = scan(&format!("{dtd}<g xmlns:a='u'><g xmlns:b='v'/></g>"));
+        assert_eq!((markup.widest_tag, markup.namespace_lookups), (1, 2 + 5));
+        // Values may hold `>`, `=` and the other quote.
+        assert_eq!(scan(&rect_with_attributes(5)).widest_tag, 5);
+
+        // roxmltree fails at a `<` in a value, and parses nothing after.
+        assert_eq!(scan("<a b='<'/><c d='1' e='2'/>"), Markup::default());
     }
 
     #[test]
-    fn attributes_are_counted_per_tag_whatever_comes_before() {
+    fn crowded_tags_are_refused() {
         let full = rect_with_attributes(MAX_ATTRIBUTES);
         let over = rect_with_attributes(MAX_ATTRIBUTES + 1);
-        // Each leaves the count thinking it is inside quotes or outside
-        // markup; neither may hide the tag after it.
         for before in [
             "",
             r#"<!-- it's "quoted -->"#,
@@ -683,63 +1012,81 @@ mod tests {
             r#"<?pi " ?>"#,
             r#"<text>"it's" = 'x' > y</text>"#,
             &format!("<!-- {} -->", "=".repeat(1_000)),
-            &format!(
-                "<style>{}</style>",
-                r#"rect { font-family: "A" } "#.repeat(1_000)
-            ),
             &rect_with_attributes(MAX_ATTRIBUTES),
         ] {
             let fits = svg(&format!("{before}{full}"));
-            assert!(is_safe_image(fits.as_bytes()), "{fits}");
+            assert_eq!(cost(&fits), None, "{fits}");
             let crowded = svg(&format!("{before}{over}"));
-            assert!(!is_safe_image(crowded.as_bytes()), "{crowded}");
+            assert_eq!(cost(&crowded), Some(Cost::CrowdedTag), "{crowded}");
         }
-
-        let doc = |dtd: &str, inner: &str| {
-            format!(
-                r#"<!DOCTYPE svg [{dtd}]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">{inner}</svg>"#
-            )
-        };
         let dtd = r#"<!ENTITY q '"'><!-- ' --><!ENTITY a "x>y">"#;
-        assert!(is_safe_image(doc(dtd, &full).as_bytes()));
-        assert!(!is_safe_image(doc(dtd, &over).as_bytes()));
+        assert_eq!(cost(&with_dtd(dtd, &full)), None);
+        assert_eq!(cost(&with_dtd(dtd, &over)), Some(Cost::CrowdedTag));
+
+        // Tags each within the bound, but too many of them: the root's four
+        // and 4 096 of 128 are just over.
+        let attributes: String = (0..MAX_ATTRIBUTES).map(|i| format!(" a{i}=''")).collect();
+        let tags = |count: usize| svg(&format!("<g{attributes}/>").repeat(count));
+        let tag_pairs = MAX_ATTRIBUTES * MAX_ATTRIBUTES;
+        assert_eq!(MAX_ATTRIBUTE_PAIRS / tag_pairs, 4_096);
+        assert_eq!(
+            Markup::scan(&tags(4_096), 0).attribute_pairs,
+            4_096 * tag_pairs + 16
+        );
+        assert_eq!(cost(&tags(4_096)), Some(Cost::CrowdedTag));
+        assert_eq!(cost(&tags(4_095)), None);
+
+        let attributes: String = (0..50_000).map(|i| format!(" a{i}=''")).collect();
+        let crowded = svg(&format!("<rect{attributes}/>"));
+        quickly(|| assert_eq!(cost(&crowded), Some(Cost::CrowdedTag)));
     }
 
     #[test]
-    fn many_namespace_declarations_are_refused_before_parsing() {
-        const DEPTH: usize = 3_000;
+    fn long_namespace_names_on_prefixed_attributes_are_refused() {
+        // Every pair of prefixed attributes compares 100 KB namespace
+        // names: 445 KB that took six seconds to parse.
+        let uri = "x".repeat(100_000);
+        let attributes: String = (0..MAX_ATTRIBUTES - 2)
+            .map(|i| format!(" {}:a{i}=''", if i % 2 == 0 { 'p' } else { 'q' }))
+            .collect();
+        let reviewed = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' xmlns:p='urn:{uri}p' xmlns:q='urn:{uri}q'>{}</svg>",
+            format!("<g{attributes}/>").repeat(100)
+        );
+        quickly(|| assert_eq!(cost(&reviewed), Some(Cost::PrefixedAttributes)));
+        // The same through an entity.
+        let entity = with_dtd(
+            &format!("<!ENTITY u '{uri}'>"),
+            &format!(
+                "<g xmlns:p='&u;'>{}</g>",
+                format!("<g{attributes}/>").repeat(100)
+            ),
+        );
+        let entity = entity.replace(" q:", " p:");
+        assert_eq!(cost(&entity), Some(Cost::PrefixedAttributes));
+        // Short ones cost little.
+        let short = reviewed.replace(&uri, "");
+        assert_eq!(cost(&short), None);
+    }
+
+    #[test]
+    fn nested_namespace_declarations_are_refused() {
+        // 3 000 elements each declaring one more: 80 KB that took twelve
+        // seconds to parse.
         let mut nested = String::new();
-        for level in 0..DEPTH {
+        for level in 0..3_000 {
             nested.push_str(&format!("<g xmlns:p{level}='urn:{level}'>"));
         }
-        nested.push_str(&"</g>".repeat(DEPTH));
+        nested.push_str(&"</g>".repeat(3_000));
         let nested = svg(&nested);
-        // A few declarations on the root, then many children each copying
-        // them all to declare one more.
-        let siblings = svg(&r#"<g xmlns:x="urn:x"/>"#.repeat(100_000));
-        let started = std::time::Instant::now();
-        assert!(!is_safe_image(nested.as_bytes()));
-        assert!(!is_safe_image(siblings.as_bytes()));
-        // Parsing the nested one, 80 KB, took twelve seconds.
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "{:?}",
-            started.elapsed()
-        );
-
-        // `svg` declares two on the root.
-        let declaring = |count: usize| {
-            let declarations: String = (2..count)
-                .map(|i| format!(" xmlns:p{i}='urn:{i}'"))
-                .collect();
-            svg(&format!("<g{declarations}/>"))
-        };
-        assert!(is_safe_image(
-            declaring(MAX_NAMESPACE_DECLARATIONS).as_bytes()
+        quickly(|| assert_eq!(cost(&nested), Some(Cost::NamespaceScopes)));
+        // Many prefixes in scope, then many elements looking theirs up.
+        let declarations: String = (0..126).map(|i| format!(" xmlns:p{i}='u{i}'")).collect();
+        let lookups = svg(&format!(
+            "<g{declarations}>{}</g>",
+            "<a/>".repeat(1_000_000)
         ));
-        assert!(!is_safe_image(
-            declaring(MAX_NAMESPACE_DECLARATIONS + 1).as_bytes()
-        ));
+        assert_eq!(cost(&lookups), Some(Cost::NamespaceScopes));
     }
 
     #[test]
@@ -751,36 +1098,38 @@ mod tests {
             <g inkscape:label="Layer 1" inkscape:groupmode="layer"><rect width="1" height="1"/></g>
         </svg>"##;
         assert!(is_safe_image(inkscape.as_bytes()));
-        // Icons pasted in with their own declarations.
-        let icons = svg(&r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1"/></svg>"#.repeat(20));
-        assert!(is_safe_image(icons.as_bytes()));
+        // A large drawing of it: every path with its own prefixed attributes.
+        let path =
+            r#"<path inkscape:connector-curvature="0" sodipodi:nodetypes="ccc" d="M0 0h1v1z"/>"#;
+        let drawing = inkscape.replace("</g>", &format!("{}</g>", path.repeat(100_000)));
+        assert_eq!(cost(&drawing), None);
+        // Icons pasted in with their own declarations, however many.
+        let icon = r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1" height="1"><rect width="1" height="1"/></svg>"#;
+        assert!(is_safe_image(svg(&icon.repeat(1_000)).as_bytes()));
+        // Text that names them is no declaration.
+        let prose = svg(&format!(
+            "<!-- xmlns xmlns --><style>/* xmlns */</style><text>{}</text>",
+            "xmlns ".repeat(1_000)
+        ));
+        assert!(is_safe_image(prose.as_bytes()));
     }
 
     #[test]
     fn entities_holding_markup_are_refused() {
-        let doc = |dtd: &str, inner: &str| {
-            format!(
-                r#"<!DOCTYPE svg [{dtd}]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">{inner}</svg>"#
-            )
-        };
         // roxmltree leaves the attributes of a tag cut off by the end of an
         // entity to the next tag, so tags no bound sees can grow without one.
-        let pieces = doc(
+        let pieces = with_dtd(
             r#"<!ENTITY a "<x a1='1' a2='2'"><!ENTITY b "<y b1='1'">"#,
             "&a;&b;<g c='3'/>",
         );
-        let options = ParsingOptions {
-            allow_dtd: true,
-            ..ParsingOptions::default()
-        };
-        let parsed = Document::parse_with_options(&pieces, options).unwrap();
+        let parsed = Document::parse_with_options(&pieces, parsing_options()).unwrap();
         let g = parsed
             .descendants()
             .find(|node| node.has_tag_name("g"))
             .unwrap();
         let names: Vec<_> = g.attributes().map(|attribute| attribute.name()).collect();
         assert_eq!(names, ["a1", "a2", "b1", "c"]);
-        assert!(!is_safe_image(pieces.as_bytes()));
+        assert_eq!(cost(&pieces), Some(Cost::MarkupEntity));
 
         // Many such entities: one tag of 100 000 attributes, every entity
         // within the bound on its own. Parsing it took five seconds.
@@ -793,10 +1142,8 @@ mod tests {
             dtd.push_str(r#"">"#);
             references.push_str(&format!("&e{entity};"));
         }
-        let built = doc(&dtd, &format!("{references}<g/>"));
-        let started = std::time::Instant::now();
-        assert!(!is_safe_image(built.as_bytes()));
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        let built = with_dtd(&dtd, &format!("{references}<g/>"));
+        quickly(|| assert_eq!(cost(&built), Some(Cost::MarkupEntity)));
 
         // Entities as SVG editors use them, for names, still render.
         let names = r##"<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd" [
@@ -808,38 +1155,41 @@ mod tests {
     }
 
     #[test]
-    fn costly_entity_references_are_refused_before_parsing() {
-        let doc = |dtd: &str, inner: &str| {
-            format!(
-                r#"<!DOCTYPE svg [{dtd}]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">{inner}</svg>"#
-            )
-        };
+    fn costly_entity_references_are_refused() {
         // Each reference compared with 30 000 declarations: 830 KB that
         // took over a second to parse.
         let dtd: String = (0..30_000).map(|i| format!("<!ENTITY e{i} 'x'>")).collect();
-        let lookups = doc(&dtd, &"&e29999;".repeat(30_000));
+        let lookups = with_dtd(&dtd, &"&e29999;".repeat(30_000));
+        quickly(|| assert_eq!(cost(&lookups), Some(Cost::EntityReferences)));
         // An entity referencing another 255 times, which roxmltree allows
         // under each of 2 000 references, every one compared with 10 000
         // declarations: within the bound if each counted once.
         let unused: String = (0..10_000).map(|i| format!("<!ENTITY d{i} ''>")).collect();
-        let nested = doc(
+        let nested = with_dtd(
             &format!("{unused}<!ENTITY b ''><!ENTITY a '{}'>", "&b;".repeat(255)),
             &"&a;".repeat(2_000),
         );
+        assert!(!Entities::scan(&nested).markup && Entities::scan(&nested).nested);
+        let unnested = Entities::scan(&nested.replace("&b;", "bbb"));
+        assert!(unnested.work(&nested).0 <= MAX_ENTITY_WORK);
+        assert_eq!(cost(&nested), Some(Cost::EntityReferences));
+        // Lookups and expanded text, as counted: two declarations, three
+        // references with four bytes of names, the longest value three bytes.
+        let counted = "<!ENTITY a 'xyz'><!ENTITY bb 'q'>&a;&bb;&a;&lt;&#65;";
+        assert_eq!(Entities::scan(counted).work(counted), (2 * (3 + 4), 3 * 3));
+        // 64 KB copied in 1 024 times: 64 MB of text, which took usvg over
+        // half a second more than the body alone.
+        let sixty_four = with_dtd(
+            &format!("<!ENTITY x '{}'>", "x".repeat(1 << 16)),
+            &format!("<text>{}</text>", "&x;".repeat(1_024)),
+        );
+        assert_eq!(cost(&sixty_four), Some(Cost::EntityReferences));
         // 100 KB copied in 10 000 times: a gigabyte of text from 130 KB.
-        let expanding = doc(
+        let expanding = with_dtd(
             &format!("<!ENTITY x '{}'>", "x".repeat(100_000)),
             &format!("<text>{}</text>", "&x;".repeat(10_000)),
         );
-        let started = std::time::Instant::now();
-        for hostile in [&lookups, &nested, &expanding] {
-            assert!(!is_safe_image(hostile.as_bytes()));
-        }
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "{:?}",
-            started.elapsed()
-        );
+        assert_eq!(cost(&expanding), Some(Cost::EntityReferences));
     }
 
     #[test]
