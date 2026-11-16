@@ -11,7 +11,10 @@
 //! restart. Requests arrive here on GPUI's background threads, where
 //! reading the disk is fine.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use futures::future::BoxFuture;
 use gpui_kit::http_client::{AsyncBody, HttpClient, Request, Response, Url, http::HeaderValue};
@@ -54,11 +57,20 @@ impl HttpClient for ServerHttpClient {
         let generation = self.generation;
         Box::pin(async move {
             if keep && let Some(body) = cache::image(&uri) {
+                if !is_safe_image(&body) {
+                    return refused();
+                }
                 return Ok(Response::builder()
                     .status(200)
                     .body(AsyncBody::from(body))?);
             }
             let fetched = client.fetch(&uri).await?;
+            if !is_safe_image(&fetched.body) {
+                log::warn!(
+                    "not showing an SVG image that reads local files or nests compressed SVG"
+                );
+                return refused();
+            }
             if keep && fetched.status == 200 && !fetched.body.is_empty() {
                 cache::save_image(generation, &uri, &fetched.body);
             }
@@ -69,6 +81,58 @@ impl HttpClient for ServerHttpClient {
             Ok(response.body(AsyncBody::from(fetched.body))?)
         })
     }
+}
+
+/// A failed response, which GPUI shows as a picture that can't be shown.
+fn refused() -> anyhow::Result<Response<AsyncBody>> {
+    Ok(Response::builder()
+        .status(415)
+        .body(AsyncBody::from(Vec::new()))?)
+}
+
+/// Whether GPUI may render `body`.
+///
+/// GPUI decodes the raster formats it recognizes and renders everything
+/// else as SVG, with usvg's default options. Those resolve an `<image>` or
+/// `<feImage>` link as a local path and read the whole file: `/dev/zero`
+/// exhausts memory, a FIFO hangs the loader, and on Windows a UNC path
+/// connects to another host. Compressed SVG, at the top level or nested in
+/// a `data:` link, is inflated without a limit. Any message or attachment
+/// can carry such an image, so those SVGs aren't shown. SVGs that embed
+/// raster images as `data:` links still are.
+fn is_safe_image(body: &[u8]) -> bool {
+    const GZIP: [u8; 2] = [0x1f, 0x8b];
+    if body.starts_with(&GZIP) {
+        return false;
+    }
+    let unsafe_link = Arc::new(AtomicBool::new(false));
+    let (on_string, on_data) = (unsafe_link.clone(), unsafe_link.clone());
+    let options = usvg::Options {
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_string: Box::new(move |_, _| {
+                on_string.store(true, Ordering::Relaxed);
+                None
+            }),
+            resolve_data: Box::new(move |mime, data, _| match mime {
+                "image/jpg" | "image/jpeg" => Some(usvg::ImageKind::JPEG(data)),
+                "image/png" => Some(usvg::ImageKind::PNG(data)),
+                "image/gif" => Some(usvg::ImageKind::GIF(data)),
+                "image/webp" => Some(usvg::ImageKind::WEBP(data)),
+                // usvg's own resolver parses SVG here, or sniffs plain text
+                // as SVG, inflating it if compressed.
+                "image/svg+xml" | "text/plain" => {
+                    on_data.store(true, Ordering::Relaxed);
+                    None
+                }
+                _ => None,
+            }),
+        },
+        ..Default::default()
+    };
+    // Raster images aren't UTF-8 text and fail at once; an SVG that fails
+    // here fails the same way in GPUI, before it resolves any link.
+    let _ = usvg::Tree::from_data(body, &options);
+    !unsafe_link.load(Ordering::Relaxed)
 }
 
 /// The URL of a user's profile picture. `version` changes when the user
@@ -95,6 +159,51 @@ fn never_changes(client: &Client, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn svgs_that_read_files_or_inflate_data_are_refused() {
+        let svg = |inner: &str| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10">{inner}</svg>"#
+            )
+        };
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        for (inner, safe) in [
+            (r#"<rect width="10" height="10" fill="red"/>"#.to_string(), true),
+            (
+                format!(r#"<image width="1" height="1" href="data:image/png;base64,{png}"/>"#),
+                true,
+            ),
+            (r#"<image width="1" height="1" href="/dev/zero"/>"#.into(), false),
+            (r#"<image width="1" height="1" xlink:href="/dev/zero"/>"#.into(), false),
+            (r#"<image width="1" height="1" href="secret.png"/>"#.into(), false),
+            (r#"<image width="1" height="1" href="\\host\share\a.png"/>"#.into(), false),
+            (
+                r#"<filter id="f"><feImage href="/dev/zero"/></filter><rect width="1" height="1" filter="url(#f)"/>"#.into(),
+                false,
+            ),
+            (
+                r#"<image width="1" height="1" href="data:image/svg+xml;base64,H4sIAAAAAAAA"/>"#.into(),
+                false,
+            ),
+            (
+                r#"<image width="1" height="1" href="data:text/plain;base64,H4sIAAAAAAAA"/>"#.into(),
+                false,
+            ),
+        ] {
+            assert_eq!(is_safe_image(svg(&inner).as_bytes()), safe, "{inner}");
+        }
+        // Compressed SVG.
+        assert!(!is_safe_image(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0]));
+        // Raster images and other bytes pass through to GPUI's decoders.
+        assert!(is_safe_image(&[
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'
+        ]));
+        assert!(is_safe_image(&[0xff, 0xd8, 0xff, 0xe0]));
+        assert!(is_safe_image(b"GIF89a"));
+        assert!(is_safe_image(b"not an image"));
+        assert!(is_safe_image(b""));
+    }
 
     #[test]
     fn only_server_images_that_never_change_are_kept() {
