@@ -62,21 +62,16 @@ pub async fn fetch_manifest(url: String) -> Result<Option<Manifest>> {
         // The final feed's transport determines whether HTTP downloads are safe.
         // A local debug feed may have redirected to an HTTPS manifest.
         let feed_url = response.url().clone();
-        let mut response = response
+        let response = response
             .error_for_status()
             .context("the release feed is unavailable")?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .context("couldn’t read the release feed")?
-        {
-            ensure!(
-                chunk.len() <= MAX_FEED_BYTES - bytes.len(),
-                "the release feed is too large"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
+        let bytes = read_bounded(
+            response,
+            MAX_FEED_BYTES,
+            "the release feed is too large",
+            "couldn’t read the release feed",
+        )
+        .await?;
         let manifest = Manifest::parse(&bytes)?;
         manifest.validate_downloads(&feed_url)?;
         Ok(Some(manifest))
@@ -87,28 +82,46 @@ pub async fn fetch_manifest(url: String) -> Result<Option<Manifest>> {
 /// Download a release archive and check it against the feed's checksum.
 pub async fn download(download: Download) -> Result<Vec<u8>> {
     mattermost::runtime::run(async move {
-        let mut response = http(&download.url)?
+        let response = http(&download.url)?
             .get(&download.url)
             .send()
             .await
             .context("couldn’t download the update")?
             .error_for_status()
             .context("couldn’t download the update")?;
-        let mut bytes = Vec::new();
-        let mut hasher = Sha256::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .context("the update download was interrupted")?
-        {
-            hasher.update(&chunk);
-            bytes.extend_from_slice(&chunk);
-            ensure!(bytes.len() <= MAX_ARCHIVE_BYTES, "the update is too large");
-        }
-        verify(&hasher.finalize(), &download.sha256)?;
+        let bytes = read_bounded(
+            response,
+            MAX_ARCHIVE_BYTES,
+            "the update is too large",
+            "the update download was interrupted",
+        )
+        .await?;
+        verify(&Sha256::digest(&bytes), &download.sha256)?;
         Ok(bytes)
     })
     .await
+}
+
+/// Read `response`'s body, failing with `too_large` as soon as its declared
+/// length, or the bytes decoded so far, exceed `limit`.
+async fn read_bounded(
+    mut response: reqwest::Response,
+    limit: usize,
+    too_large: &'static str,
+    interrupted: &'static str,
+) -> Result<Vec<u8>> {
+    ensure!(
+        response
+            .content_length()
+            .is_none_or(|len| len <= limit as u64),
+        too_large
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.context(interrupted)? {
+        ensure!(chunk.len() <= limit - bytes.len(), too_large);
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn verify(digest: &[u8], expected: &str) -> Result<()> {
@@ -759,6 +772,51 @@ mod tests {
             feed.unwrap_err().to_string(),
             "the release feed is too large"
         );
+    }
+
+    /// A declared length past the limit fails before any body arrives: this
+    /// server sends headers only, then holds the connection open.
+    #[test]
+    fn an_oversized_declared_feed_is_refused_before_reading() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+                    header.clear();
+                }
+                // Stray local connections get a 404, not the held response.
+                if line.starts_with("GET /latest.json ") {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        MAX_FEED_BYTES + 1
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    held.push(stream);
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            }
+        });
+        let started = std::time::Instant::now();
+        let feed = futures::executor::block_on(fetch_manifest(format!("{base}/latest.json")));
+        assert_eq!(
+            feed.unwrap_err().to_string(),
+            "the release feed is too large"
+        );
+        // Well within the 60 s read timeout a body-less read would wait out.
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
