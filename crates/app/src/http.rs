@@ -92,6 +92,49 @@ fn never_changes(client: &Client, url: &str) -> bool {
         || (path.starts_with("users/") && path.contains("/image?_="))
 }
 
+/// Answers every request with a small, valid PNG, so tests draw real
+/// pictures without a network and the test executor drives each load.
+#[cfg(test)]
+pub(crate) struct PictureClient;
+
+#[cfg(test)]
+impl PictureClient {
+    /// A 2 × 2 red PNG.
+    const PNG: [u8; 74] = [
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 6,
+        0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 17, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
+        31, 132, 25, 96, 12, 0, 71, 202, 7, 249, 103, 89, 110, 183, 0, 0, 0, 0, 73, 69, 78, 68,
+        174, 66, 96, 130,
+    ];
+
+    pub(crate) fn install(cx: &mut gpui_kit::App) {
+        cx.set_http_client(Arc::new(Self));
+    }
+}
+
+#[cfg(test)]
+impl HttpClient for PictureClient {
+    fn user_agent(&self) -> Option<&HeaderValue> {
+        None
+    }
+
+    fn proxy(&self) -> Option<&Url> {
+        None
+    }
+
+    fn send(
+        &self,
+        _: Request<AsyncBody>,
+    ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+        Box::pin(async {
+            Ok(Response::builder()
+                .status(200)
+                .header("content-type", "image/png")
+                .body(AsyncBody::from(Self::PNG.to_vec()))?)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

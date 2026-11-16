@@ -285,6 +285,9 @@ pub struct ReactionPicker {
     trigger_focus: gpui_kit::FocusHandle,
     on_action: PostActionHandler,
     fallback_focus: Option<gpui_kit::FocusHandle>,
+    /// The cache of the conversation the picker opens in, for the custom
+    /// emoji it paints after the rest of the window.
+    images: Option<Entity<crate::image_scope::ImageStore>>,
     _release: Subscription,
 }
 
@@ -294,6 +297,7 @@ impl ReactionPicker {
         store: Entity<EmojiStore>,
         on_action: PostActionHandler,
         fallback_focus: Option<gpui_kit::FocusHandle>,
+        images: Option<Entity<crate::image_scope::ImageStore>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -312,6 +316,7 @@ impl ReactionPicker {
             trigger_focus: cx.focus_handle().tab_stop(true),
             on_action,
             fallback_focus,
+            images,
             _release: release,
         }
     }
@@ -367,7 +372,10 @@ impl Render for ReactionPicker {
         if let Some(picker) = &content {
             popover = popover.track_focus(&picker.read(cx).input.focus_handle(cx));
         }
-        popover.content(move |_, _, _| div().children(content.clone()))
+        let images = self.images.clone();
+        popover.content(move |_, _, _| {
+            crate::image_scope::in_image_scope(images.as_ref(), div().children(content.clone()))
+        })
     }
 }
 
@@ -411,7 +419,7 @@ mod tests {
         });
         let (handle, picker) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
-                cx.new(|cx| ReactionPicker::new(client, store, on_action, None, window, cx))
+                cx.new(|cx| ReactionPicker::new(client, store, on_action, None, None, window, cx))
             })
             .unwrap()
         });
@@ -485,7 +493,9 @@ mod tests {
         };
         let (handle, _) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
-                cx.new(|cx| ReactionPicker::new(client, store.clone(), action, None, window, cx))
+                cx.new(|cx| {
+                    ReactionPicker::new(client, store.clone(), action, None, None, window, cx)
+                })
             })
             .unwrap()
         });

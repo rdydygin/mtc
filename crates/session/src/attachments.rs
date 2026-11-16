@@ -2,6 +2,7 @@
 use crate::{
     CustomEmojis, PreparedMessage,
     image_policy::{ImageBudget, is_web_image},
+    prepare::{custom_emoji_names, has_markdown_image},
 };
 use mattermost::Post;
 use serde_json::Value;
@@ -83,7 +84,12 @@ pub struct MessageAttachment {
     footer_icon: Arc<str>,
     actions: bool,
     summary: Arc<str>,
-    emoji_source: Arc<str>,
+    /// The custom emoji names its prepared texts use. Each text is
+    /// scanned on its own, as each is prepared on its own: a fence left
+    /// open in one must not hide another's emoji.
+    emoji_names: Arc<[String]>,
+    /// Whether a prepared text has Markdown image syntax of its own.
+    markdown_images: bool,
 }
 impl MessageAttachment {
     pub fn parse(post: &Post, custom: &CustomEmojis) -> Arc<[Self]> {
@@ -121,7 +127,26 @@ impl MessageAttachment {
                 let footer = read("footer", MAX_LABEL);
                 let footer_icon =
                     image_url(&read("footer_icon", MAX_URL), images, &mut image_links);
-                let mut emoji_source = format!("{pretext}\n{text}\n{fallback}");
+                // Fallback-only webhooks must still be visible.
+                let body = if pretext.is_empty() && title.is_empty() && text.is_empty() {
+                    fallback.as_str()
+                } else {
+                    text.as_str()
+                };
+                // Only the texts prepared below; the fallback is shown as
+                // written unless it is the body.
+                let mut emoji_names = Vec::new();
+                let mut markdown_images = false;
+                let mut note_prepared = |source: &str| {
+                    markdown_images |= has_markdown_image(source);
+                    for name in custom_emoji_names(source) {
+                        if !emoji_names.iter().any(|known| known == &name) {
+                            emoji_names.push(name.into_owned());
+                        }
+                    }
+                };
+                note_prepared(&pretext);
+                note_prepared(body);
                 let fields: Vec<AttachmentField> = value
                     .get("fields")
                     .and_then(Value::as_array)
@@ -148,8 +173,7 @@ impl MessageAttachment {
                         )
                         .to_string();
                         budget -= value.len();
-                        emoji_source.push('\n');
-                        emoji_source.push_str(&value);
+                        note_prepared(&value);
                         Some(AttachmentField {
                             label: format!("{title}: {value}").into(),
                             title: title.into(),
@@ -176,12 +200,6 @@ impl MessageAttachment {
                         .collect::<Vec<_>>()
                         .join("\n");
                 }
-                // Fallback-only webhooks must still be visible.
-                let body = if pretext.is_empty() && title.is_empty() && text.is_empty() {
-                    &fallback
-                } else {
-                    &text
-                };
                 Some(Self {
                     color: parse_color(
                         value
@@ -207,7 +225,8 @@ impl MessageAttachment {
                         .and_then(Value::as_array)
                         .is_some_and(|a| !a.is_empty()),
                     summary: summary.into(),
-                    emoji_source: emoji_source.into(),
+                    emoji_names: emoji_names.into(),
+                    markdown_images,
                 })
             })
             .collect()
@@ -227,8 +246,14 @@ impl MessageAttachment {
     pub fn has_actions(&self) -> bool {
         self.actions
     }
-    pub fn emoji_source(&self) -> &str {
-        &self.emoji_source
+    /// The custom emoji names in its texts, each text scanned on its own.
+    pub fn emoji_names(&self) -> &[String] {
+        &self.emoji_names
+    }
+    /// Whether its texts write Markdown images, whose admission can depend
+    /// on any custom emoji (see [`has_markdown_image`]).
+    pub fn has_markdown_images(&self) -> bool {
+        self.markdown_images
     }
     pub fn author_name(&self) -> &Arc<str> {
         &self.author_name
@@ -487,6 +512,33 @@ mod tests {
         assert_eq!(parsed[0].fields().len(), MAX_FIELDS);
         assert!(post_text(&post).len() <= MAX_TOTAL + MAX_ATTACHMENTS);
     }
+    /// Emoji and images are tracked only in texts that are prepared: the
+    /// fallback counts only when it stands in for the body.
+    #[test]
+    fn emoji_and_images_are_tracked_in_prepared_texts_only() {
+        let parse = |attachment: serde_json::Value| {
+            let mut post = Post::default();
+            post.props.insert("attachments".into(), json!([attachment]));
+            MessageAttachment::parse(&post, &CustomEmojis::default())[0].clone()
+        };
+        let shown = parse(json!({
+            "pretext": "deploy :rocketship:",
+            "text": "done :party:",
+            "fallback": "unused :spooky_custom: ![x](https://example.com/x.png)",
+            "fields": [{"title": "by", "value": ":robot_face_custom:"}],
+        }));
+        assert_eq!(
+            shown.emoji_names(),
+            ["rocketship", "party", "robot_face_custom"]
+        );
+        assert!(!shown.has_markdown_images());
+        let fallback_only = parse(json!({
+            "fallback": "only :spooky_custom: ![x](https://example.com/x.png)",
+        }));
+        assert_eq!(fallback_only.emoji_names(), ["spooky_custom"]);
+        assert!(fallback_only.has_markdown_images());
+    }
+
     #[test]
     fn empty_messages_have_shared_summary() {
         let mut post = Post::default();

@@ -83,6 +83,36 @@ impl CustomEmojis {
         }
     }
 
+    /// The names whose image differs between `self` and `other`: added,
+    /// removed, or replaced. `None` when any message may read differently,
+    /// as when the snapshots trust different servers or a changed name is
+    /// also a standard emoji, which literal image syntax can still name.
+    pub(crate) fn changed_names(&self, other: &Self) -> Option<HashSet<String>> {
+        if self.endpoint != other.endpoint {
+            return None;
+        }
+        if Arc::ptr_eq(&self.urls, &other.urls) {
+            return Some(HashSet::new());
+        }
+        let mut changed: HashSet<String> = self
+            .urls
+            .iter()
+            .filter(|(name, url)| other.urls.get(*name) != Some(*url))
+            .map(|(name, _)| name.clone())
+            .collect();
+        changed.extend(
+            other
+                .urls
+                .keys()
+                .filter(|name| !self.urls.contains_key(*name))
+                .cloned(),
+        );
+        if changed.iter().any(|name| emoji_for(name).is_some()) {
+            return None;
+        }
+        Some(changed)
+    }
+
     /// Every `(name, image URL)` pair, in no particular order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.urls.iter().map(|(name, url)| (name.as_str(), &**url))
