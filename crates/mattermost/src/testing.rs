@@ -6,19 +6,32 @@
 //! poor connection: which requests run in parallel, how long startup takes
 //! in round trips, whether slow downloads survive and stalled ones fail.
 //!
+//! With [`SlowServer::accept_websockets`] it also takes the client's event
+//! connection, greets it as Mattermost does, and sends it whatever
+//! [`SlowServer::push`] is given, so tests can drive real-time events through
+//! the same path the server's would take.
+//!
 //! Enabled by the `test-support` feature.
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
+use futures::{SinkExt as _, StreamExt as _};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
-    sync::watch,
+    sync::{broadcast, watch},
     task::JoinHandle,
+};
+use tokio_tungstenite::{
+    WebSocketStream,
+    tungstenite::{Message, handshake::derive_accept_key, protocol::Role},
 };
 
 use crate::runtime;
@@ -165,11 +178,24 @@ impl Reply {
 
 type Route = dyn Fn(&Request) -> Reply + Send + Sync;
 
+/// Where the client opens its event connection.
+const WEBSOCKET_PATH: &str = "/api/v4/websocket";
+
+/// The event connection's side of the server.
+#[derive(Clone)]
+struct Websockets {
+    /// Off until asked for, so other tests see the connection refused as
+    /// before and no reconnect events reach their sessions.
+    accept: Arc<AtomicBool>,
+    events: broadcast::Sender<String>,
+}
+
 /// A local HTTP server with simulated latency and bandwidth.
 pub struct SlowServer {
     addr: SocketAddr,
     requests: Arc<Mutex<Vec<Request>>>,
     closed_stalled_requests: Arc<Mutex<Vec<Request>>>,
+    websockets: Websockets,
     task: JoinHandle<()>,
 }
 
@@ -197,14 +223,20 @@ impl SlowServer {
         let log = requests.clone();
         let closed = closed_stalled_requests.clone();
         let started = Instant::now();
+        let websockets = Websockets {
+            accept: Arc::new(AtomicBool::new(false)),
+            events: broadcast::channel(64).0,
+        };
+        let sockets = websockets.clone();
         let task = runtime::spawn(async move {
             let listener = TcpListener::from_std(std_listener).expect("adopt the listener");
             while let Ok((stream, _)) = listener.accept().await {
                 let route = route.clone();
                 let log = log.clone();
                 let closed = closed.clone();
+                let sockets = sockets.clone();
                 tokio::spawn(async move {
-                    let _ = serve(stream, network, started, &*route, &log, &closed).await;
+                    let _ = serve(stream, network, started, &*route, &log, &closed, &sockets).await;
                 });
             }
         });
@@ -212,8 +244,27 @@ impl SlowServer {
             addr,
             requests,
             closed_stalled_requests,
+            websockets,
             task,
         }
+    }
+
+    /// Take event connections from now on, greeting each with `hello`.
+    pub fn accept_websockets(self) -> Self {
+        self.websockets.accept.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Send `event`, a Mattermost event such as
+    /// `{"event": "typing", "data": {…}, "broadcast": {…}}`, on every open
+    /// event connection. Returns how many connections it went to.
+    pub fn push(&self, event: serde_json::Value) -> usize {
+        self.websockets.events.send(event.to_string()).unwrap_or(0)
+    }
+
+    /// How many event connections are open.
+    pub fn websockets(&self) -> usize {
+        self.websockets.events.receiver_count()
     }
 
     /// The server's base URL, as a person would type it.
@@ -242,6 +293,7 @@ async fn serve(
     route: &Route,
     log: &Mutex<Vec<Request>>,
     closed: &Mutex<Vec<Request>>,
+    websockets: &Websockets,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let mut buffer = Vec::new();
@@ -263,6 +315,15 @@ async fn serve(
         request.body = buffer[consumed..consumed + body_len].to_vec();
         buffer.drain(..consumed + body_len);
         log.lock().unwrap().push(request.clone());
+
+        if websockets.accept.load(Ordering::SeqCst)
+            && request.path().split('?').next() == Some(WEBSOCKET_PATH)
+            && let Some(key) = request.header("sec-websocket-key")
+        {
+            // The client says nothing before the handshake's answer.
+            let accept = derive_accept_key(key.as_bytes());
+            return serve_websocket(stream, &accept, websockets).await;
+        }
 
         let reply = route(&request);
         if let Some(gate) = &reply.gate {
@@ -292,6 +353,49 @@ async fn serve(
             while stream.read(&mut ignored).await.unwrap_or(0) != 0 {}
             closed.lock().unwrap().push(request);
             return Ok(());
+        }
+    }
+}
+
+/// Finish the handshake, greet, then send pushed events until either side
+/// closes. What the client sends (its token, typing) is read and dropped.
+async fn serve_websocket(
+    mut stream: TcpStream,
+    accept: &str,
+    websockets: &Websockets,
+) -> std::io::Result<()> {
+    // Subscribe before answering, so nothing pushed after the client sees
+    // the handshake is missed.
+    let mut events = websockets.events.subscribe();
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let mut socket = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
+    let hello = r#"{"event":"hello","data":{"server_version":"test"}}"#;
+    if socket.send(Message::text(hello)).await.is_err() {
+        return Ok(());
+    }
+    loop {
+        tokio::select! {
+            message = socket.next() => match message {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Ok(()),
+                Some(Ok(_)) => {}
+            },
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if socket.send(Message::text(event)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
         }
     }
 }
@@ -420,6 +524,10 @@ mod tests {
                             &route,
                             &requests,
                             &closed,
+                            &Websockets {
+                                accept: Arc::new(AtomicBool::new(false)),
+                                events: broadcast::channel(1).0,
+                            },
                         )
                         .await
                     }
