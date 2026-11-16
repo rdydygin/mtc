@@ -140,12 +140,17 @@ async fn download_to(client: &Client, file: &FileInfo, dir: &Path) -> anyhow::Re
     Ok(path)
 }
 
-/// The most a download may grow to: the size the server gave for the file,
-/// with room to spare, so a server can't fill the disk with an endless body.
+/// The most a download may grow to, so a server can't fill the disk with an
+/// endless body: the size the server gave for the file, with room to spare.
+/// A file without a size (none, zero or negative; a missing size reads as
+/// zero) gets a fixed bound well past the server upload limits in practice.
 fn download_limit(size: i64) -> u64 {
     const SLACK: u64 = 16 * 1024 * 1024;
-    let size = u64::try_from(size).unwrap_or(0);
-    size.saturating_add(size / 4).saturating_add(SLACK)
+    const UNKNOWN: u64 = 2 * 1024 * 1024 * 1024;
+    match u64::try_from(size) {
+        Ok(size) if size > 0 => size.saturating_add(size / 4).saturating_add(SLACK),
+        _ => UNKNOWN,
+    }
 }
 
 /// Claim a new file in `dir` for `name`, quarantined on macOS before any
@@ -257,6 +262,7 @@ mod tests {
                 ("GET", "/api/v4/files/endless") => {
                     Reply::bytes(vec![0; 17 * 1024 * 1024]).stall_after(0)
                 }
+                ("GET", "/api/v4/files/unsized") => Reply::bytes(vec![7; 20 * 1024 * 1024]),
                 _ => Reply::not_found(),
             }
         });
@@ -276,24 +282,33 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"quarterly");
 
         // Far more than the server said the file holds; and a missing file.
-        for id in ["endless", "missing"] {
+        for (id, size) in [("endless", 9), ("missing", 0)] {
             assert!(
-                futures::executor::block_on(download_to(&client, &file(id, 0), &dir.0)).is_err(),
+                futures::executor::block_on(download_to(&client, &file(id, size), &dir.0)).is_err(),
                 "{id}"
             );
         }
-        let names: Vec<_> = std::fs::read_dir(&dir.0)
+        let mut names: Vec<_> = std::fs::read_dir(&dir.0)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names, ["report.pdf"]);
+
+        // A file without a known size isn't held to a size-derived bound.
+        let path =
+            futures::executor::block_on(download_to(&client, &file("unsized", 0), &dir.0)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 20 * 1024 * 1024);
+        names.push(path.file_name().unwrap().to_owned());
+        assert_eq!(names.len(), std::fs::read_dir(&dir.0).unwrap().count());
     }
 
     #[test]
     fn download_limits_follow_the_declared_size() {
         const SLACK: u64 = 16 * 1024 * 1024;
-        assert_eq!(download_limit(0), SLACK);
-        assert_eq!(download_limit(-5), SLACK);
+        const UNKNOWN: u64 = 2 * 1024 * 1024 * 1024;
+        assert_eq!(download_limit(0), UNKNOWN);
+        assert_eq!(download_limit(-5), UNKNOWN);
+        assert_eq!(download_limit(1), 1 + SLACK);
         assert_eq!(download_limit(400), 500 + SLACK);
         assert_eq!(
             download_limit(i64::MAX),
