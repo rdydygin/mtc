@@ -671,35 +671,57 @@ mod tests {
     }
 
     fn serve_with(routes: impl FnOnce(&str) -> Vec<(&'static str, Vec<u8>)>) -> String {
-        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::io::Write as _;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let routes = routes(&base);
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let mut line = String::new();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                reader.read_line(&mut line).unwrap();
-                // Skip the headers.
-                let mut header = String::new();
-                while reader.read_line(&mut header).unwrap() > 2 {
-                    header.clear();
-                }
-                let path = line.split_whitespace().nth(1).unwrap_or_default();
-                let (status, body) = match routes.iter().find(|(p, _)| *p == path) {
-                    Some((_, body)) => ("200 OK", body.clone()),
-                    None => ("404 Not Found", b"Not Found".to_vec()),
-                };
-                let head = format!(
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(&body);
-            }
+        serve_each(listener, move |request, mut stream| {
+            let path = request.split_whitespace().nth(1).unwrap_or_default();
+            let (status, body) = match routes.iter().find(|(p, _)| *p == path) {
+                Some((_, body)) => ("200 OK", body.clone()),
+                None => ("404 Not Found", b"Not Found".to_vec()),
+            };
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
         });
         base
+    }
+
+    /// Answer each connection on its own thread, once its request line and
+    /// headers have arrived. A stray local connection that sends nothing
+    /// times out on its own thread instead of holding up the test's request.
+    fn serve_each(
+        listener: std::net::TcpListener,
+        answer: impl Fn(&str, std::net::TcpStream) + Send + Sync + 'static,
+    ) {
+        use std::io::{BufRead as _, BufReader};
+        let answer = std::sync::Arc::new(answer);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let answer = answer.clone();
+                std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let Ok(clone) = stream.try_clone() else {
+                        return;
+                    };
+                    let mut reader = BufReader::new(clone);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut header = String::new();
+                    while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+                        header.clear();
+                    }
+                    answer(&line, stream);
+                });
+            }
+        });
     }
 
     /// Opt-in network smoke test: only request archive headers, never its body.
@@ -778,37 +800,28 @@ mod tests {
     /// server sends headers only, then holds the connection open.
     #[test]
     fn an_oversized_declared_feed_is_refused_before_reading() {
-        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::io::Write as _;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            let mut held = Vec::new();
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                if reader.read_line(&mut line).is_err() {
-                    continue;
-                }
-                let mut header = String::new();
-                while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
-                    header.clear();
-                }
-                // Stray local connections get a 404, not the held response.
-                if line.starts_with("GET /latest.json ") {
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                        MAX_FEED_BYTES + 1
-                    );
-                    let _ = stream.write_all(head.as_bytes());
-                    held.push(stream);
-                } else {
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    );
-                }
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        serve_each(listener, |request, mut stream| {
+            // Stray local connections get a 404, not the held response.
+            if request.starts_with("GET /latest.json ") {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    MAX_FEED_BYTES + 1
+                );
+                let _ = stream.write_all(head.as_bytes());
+                // Hold the connection open without sending the body.
+                std::thread::sleep(std::time::Duration::from_secs(20));
+            } else {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
             }
         });
+        // An idle stray connection, accepted first, must not hold up the feed.
+        let _stray = std::net::TcpStream::connect(addr).unwrap();
         let started = std::time::Instant::now();
         let feed = futures::executor::block_on(fetch_manifest(format!("{base}/latest.json")));
         assert_eq!(
