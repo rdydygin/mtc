@@ -77,6 +77,11 @@ impl Directory {
         }
     }
 
+    /// Whether any user has been asked for and not yet answered.
+    pub fn is_looking_up(&self) -> bool {
+        !self.queued.is_empty() || !self.in_flight.is_empty()
+    }
+
     pub fn user(&self, id: &UserId) -> Option<&Arc<User>> {
         self.users.get(id)
     }

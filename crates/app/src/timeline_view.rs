@@ -30,6 +30,7 @@ use crate::{
     post_row::{PostAction, PostActionHandler, PostRow},
     post_scroller::{PostScroller, PostScrollerState},
     time,
+    typing_indicator::TypingIndicator,
 };
 
 /// Posts by one author closer together than this form one group.
@@ -56,6 +57,7 @@ pub struct TimelineView {
     timeline: Entity<Timeline>,
     scroller: Entity<PostScrollerState>,
     composer: Entity<Composer>,
+    typing: Entity<TypingIndicator>,
     /// Decoded avatars, emoji, and pictures shown in this conversation's
     /// posts and their popovers. GPUI's default image store keeps every
     /// image for the whole run; these go, from memory and the GPU atlas,
@@ -124,6 +126,7 @@ impl TimelineView {
                 cx,
             )
         });
+        let typing = cx.new(|cx| TypingIndicator::new(kind.clone(), &session, cx));
         let directory = session.read(cx).directory().clone();
         let images = crate::image_scope::ImageStore::new(cx);
 
@@ -152,6 +155,7 @@ impl TimelineView {
             timeline,
             scroller,
             composer,
+            typing,
             images,
             row_ids: Vec::new(),
             rich_text: HashMap::new(),
@@ -971,31 +975,6 @@ impl TimelineView {
             })
     }
 
-    fn render_typing(&self, cx: &App) -> impl IntoElement {
-        let session = self.session.read(cx);
-        let directory = session.directory().read(cx);
-        let names: Vec<SharedString> = session
-            .typing_users(&self.kind)
-            .iter()
-            .map(|id| directory.display_name(id))
-            .collect();
-        let text = match names.as_slice() {
-            [] => String::new(),
-            [one] => format!("{one} is typing…"),
-            [a, b] => format!("{a} and {b} are typing…"),
-            _ => "Several people are typing…".to_string(),
-        };
-        // Fixed height: the composer must not jump when someone types.
-        div()
-            .flex_none()
-            .h_5()
-            .px_5()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .truncate()
-            .child(text)
-    }
-
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let timeline = self.timeline.read(cx);
@@ -1175,7 +1154,7 @@ impl Render for TimelineView {
             }))
             .child(self.render_header(cx))
             .child(self.render_body(cx))
-            .child(self.render_typing(cx))
+            .child(self.typing.clone())
             .child(self.composer.clone())
     }
 }
@@ -1437,6 +1416,434 @@ mod tests {
             "the old version goes"
         );
         assert!(!in_atlas(cx, handle, &painted), "from the GPU atlas too");
+    }
+
+    /// How many times `entity` notifies, while the subscription lives.
+    fn notifications<T: 'static>(
+        entity: &Entity<T>,
+        cx: &mut TestAppContext,
+    ) -> (Rc<std::cell::Cell<usize>>, gpui_kit::Subscription) {
+        let count = Rc::new(std::cell::Cell::new(0));
+        let seen = count.clone();
+        let subscription = cx.update(|cx| cx.observe(entity, move |_, _| seen.set(seen.get() + 1)));
+        (count, subscription)
+    }
+
+    /// A `typing` event as the server sends it on the event connection.
+    fn typing_event(channel: &str, user: &str) -> serde_json::Value {
+        json!({
+            "event": "typing",
+            "data": { "parent_id": "", "user_id": user },
+            "broadcast": { "channel_id": channel },
+        })
+    }
+
+    /// How many `users/ids` lookups asked for `user`.
+    fn lookups(server: &SlowServer, user: &str) -> usize {
+        let quoted = format!("\"{user}\"");
+        server
+            .requests()
+            .iter()
+            .filter(|r| {
+                r.method() == "POST"
+                    && r.path().split('?').next() == Some("/api/v4/users/ids")
+                    && String::from_utf8_lossy(r.body()).contains(&quoted)
+            })
+            .count()
+    }
+
+    /// Run GPUI's work while the real network answers, without moving
+    /// GPUI's clock, until `done`.
+    fn wait_for_network(
+        cx: &mut TestAppContext,
+        what: &str,
+        mut done: impl FnMut(&mut TestAppContext) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A channel open in a window, with a sidebar in another, on an event
+    /// connection the test pushes to. Users the server knows: Ann, Bob,
+    /// and Rem (as "New Name"); Tia only from her second lookup; anyone
+    /// else it leaves out, as it does deleted or hidden users. Each load the
+    /// session starts with gets an answer whose handling shows, so the
+    /// fixture can tell when all of them are done.
+    struct TypingFixture {
+        server: SlowServer,
+        session: Entity<Session>,
+        directory: Entity<session::Directory>,
+        typing: Entity<session::Typing>,
+        view: Entity<TimelineView>,
+        line: Entity<crate::typing_indicator::TypingIndicator>,
+        sidebar: Entity<crate::sidebar::SidebarView>,
+        window: gpui_kit::AnyWindowHandle,
+    }
+
+    impl TypingFixture {
+        fn open(cx: &mut TestAppContext) -> Self {
+            let tia_asked = std::sync::atomic::AtomicUsize::new(0);
+            let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+                match (
+                    request.method(),
+                    request.path().split('?').next().unwrap_or_default(),
+                ) {
+                    ("POST", "/api/v4/users/ids") => {
+                        let asked = String::from_utf8_lossy(request.body()).into_owned();
+                        let asks = |id: &str| asked.contains(&format!("\"{id}\""));
+                        if asks("tia")
+                            && tia_asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                        {
+                            return Reply::not_found().status(503);
+                        }
+                        let users: Vec<_> = [
+                            json!({ "id": "ann", "username": "ann" }),
+                            json!({ "id": "bob", "username": "bob" }),
+                            json!({ "id": "tia", "username": "tia" }),
+                            json!({ "id": "rem", "username": "rem",
+                                    "first_name": "New", "last_name": "Name" }),
+                        ]
+                        .into_iter()
+                        .filter(|user| asks(user["id"].as_str().unwrap()))
+                        .collect();
+                        Reply::json(json!(users))
+                    }
+                    ("POST", "/api/v4/users/status/ids") => {
+                        let asked: Vec<String> =
+                            serde_json::from_slice(request.body()).unwrap_or_default();
+                        let statuses: Vec<_> = asked
+                            .iter()
+                            .map(|id| json!({ "user_id": id, "status": "online" }))
+                            .collect();
+                        Reply::json(json!(statuses))
+                    }
+                    ("GET", "/api/v4/users/me/preferences/favorite_channel") => {
+                        Reply::json(json!([{ "user_id": "me", "category": "favorite_channel",
+                                             "name": "town", "value": "true" }]))
+                    }
+                    ("GET", "/api/v4/users/me/preferences/flagged_post") => {
+                        Reply::json(json!([{ "user_id": "me", "category": "flagged_post",
+                                             "name": "n119", "value": "true" }]))
+                    }
+                    ("GET", "/api/v4/teams/team/commands/autocomplete") => {
+                        Reply::json(json!([{ "trigger": "away" }]))
+                    }
+                    ("GET", "/api/v4/emoji") => Reply::json(json!([
+                        { "id": "e1", "creator_id": "ann", "name": "party", "delete_at": 0 },
+                    ])),
+                    ("GET", "/api/v4/users/me/teams/team/threads") => Reply::json(json!({
+                        "total_unread_threads": 1, "total_unread_mentions": 0, "threads": [],
+                    })),
+                    // Opening the channel marks it read, then reads it back.
+                    ("POST", "/api/v4/channels/members/me/view") => {
+                        Reply::json(json!({ "status": "OK" }))
+                    }
+                    ("GET", "/api/v4/channels/town/members/me") => Reply::json(json!({
+                        "channel_id": "town", "user_id": "me", "last_viewed_at": 777,
+                    })),
+                    _ => route(request),
+                }
+            })
+            .accept_websockets();
+            // Online before the channel opens, so no catch-up runs mid-test,
+            // and the channel listed, as the workspace only opens listed
+            // ones (and only those are marked read).
+            cx.executor().allow_parking();
+            cx.update(gpui_kit::init);
+            // Pictures come from memory, not the network.
+            cx.update(crate::http::PictureClient::install);
+            let client = Client::new_unverified(&server.url(), "token").unwrap();
+            let mut me = User::default();
+            me.id = "me".into();
+            let session = cx.new(|cx| Session::new(client, me, Some(TeamId::from("team")), cx));
+            wait_for_network(cx, "the event connection and channels", |cx| {
+                server.websockets() > 0
+                    && session.read_with(cx, |s, _| {
+                        s.connection() == session::Connection::Online && s.is_loaded()
+                    })
+            });
+            session.update(cx, |s, cx| {
+                s.open_channel(&"town".into(), cx);
+            });
+            let (window, view) = cx.update(|cx| {
+                let options = WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: point(px(0.), px(0.)),
+                        size: size(px(800.), px(600.)),
+                    })),
+                    ..Default::default()
+                };
+                let kind = TimelineKind::Channel("town".into());
+                let session = session.clone();
+                gpui_kit::open_window(options, cx, |window, cx| {
+                    cx.new(|cx| TimelineView::new(kind, session, None, window, cx))
+                })
+                .unwrap()
+            });
+            let line = view.read_with(cx, |v, _| v.typing.clone());
+            let sidebar = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| crate::sidebar::SidebarView::new(session.clone(), window, cx))
+                })
+                .unwrap()
+                .1
+            });
+            let (directory, typing) =
+                session.read_with(cx, |s, _| (s.directory().clone(), s.typing().clone()));
+            let this = Self {
+                server,
+                session,
+                directory,
+                typing,
+                view,
+                line,
+                sidebar,
+                window,
+            };
+            // Every post is Ann's: know her before counting.
+            this.directory
+                .update(cx, |d, cx| d.ensure(["ann".into()], cx));
+            this.settle(cx);
+            this
+        }
+
+        /// Wait until every load the session and the view started with has
+        /// been answered and handled, as seen in what each one changes.
+        fn settle(&self, cx: &mut TestAppContext) {
+            use gpui_kit::test::TestWindowExt as _;
+            for window in cx.update(|cx| cx.windows()) {
+                cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                    .unwrap();
+            }
+            // Let the directory's batch, with Ann in it, go out.
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(20));
+            let (ann, me) = (
+                mattermost::UserId::from("ann"),
+                mattermost::UserId::from("me"),
+            );
+            let unfinished = |cx: &mut TestAppContext| {
+                let (session, directory, view) = (&self.session, &self.directory, &self.view);
+                [
+                    ("teams", session.read_with(cx, |s, _| s.teams_loaded())),
+                    ("channels", session.read_with(cx, |s, _| s.is_loaded())),
+                    (
+                        "favorites",
+                        session.read_with(cx, |s, _| s.is_favorite(&"town".into())),
+                    ),
+                    (
+                        "saved",
+                        session.read_with(cx, |s, _| s.is_saved(&"n119".into())),
+                    ),
+                    (
+                        "commands",
+                        session.read_with(cx, |s, _| !s.autocomplete_commands().is_empty()),
+                    ),
+                    (
+                        "emoji",
+                        session.read_with(cx, |s, _| s.custom_emoji().len() == 1),
+                    ),
+                    (
+                        "thread totals",
+                        session.read_with(cx, |s, cx| s.threads().read(cx).unread_threads() == 1),
+                    ),
+                    (
+                        "read state",
+                        session.read_with(cx, |s, _| {
+                            s.channel(&"town".into())
+                                .is_some_and(|c| c.last_viewed_at() == 777)
+                        }),
+                    ),
+                    (
+                        "lookups",
+                        directory
+                            .read_with(cx, |d, _| !d.is_looking_up() && d.user(&ann).is_some()),
+                    ),
+                    (
+                        "own status",
+                        directory.read_with(cx, |d, _| d.status(&me) == mattermost::Status::Online),
+                    ),
+                    (
+                        "posts",
+                        view.read_with(cx, |v, cx| v.timeline.read(cx).entries().len() >= 60),
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(load, done)| (!done).then_some(load))
+                .collect::<Vec<_>>()
+            };
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                cx.run_until_parked();
+                let unfinished = unfinished(cx);
+                if unfinished.is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "startup loads never finished: {unfinished:?}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Those are all the loads there were, so none is still on its way.
+            const STARTUP: [&str; 14] = [
+                "/api/v4/websocket",
+                "/api/v4/users/me/teams",
+                "/api/v4/users/me/teams/team/channels",
+                "/api/v4/users/me/teams/team/channels/members",
+                "/api/v4/users/me/preferences/favorite_channel",
+                "/api/v4/users/me/preferences/flagged_post",
+                "/api/v4/teams/team/commands/autocomplete",
+                "/api/v4/emoji",
+                "/api/v4/users/me/teams/team/threads",
+                "/api/v4/users/status/ids",
+                "/api/v4/users/ids",
+                "/api/v4/channels/town/posts",
+                "/api/v4/channels/members/me/view",
+                "/api/v4/channels/town/members/me",
+            ];
+            for request in self.server.requests() {
+                let path = request.path().split('?').next().unwrap_or_default();
+                // Other local programs may probe the port; only the client
+                // asks for the API.
+                assert!(
+                    !path.starts_with("/api/") || STARTUP.contains(&path),
+                    "a startup load the fixture doesn't wait for: {path}"
+                );
+            }
+        }
+
+        /// The typing line as screen readers get it, once drawn.
+        fn line_text(&self, cx: &mut TestAppContext) -> String {
+            use gpui_kit::test::TestWindowExt as _;
+            cx.update_window(self.window, |_, window, cx| {
+                window.render_frame(cx);
+                window
+                    .find("typing")
+                    .label()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .unwrap()
+        }
+
+        /// Push `user` typing in `channel` and wait until it arrives.
+        fn type_in(&self, channel: &str, user: &str, cx: &mut TestAppContext) {
+            assert_eq!(self.server.push(typing_event(channel, user)), 1);
+            let kind = TimelineKind::Channel(channel.into());
+            let user = mattermost::UserId::from(user);
+            wait_for_network(cx, "the typing event", |cx| {
+                self.typing
+                    .read_with(cx, |t, _| t.users(&kind).any(|u| u == &user))
+            });
+        }
+
+        /// Draw the line, so it asks for the names it shows, let the
+        /// directory's batch go out and wait for the answer; then the text.
+        fn line_after_lookups(&self, cx: &mut TestAppContext) -> String {
+            self.line_text(cx);
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(20));
+            wait_for_network(cx, "the name lookups", |cx| {
+                !self.directory.read_with(cx, |d, _| d.is_looking_up())
+            });
+            self.line_text(cx)
+        }
+
+        /// Let every typing signal run out.
+        fn expire(&self, cx: &mut TestAppContext) {
+            cx.executor().advance_clock(Duration::from_secs(7));
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn typing_redraws_only_the_typing_line_of_its_conversation(cx: &mut TestAppContext) {
+        let f = TypingFixture::open(cx);
+        let (session_notes, _s) = notifications(&f.session, cx);
+        let (directory_notes, _d) = notifications(&f.directory, cx);
+        let (view_notes, _v) = notifications(&f.view, cx);
+        let (sidebar_notes, _b) = notifications(&f.sidebar, cx);
+        let (line_notes, _l) = notifications(&f.line, cx);
+
+        // Someone nobody has a name for, typing in a channel nobody is
+        // looking at: nothing redraws, and no one asks for the name. GPUI's
+        // clock stays put, so only the typing could have changed anything.
+        f.type_in("elsewhere", "zed", cx);
+        assert!(!f.directory.read_with(cx, |d, _| d.is_looking_up()));
+        assert_eq!(
+            [
+                session_notes.get(),
+                directory_notes.get(),
+                view_notes.get(),
+                sidebar_notes.get(),
+                line_notes.get()
+            ],
+            [0; 5],
+            "session, directory, timeline, sidebar, typing line"
+        );
+        assert_eq!(f.line_text(cx), "");
+        assert_eq!(lookups(&f.server, "zed"), 0);
+
+        // In the open channel, the line names whoever types, asking the
+        // directory for the name itself.
+        f.type_in("town", "bob", cx);
+        assert_eq!(line_notes.get(), 1);
+        assert_eq!(f.line_after_lookups(cx), "bob is typing…");
+        assert_eq!(lookups(&f.server, "bob"), 1);
+
+        // A name the server leaves out is asked for once while that person
+        // keeps typing, however often the line redraws.
+        f.type_in("town", "yan", cx);
+        assert_eq!(f.line_after_lookups(cx), "bob and Someone are typing…");
+        let directory_after_lookup = directory_notes.get();
+        f.type_in("town", "yan", cx);
+        assert_eq!(f.line_after_lookups(cx), "bob and Someone are typing…");
+        assert_eq!(f.line_after_lookups(cx), "bob and Someone are typing…");
+        assert_eq!(lookups(&f.server, "yan"), 1);
+        assert_eq!(directory_notes.get(), directory_after_lookup);
+
+        // Both run out, and the line clears.
+        f.expire(cx);
+        assert_eq!(f.line_text(cx), "");
+        assert_eq!(lookups(&f.server, "zed"), 0);
+        assert_eq!(session_notes.get(), 0);
+    }
+
+    #[gpui_kit::test]
+    fn a_failed_name_lookup_is_retried_when_they_type_again(cx: &mut TestAppContext) {
+        let f = TypingFixture::open(cx);
+        f.type_in("town", "tia", cx);
+        assert_eq!(f.line_after_lookups(cx), "Someone is typing…");
+        assert_eq!(lookups(&f.server, "tia"), 1);
+
+        f.expire(cx);
+        assert_eq!(f.line_text(cx), "");
+        f.type_in("town", "tia", cx);
+        assert_eq!(f.line_after_lookups(cx), "tia is typing…");
+        assert_eq!(lookups(&f.server, "tia"), 2);
+    }
+
+    #[gpui_kit::test]
+    fn a_remembered_typer_is_confirmed_and_shows_their_new_name(cx: &mut TestAppContext) {
+        let f = TypingFixture::open(cx);
+        let mut rem = User::default();
+        rem.id = "rem".into();
+        rem.username = "rem".into();
+        rem.first_name = "Old".into();
+        f.directory.update(cx, |d, cx| d.remember([rem], cx));
+
+        f.type_in("town", "rem", cx);
+        assert_eq!(f.line_text(cx), "Old is typing…");
+        assert_eq!(f.line_after_lookups(cx), "New Name is typing…");
+        assert_eq!(lookups(&f.server, "rem"), 1);
     }
 
     #[gpui_kit::test]
