@@ -30,6 +30,7 @@ use crate::{
     post_row::{PostAction, PostActionHandler, PostRow},
     post_scroller::{PostScroller, PostScrollerState},
     time,
+    typing_indicator::TypingIndicator,
 };
 
 /// Posts by one author closer together than this form one group.
@@ -56,6 +57,7 @@ pub struct TimelineView {
     timeline: Entity<Timeline>,
     scroller: Entity<PostScrollerState>,
     composer: Entity<Composer>,
+    typing: Entity<TypingIndicator>,
     /// Decoded avatars, emoji, and pictures shown in this conversation's
     /// posts and their popovers. GPUI's default image store keeps every
     /// image for the whole run; these go, from memory and the GPU atlas,
@@ -124,6 +126,7 @@ impl TimelineView {
                 cx,
             )
         });
+        let typing = cx.new(|cx| TypingIndicator::new(kind.clone(), &session, cx));
         let directory = session.read(cx).directory().clone();
 
         let subscriptions = vec![
@@ -148,6 +151,7 @@ impl TimelineView {
             timeline,
             scroller,
             composer,
+            typing,
             images: crate::image_scope::ImageStore::new(cx),
             row_ids: Vec::new(),
             rich_text: HashMap::new(),
@@ -967,31 +971,6 @@ impl TimelineView {
             })
     }
 
-    fn render_typing(&self, cx: &App) -> impl IntoElement {
-        let session = self.session.read(cx);
-        let directory = session.directory().read(cx);
-        let names: Vec<SharedString> = session
-            .typing_users(&self.kind)
-            .iter()
-            .map(|id| directory.display_name(id))
-            .collect();
-        let text = match names.as_slice() {
-            [] => String::new(),
-            [one] => format!("{one} is typing…"),
-            [a, b] => format!("{a} and {b} are typing…"),
-            _ => "Several people are typing…".to_string(),
-        };
-        // Fixed height: the composer must not jump when someone types.
-        div()
-            .flex_none()
-            .h_5()
-            .px_5()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .truncate()
-            .child(text)
-    }
-
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let timeline = self.timeline.read(cx);
@@ -1171,7 +1150,7 @@ impl Render for TimelineView {
             }))
             .child(self.render_header(cx))
             .child(self.render_body(cx))
-            .child(self.render_typing(cx))
+            .child(self.typing.clone())
             .child(self.composer.clone())
     }
 }
@@ -1403,6 +1382,58 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         panic!("pictures never painted from the view's store: {states:?}");
+    }
+
+    /// How many times `entity` notifies, while the subscription lives.
+    fn notifications<T: 'static>(
+        entity: &Entity<T>,
+        cx: &mut TestAppContext,
+    ) -> (Rc<std::cell::Cell<usize>>, gpui_kit::Subscription) {
+        let count = Rc::new(std::cell::Cell::new(0));
+        let seen = count.clone();
+        let subscription = cx.update(|cx| cx.observe(entity, move |_, _| seen.set(seen.get() + 1)));
+        (count, subscription)
+    }
+
+    #[gpui_kit::test]
+    fn typing_redraws_only_the_typing_line_of_its_conversation(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (view, _) = open_channel(&server, cx);
+        cx.run_until_parked();
+        let (session, line) = view.read_with(cx, |v, _| (v.session.clone(), v.typing.clone()));
+        let typing = session.read_with(cx, |s, _| s.typing().clone());
+        let (session_notes, _s) = notifications(&session, cx);
+        let (view_notes, _v) = notifications(&view, cx);
+        let (line_notes, _l) = notifications(&line, cx);
+        let start = |channel: &str, user: &str, cx: &mut TestAppContext| {
+            typing.update(cx, |t, cx| {
+                t.start(channel.into(), PostId::default(), user.into(), cx)
+            });
+            cx.run_until_parked();
+        };
+        let town = TimelineKind::Channel("town".into());
+
+        // Someone typing in a channel nobody is looking at draws nothing.
+        start("elsewhere", "ann", cx);
+        assert_eq!(
+            (session_notes.get(), view_notes.get(), line_notes.get()),
+            (0, 0, 0)
+        );
+
+        // In the open channel, only its typing line is told.
+        start("town", "ann", cx);
+        assert_eq!(line_notes.get(), 1);
+        assert_eq!((session_notes.get(), view_notes.get()), (0, 0));
+        typing.read_with(cx, |t, _| assert!(t.users(&town).eq([&"ann".into()])));
+
+        // The line clears when the signal runs out. (Moving the clock also
+        // runs the view's own timers, so only the line and session count.)
+        let before = line_notes.get();
+        cx.executor().advance_clock(Duration::from_secs(7));
+        cx.run_until_parked();
+        typing.read_with(cx, |t, _| assert_eq!(t.users(&town).count(), 0));
+        assert!(line_notes.get() > before, "the line redraws without Ann");
+        assert_eq!(session_notes.get(), 0);
     }
 
     #[gpui_kit::test]

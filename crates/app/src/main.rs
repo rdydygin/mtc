@@ -42,6 +42,7 @@ mod switcher;
 mod threads_view;
 mod time;
 mod timeline_view;
+mod typing_indicator;
 mod update;
 mod workspace;
 

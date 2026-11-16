@@ -19,7 +19,7 @@ use mattermost::{
 
 use crate::{
     CustomEmojis, Delivery, Directory, EmojiStore, FollowedThreads, ThreadsEvent, Timeline,
-    TimelineKind,
+    TimelineKind, Typing,
     retry::{is_transient, retry},
     timeline::{CLIENT_NONCE, LoadState, now_millis, send_ids},
 };
@@ -29,8 +29,6 @@ mod conversations;
 pub use conversations::ChannelSections;
 use conversations::ConversationCache;
 
-/// How long a "typing" signal stays visible without being repeated.
-const TYPING_TTL: Duration = Duration::from_secs(6);
 /// Minimum gap between our own typing signals for one conversation.
 const TYPING_THROTTLE: Duration = Duration::from_secs(3);
 /// Timelines kept alive after their view closes, for instant switching.
@@ -228,7 +226,8 @@ pub struct Session {
     sending: HashSet<PostId>,
     /// Confirmations received while a local delete request is outstanding.
     deleting: HashMap<PostId, bool>,
-    typing: HashMap<(ChannelId, PostId), Vec<(UserId, Instant)>>,
+    /// Who is typing where; apart, so a signal doesn't notify the session.
+    typing: Entity<Typing>,
     last_typing_sent: HashMap<(ChannelId, PostId), Instant>,
     connection: Connection,
     has_connected: bool,
@@ -238,7 +237,6 @@ pub struct Session {
     _event_task: Task<()>,
     _channels_task: Option<Task<()>>,
     _teams_task: Option<Task<()>>,
-    _typing_expiry: Option<Task<()>>,
     _emoji_subscription: Subscription,
     _threads_subscription: Subscription,
 }
@@ -325,7 +323,7 @@ impl Session {
             outbox: Vec::new(),
             sending: HashSet::new(),
             deleting: HashMap::new(),
-            typing: HashMap::new(),
+            typing: cx.new(|_| Typing::default()),
             last_typing_sent: HashMap::new(),
             connection: Connection::Connecting,
             has_connected: false,
@@ -334,7 +332,6 @@ impl Session {
             _event_task,
             _channels_task: None,
             _teams_task: None,
-            _typing_expiry: None,
             _emoji_subscription,
             _threads_subscription,
         };
@@ -1997,23 +1994,9 @@ impl Session {
         self.stream.send_typing(kind.channel(), kind.root());
     }
 
-    /// Users currently typing in a channel or thread, excluding the user.
-    pub fn typing_users(&self, kind: &TimelineKind) -> Vec<UserId> {
-        let key = (
-            kind.channel().clone(),
-            kind.root().cloned().unwrap_or_default(),
-        );
-        let now = Instant::now();
-        self.typing
-            .get(&key)
-            .map(|users| {
-                users
-                    .iter()
-                    .filter(|(_, at)| now.duration_since(*at) < TYPING_TTL)
-                    .map(|(user, _)| user.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// Who is typing in each channel and thread, other than the user.
+    pub fn typing(&self) -> &Entity<Typing> {
+        &self.typing
     }
 
     // ----- Real-time routing -----------------------------------------------
@@ -2058,10 +2041,14 @@ impl Session {
                 self.route_post((*post).clone(), true, cx);
                 if !from_me {
                     // A reply stops the author's typing indicator.
-                    let key = (post.channel_id.clone(), post.root_id.clone());
-                    if let Some(users) = self.typing.get_mut(&key) {
-                        users.retain(|(u, _)| u != &post.user_id);
-                    }
+                    self.typing.update(cx, |typing, cx| {
+                        typing.stop(
+                            post.channel_id.clone(),
+                            post.root_id.clone(),
+                            &post.user_id,
+                            cx,
+                        )
+                    });
                     cx.emit(SessionEvent::Posted { post, mentions_me });
                 }
             }
@@ -2077,12 +2064,12 @@ impl Session {
                 if user_id == self.me.id {
                     return;
                 }
-                let users = self.typing.entry((channel_id, parent_id)).or_default();
-                users.retain(|(u, _)| u != &user_id);
-                users.push((user_id.clone(), Instant::now()));
-                self.directory.update(cx, |d, cx| d.ensure([user_id], cx));
-                self.schedule_typing_expiry(cx);
-                cx.notify();
+                // Only the typing line for that conversation redraws.
+                self.directory
+                    .update(cx, |d, cx| d.ensure([user_id.clone()], cx));
+                self.typing.update(cx, |typing, cx| {
+                    typing.start(channel_id, parent_id, user_id, cx)
+                });
             }
             Event::PostUnread { state, .. } => {
                 if state.user_id.is_empty() || state.user_id == self.me.id {
@@ -2378,20 +2365,6 @@ impl Session {
         }
     }
 
-    fn schedule_typing_expiry(&mut self, cx: &mut Context<Self>) {
-        self._typing_expiry = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(TYPING_TTL).await;
-            let _ = this.update(cx, |this, cx| {
-                let now = Instant::now();
-                for users in this.typing.values_mut() {
-                    users.retain(|(_, at)| now.duration_since(*at) < TYPING_TTL);
-                }
-                this.typing.retain(|_, users| !users.is_empty());
-                cx.notify();
-            });
-        }));
-    }
-
     /// Whether every live timeline is loaded, for tests and diagnostics.
     pub fn is_settled(&self, cx: &App) -> bool {
         self.live_timelines()
@@ -2634,6 +2607,56 @@ mod slow_network_tests {
             cx.run_until_parked();
             assert_eq!(invalidations.get(), expected, "{name} in {team} for {user}");
         }
+    }
+
+    #[gpui_kit::test]
+    fn typing_signals_update_typing_without_notifying_the_session(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let session = start(&server, cx);
+        wait_until(cx, |cx| session.read_with(cx, |s, _| s.is_loaded()));
+        let notified = Rc::new(std::cell::Cell::new(0));
+        let seen = notified.clone();
+        let _observer = cx.update(|cx| cx.observe(&session, move |_, _| seen.set(seen.get() + 1)));
+        let typing = session.read_with(cx, |s, _| s.typing().clone());
+        let changed = Rc::new(RefCell::new(Vec::new()));
+        let log = changed.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&typing, move |_, crate::TypingChanged(kind), _| {
+                log.borrow_mut().push(kind.clone())
+            })
+        });
+        let signal = |channel: &str, parent: &str, user: &str| Event::Typing {
+            channel_id: channel.into(),
+            parent_id: parent.into(),
+            user_id: user.into(),
+        };
+
+        session.update(cx, |s, cx| {
+            s.handle_event(signal("elsewhere", "", "ann"), cx)
+        });
+        session.update(cx, |s, cx| {
+            s.handle_event(signal("town", "root", "ben"), cx)
+        });
+        // The user's own signal, echoed back, is not someone typing.
+        session.update(cx, |s, cx| s.handle_event(signal("town", "", "me"), cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            notified.get(),
+            0,
+            "views watching the session stay as they are"
+        );
+        let elsewhere = TimelineKind::Channel("elsewhere".into());
+        let thread = TimelineKind::Thread {
+            channel: "town".into(),
+            root: "root".into(),
+        };
+        assert_eq!(*changed.borrow(), [elsewhere.clone(), thread.clone()]);
+        typing.read_with(cx, |t, _| {
+            assert!(t.users(&elsewhere).eq([&"ann".into()]));
+            assert!(t.users(&thread).eq([&"ben".into()]));
+            assert_eq!(t.users(&TimelineKind::Channel("town".into())).count(), 0);
+        });
     }
 
     #[gpui_kit::test]
