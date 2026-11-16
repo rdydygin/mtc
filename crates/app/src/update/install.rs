@@ -15,6 +15,8 @@ use super::manifest::{Download, Manifest};
 
 /// No release comes close; a response this large is not one of ours.
 const MAX_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
+/// The feed is a few hundred bytes of JSON.
+const MAX_FEED_BYTES: usize = 1024 * 1024;
 
 fn http(source: &str) -> Result<reqwest::Client> {
     let source = url::Url::parse(source).context("invalid update URL")?;
@@ -60,12 +62,21 @@ pub async fn fetch_manifest(url: String) -> Result<Option<Manifest>> {
         // The final feed's transport determines whether HTTP downloads are safe.
         // A local debug feed may have redirected to an HTTPS manifest.
         let feed_url = response.url().clone();
-        let bytes = response
+        let mut response = response
             .error_for_status()
-            .context("the release feed is unavailable")?
-            .bytes()
+            .context("the release feed is unavailable")?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .context("couldn’t read the release feed")?;
+            .context("couldn’t read the release feed")?
+        {
+            ensure!(
+                chunk.len() <= MAX_FEED_BYTES - bytes.len(),
+                "the release feed is too large"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
         let manifest = Manifest::parse(&bytes)?;
         manifest.validate_downloads(&feed_url)?;
         Ok(Some(manifest))
@@ -738,6 +749,16 @@ mod tests {
             ..download
         };
         assert!(futures::executor::block_on(super::download(damaged)).is_err());
+    }
+
+    #[test]
+    fn an_oversized_feed_is_refused() {
+        let base = serve(vec![("/latest.json", vec![b' '; MAX_FEED_BYTES + 1])]);
+        let feed = futures::executor::block_on(fetch_manifest(format!("{base}/latest.json")));
+        assert_eq!(
+            feed.unwrap_err().to_string(),
+            "the release feed is too large"
+        );
     }
 
     #[test]

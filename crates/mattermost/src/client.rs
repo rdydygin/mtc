@@ -141,6 +141,39 @@ fn is_downgrade(previous: &[Url], next: &Url) -> bool {
     next.scheme() != "https" && previous.iter().any(|url| url.scheme() == "https")
 }
 
+/// The largest JSON API response read, after decompression. Far beyond any
+/// real response; it stops a hostile server's compression bomb from
+/// exhausting memory.
+pub(crate) const MAX_API_BYTES: usize = 128 * 1024 * 1024;
+
+/// The most of an error response read for the server's message.
+const MAX_ERROR_BYTES: usize = 64 * 1024;
+
+/// Read `response`'s (decompressed) body, failing with `too_large` once it
+/// exceeds `limit` bytes rather than holding all of it.
+pub(crate) async fn read_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+    too_large: &'static str,
+) -> Result<Vec<u8>> {
+    // Compressed responses report no length; their decoded size is only
+    // known while reading.
+    let known = response.content_length();
+    if known.is_some_and(|len| len > limit as u64) {
+        bail!(too_large);
+    }
+    let mut body = Vec::with_capacity(known.unwrap_or(0).min(1 << 20) as usize);
+    while let Some(chunk) = response.chunk().await.map_err(connect_error)? {
+        if chunk.len() > limit - body.len() {
+            bail!(too_large);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+const RESPONSE_TOO_LARGE: &str = "The server’s response is too large.";
+
 impl Client {
     /// Sign in with a username or email and password. `mfa_token` is the
     /// one-time code for accounts with multi-factor authentication.
@@ -172,7 +205,8 @@ impl Client {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string)
                 .ok_or_else(|| anyhow!("The server didn’t return a session token."))?;
-            let user: User = response.json().await?;
+            let body = read_limited(response, MAX_API_BYTES, RESPONSE_TOO_LARGE).await?;
+            let user: User = serde_json::from_slice(&body)?;
             let client = Client {
                 inner: Arc::new(Inner {
                     http,
@@ -262,7 +296,7 @@ impl Client {
         }
         let response = check(request.send().await.map_err(connect_error)?).await?;
         // Decode from bytes so an empty body can stand in for `()`.
-        let bytes = response.bytes().await.map_err(connect_error)?;
+        let bytes = read_limited(response, MAX_API_BYTES, RESPONSE_TOO_LARGE).await?;
         let bytes = if bytes.is_empty() {
             &b"null"[..]
         } else {
@@ -664,7 +698,9 @@ impl Client {
                 .send()
                 .await
                 .map_err(connect_error)?;
-            let uploaded: Uploaded = check(response).await?.json().await?;
+            let body =
+                read_limited(check(response).await?, MAX_API_BYTES, RESPONSE_TOO_LARGE).await?;
+            let uploaded: Uploaded = serde_json::from_slice(&body)?;
             uploaded
                 .file_infos
                 .into_iter()
@@ -727,26 +763,19 @@ impl Client {
             if same_origin {
                 request = request.bearer_auth(&inner.token);
             }
-            let mut response = request.send().await.map_err(connect_error)?;
+            let response = request.send().await.map_err(connect_error)?;
             let status = response.status().as_u16();
             let content_type = response
                 .headers()
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            if response
-                .content_length()
-                .is_some_and(|len| len > MAX_IMAGE_BYTES as u64)
-            {
-                bail!("The image exceeds the size limit.");
-            }
-            let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(connect_error)? {
-                if chunk.len() > MAX_IMAGE_BYTES - body.len() {
-                    bail!("The image exceeds the size limit.");
-                }
-                body.extend_from_slice(&chunk);
-            }
+            let body = read_limited(
+                response,
+                MAX_IMAGE_BYTES,
+                "The image exceeds the size limit.",
+            )
+            .await?;
             Ok(FetchedResource {
                 status,
                 content_type,
@@ -995,10 +1024,10 @@ async fn check(response: reqwest::Response) -> Result<reqwest::Response> {
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("json"));
     let message = if is_json {
-        response
-            .json::<serde_json::Value>()
+        read_limited(response, MAX_ERROR_BYTES, RESPONSE_TOO_LARGE)
             .await
             .ok()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
             .and_then(|v| {
                 v.get("message")
                     .and_then(|m| m.as_str())
@@ -1317,6 +1346,41 @@ mod tests {
                 json!([{"user_id":"me", "category":"flagged_post", "name":"p", "value":"true"}])
             );
         }
+    }
+
+    /// Read `path` from `server` with [`read_limited`] and a `limit`.
+    fn read_with_limit(server: &SlowServer, path: &str, limit: usize) -> Result<Vec<u8>> {
+        let url = format!("{}{path}", server.url());
+        block_on(runtime::run(async move {
+            let response = http_client(Timeouts::default())?
+                .get(url)
+                .send()
+                .await
+                .map_err(connect_error)?;
+            read_limited(response, limit, "too large").await
+        }))
+    }
+
+    #[test]
+    fn bodies_are_limited_after_decompression() {
+        let bomb = gzip(&vec![b' '; 64 * 1024]);
+        assert!(bomb.len() < 1024);
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            match (request.method(), request.path()) {
+                ("GET", "/bomb") => Reply::bytes(bomb.clone()).header("Content-Encoding", "gzip"),
+                ("GET", "/declared") => Reply::bytes(vec![b' '; 2048]).stall_after(0),
+                ("GET", "/small") => Reply::bytes(vec![b' '; 1024]),
+                _ => Reply::not_found(),
+            }
+        });
+        for path in ["/bomb", "/declared"] {
+            let err = read_with_limit(&server, path, 1024).unwrap_err();
+            assert_eq!(err.to_string(), "too large", "{path}");
+        }
+        assert_eq!(
+            read_with_limit(&server, "/small", 1024).unwrap().len(),
+            1024
+        );
     }
 
     #[test]

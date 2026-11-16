@@ -31,7 +31,7 @@ use url::Url;
 
 use crate::{
     Client, User,
-    client::{normalize_server_url, redirect_policy},
+    client::{MAX_API_BYTES, normalize_server_url, read_limited, redirect_policy},
     runtime,
 };
 
@@ -43,6 +43,10 @@ pub const CALLBACK_SCHEME: &str = "mattermost-dev";
 pub const MOBILE_CALLBACK_SCHEME: &str = "mmauth";
 
 const MOBILE_CALLBACK: &str = "mmauth://callback";
+
+/// The most of a server's public configuration read; real ones are tens of
+/// kilobytes.
+const MAX_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 
 /// Whether `url` is an SSO callback the app should route to [`SsoAttempt`].
 pub fn is_callback_url(url: &str) -> bool {
@@ -134,7 +138,8 @@ pub async fn login_options(server: &str) -> Result<LoginOptions> {
             .redirect(redirect_policy())
             .build()?;
         let url = server.join("api/v4/config/client?format=old")?;
-        let config: Value = http
+        let not_mattermost = || anyhow!("This doesn’t look like a Mattermost server.");
+        let response = http
             .get(url)
             .send()
             .await
@@ -142,10 +147,13 @@ pub async fn login_options(server: &str) -> Result<LoginOptions> {
                 anyhow!("Couldn’t reach the server. Check the address and your connection.")
             })?
             .error_for_status()
-            .map_err(|_| anyhow!("This doesn’t look like a Mattermost server."))?
-            .json()
+            .map_err(|_| not_mattermost())?;
+        // Any address someone types is asked before it is trusted, so bound
+        // what it may send.
+        let body = read_limited(response, MAX_CONFIG_BYTES, "")
             .await
-            .map_err(|_| anyhow!("This doesn’t look like a Mattermost server."))?;
+            .map_err(|_| not_mattermost())?;
+        let config: Value = serde_json::from_slice(&body).map_err(|_| not_mattermost())?;
         Ok(parse_login_options(&config))
     })
     .await
@@ -322,7 +330,13 @@ impl SsoAttempt {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string)
                 .ok_or_else(|| anyhow!("The server didn’t return a session token."))?;
-            let user: User = response.json().await?;
+            let body = read_limited(
+                response,
+                MAX_API_BYTES,
+                "The server’s response is too large.",
+            )
+            .await?;
+            let user: User = serde_json::from_slice(&body)?;
             Ok((token, user))
         })
         .await?;
@@ -390,6 +404,42 @@ mod tests {
         let labels: Vec<_> = options.providers.iter().map(|p| p.label()).collect();
         assert_eq!(labels, ["Okta", "GitLab"]);
         assert!(!options.password);
+    }
+
+    #[test]
+    fn an_unbounded_sign_in_configuration_is_refused() {
+        use crate::testing::{Network, Reply, SlowServer};
+
+        // Valid JSON, but past the limit once decompressed.
+        let config = |padding: usize| {
+            format!(
+                r#"{{"EnableSaml":"true","Padding":"{}"}}"#,
+                " ".repeat(padding)
+            )
+        };
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, config(MAX_CONFIG_BYTES).as_bytes()).unwrap();
+        let bomb = encoder.finish().unwrap();
+        let small = config(16);
+        let server = SlowServer::start(Network::new(Duration::ZERO), move |request| {
+            match (request.method(), request.path()) {
+                ("GET", "/big/api/v4/config/client?format=old") => {
+                    Reply::bytes(bomb.clone()).header("Content-Encoding", "gzip")
+                }
+                ("GET", "/small/api/v4/config/client?format=old") => {
+                    Reply::bytes(small.clone().into_bytes())
+                }
+                _ => Reply::not_found(),
+            }
+        });
+        let options = |site: &str| {
+            futures::executor::block_on(login_options(&format!("{}/{site}", server.url())))
+        };
+        assert_eq!(
+            options("big").unwrap_err().to_string(),
+            "This doesn’t look like a Mattermost server."
+        );
+        assert_eq!(options("small").unwrap().providers[0].kind(), SsoKind::Saml);
     }
 
     #[test]
