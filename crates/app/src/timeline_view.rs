@@ -1136,6 +1136,10 @@ fn render_header_details(title: &SharedString, details: &[HeaderDetail], cx: &Ap
                         SharedString::from(format!("channel-details-{}", detail.label)),
                         detail.text.clone(),
                     )
+                    // Every picture loads through the app's HTTP client,
+                    // which renders SVG out of process; by default a
+                    // `data:` picture would be decoded, and rendered, here.
+                    .image_source(|url| gpui_kit::ImageSource::from(url.clone()))
                     .selectable(true)
                     .into_any_element()
                 } else {
