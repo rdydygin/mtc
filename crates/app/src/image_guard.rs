@@ -60,9 +60,10 @@ pub fn is_safe_image(body: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(body) else {
         return true;
     };
-    // Parsing itself is quadratic in the attributes of one tag, here and
-    // again in usvg, so a crowded tag is refused before either parses it.
-    if has_crowded_tag(text) || declares_markup_entity(text) {
+    // Parsing itself is quadratic in the attributes of one tag and worse in
+    // namespace declarations, here and again in usvg, so documents that
+    // could cost that much are refused before either parses them.
+    if has_crowded_tag(text) || declares_markup_entity(text) || declares_many_namespaces(text) {
         return false;
     }
     // usvg parses with exactly these options, so entities expand the same
@@ -150,6 +151,28 @@ fn declares_markup_entity(text: &str) -> bool {
                 .find(|&byte| byte == quote || byte == b'<')
                 == Some(b'<')
     })
+}
+
+/// The most namespace declarations a document may make. roxmltree gives
+/// each element that declares one a copy of every namespace in scope,
+/// checking each copy against those already made, and finds the namespace
+/// of every element and prefixed attribute by walking all in scope. With
+/// `n` declarations in all, at most `n` elements declare, at most `n + 1`
+/// namespaces are ever in scope, and parsing costs about `n³` steps plus
+/// `n` per element and attribute. Editors declare a handful, mostly on the
+/// root. At this bound the worst body we download parses in under half a
+/// second, twice as long as with none; 3 000 nested elements declaring one
+/// each, 80 KB, took twelve seconds.
+const MAX_NAMESPACE_DECLARATIONS: usize = 64;
+
+/// Whether the document might make more than [`MAX_NAMESPACE_DECLARATIONS`]
+/// namespace declarations. Counts `xmlns` wherever it appears: every
+/// declaration is an attribute named `xmlns` or `xmlns:…`, written out in
+/// the body because entities hold no markup.
+fn declares_many_namespaces(text: &str) -> bool {
+    text.matches("xmlns")
+        .nth(MAX_NAMESPACE_DECLARATIONS)
+        .is_some()
 }
 
 /// The elements usvg can link to by `id`, found in one pass.
@@ -624,6 +647,57 @@ mod tests {
         let dtd = r#"<!ENTITY q '"'><!-- ' --><!ENTITY a "x>y">"#;
         assert!(is_safe_image(doc(dtd, &full).as_bytes()));
         assert!(!is_safe_image(doc(dtd, &over).as_bytes()));
+    }
+
+    #[test]
+    fn many_namespace_declarations_are_refused_before_parsing() {
+        const DEPTH: usize = 3_000;
+        let mut nested = String::new();
+        for level in 0..DEPTH {
+            nested.push_str(&format!("<g xmlns:p{level}='urn:{level}'>"));
+        }
+        nested.push_str(&"</g>".repeat(DEPTH));
+        let nested = svg(&nested);
+        // A few declarations on the root, then many children each copying
+        // them all to declare one more.
+        let siblings = svg(&r#"<g xmlns:x="urn:x"/>"#.repeat(100_000));
+        let started = std::time::Instant::now();
+        assert!(!is_safe_image(nested.as_bytes()));
+        assert!(!is_safe_image(siblings.as_bytes()));
+        // Parsing the nested one, 80 KB, took twelve seconds.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // `svg` declares two on the root.
+        let declaring = |count: usize| {
+            let declarations: String = (2..count)
+                .map(|i| format!(" xmlns:p{i}='urn:{i}'"))
+                .collect();
+            svg(&format!("<g{declarations}/>"))
+        };
+        assert!(is_safe_image(
+            declaring(MAX_NAMESPACE_DECLARATIONS).as_bytes()
+        ));
+        assert!(!is_safe_image(
+            declaring(MAX_NAMESPACE_DECLARATIONS + 1).as_bytes()
+        ));
+    }
+
+    #[test]
+    fn editor_namespaces_still_render() {
+        // As Inkscape writes them, metadata and all.
+        let inkscape = r##"<svg xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:svg="http://www.w3.org/2000/svg" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" width="10" height="10" inkscape:version="1.3" sodipodi:docname="a.svg">
+            <sodipodi:namedview id="base" pagecolor="#ffffff" inkscape:zoom="1"/>
+            <metadata><rdf:RDF><cc:Work rdf:about=""><dc:format>image/svg+xml</dc:format></cc:Work></rdf:RDF></metadata>
+            <g inkscape:label="Layer 1" inkscape:groupmode="layer"><rect width="1" height="1"/></g>
+        </svg>"##;
+        assert!(is_safe_image(inkscape.as_bytes()));
+        // Icons pasted in with their own declarations.
+        let icons = svg(&r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1"/></svg>"#.repeat(20));
+        assert!(is_safe_image(icons.as_bytes()));
     }
 
     #[test]
