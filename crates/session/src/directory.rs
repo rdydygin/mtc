@@ -113,8 +113,17 @@ impl Directory {
         self.pictures_revision
     }
 
-    fn insert_user(&mut self, user: User) {
+    fn insert_user(&mut self, mut user: User) {
         let old = self.users.get(&user.id);
+        // Copies from different requests can arrive out of order, such as an
+        // autocomplete answer read before the user changed their picture.
+        // A picture version is the time it was set, negated when the default
+        // came back, so a copy never takes the picture back to an older one.
+        if let Some(old) = old
+            && old.last_picture_update.abs() > user.last_picture_update.abs()
+        {
+            user.last_picture_update = old.last_picture_update;
+        }
         if old.is_none_or(|old| old.display_name() != user.display_name()) {
             self.names_revision += 1;
         }
@@ -445,7 +454,7 @@ mod tests {
     }
 
     /// Only a known user's new picture moves the pictures revision: not a
-    /// newly known user, a new name, or presence.
+    /// newly known user, a new name, presence, or an older copy.
     #[gpui_kit::test]
     fn pictures_revision_moves_only_when_a_known_picture_changes(cx: &mut TestAppContext) {
         let server = SlowServer::start(Network::new(Duration::ZERO), route);
@@ -465,6 +474,18 @@ mod tests {
             assert_eq!(d.pictures_revision(), 1);
             d.update_user(&ann, |ann| ann.last_picture_update = 3, cx);
             assert_eq!(d.pictures_revision(), 2);
+            // A copy read before the change keeps the newer picture, and
+            // moves nothing; a newer copy or a picture reset still lands.
+            let mut stale = user("ann", "Anna");
+            stale.last_picture_update = 2;
+            d.insert([stale], cx);
+            assert_eq!(d.user(&ann).unwrap().last_picture_update, 3);
+            assert_eq!(d.pictures_revision(), 2);
+            let mut reset = user("ann", "Anna");
+            reset.last_picture_update = -4;
+            d.insert([reset], cx);
+            assert_eq!(d.user(&ann).unwrap().last_picture_update, -4);
+            assert_eq!(d.pictures_revision(), 3);
         });
     }
 
