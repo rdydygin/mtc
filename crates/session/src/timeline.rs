@@ -197,16 +197,15 @@ impl Entry {
         if names.is_empty() {
             return false;
         }
-        let names_any = |text: &str| {
-            custom_emoji_names(text)
-                .iter()
-                .any(|name| names.contains(name.as_ref()))
-        };
-        names_any(&self.post.message)
-            || self
-                .attachments
-                .iter()
-                .any(|attachment| names_any(attachment.emoji_source()))
+        custom_emoji_names(&self.post.message)
+            .iter()
+            .any(|name| names.contains(name.as_ref()))
+            || self.attachments.iter().any(|attachment| {
+                attachment
+                    .emoji_names()
+                    .iter()
+                    .any(|name| names.contains(name))
+            })
     }
 
     /// The newest moment this post changed, for incremental refresh.
@@ -887,9 +886,10 @@ impl Timeline {
             names.extend(custom_emoji_names(&post.message));
             for attachment in entry.attachments.iter() {
                 names.extend(
-                    custom_emoji_names(attachment.emoji_source())
-                        .into_iter()
-                        .map(|n| Cow::Owned(n.into_owned())),
+                    attachment
+                        .emoji_names()
+                        .iter()
+                        .map(|name| Cow::from(name.as_str())),
                 );
             }
             names.extend(
@@ -1066,6 +1066,82 @@ mod tests {
                 "Updated"
             )
         });
+    }
+
+    /// Each attachment text is prepared on its own, so a fence left open in
+    /// one cannot hide another's emoji from a custom emoji change.
+    #[gpui_kit::test]
+    fn attachment_texts_follow_emoji_changes_independently(cx: &mut TestAppContext) {
+        let attachments = [
+            serde_json::json!([{"pretext":"```", "text":"deploy :party:"}]),
+            serde_json::json!([{"text":"done", "fields":[
+                {"title":"a", "value":"```"},
+                {"title":"b", "value":"status :party:"},
+            ]}]),
+        ];
+        let bots = || {
+            attachments.iter().enumerate().map(|(ix, attachments)| {
+                let mut bot = post(&format!("bot{ix}"), ix as Millis + 1);
+                bot.message.clear();
+                bot.props.insert("attachments".into(), attachments.clone());
+                bot
+            })
+        };
+        let party_texts = |timeline: &Entity<Timeline>, cx: &mut TestAppContext| {
+            timeline.read_with(cx, |t, _| {
+                t.entries()
+                    .iter()
+                    .map(|e| {
+                        let attachment = &e.attachments()[0];
+                        match attachment.fields().get(1) {
+                            Some(field) => field.value().full().text().clone(),
+                            None => attachment.text().full().text().clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let party = CustomEmojis::new([("party".into(), "https://example.com/p.png".into())]);
+
+        // Live: added, replaced, then removed.
+        let (timeline, events) = timeline(cx);
+        timeline.update(cx, |t, cx| bots().for_each(|bot| t.upsert(bot, cx)));
+        events.borrow_mut().clear();
+        timeline.update(cx, |t, cx| t.set_custom_emoji(party.clone(), cx));
+        assert_eq!(
+            *events.borrow(),
+            [TimelineEvent::Updated(0), TimelineEvent::Updated(1)]
+        );
+        for text in party_texts(&timeline, cx) {
+            assert!(
+                text.contains("![:party:](https://example.com/p.png)"),
+                "{text}"
+            );
+        }
+        let mut replaced = party.clone();
+        replaced.insert("party".into(), "https://example.com/new.png".into());
+        timeline.update(cx, |t, cx| t.set_custom_emoji(replaced.clone(), cx));
+        for text in party_texts(&timeline, cx) {
+            assert!(text.contains("https://example.com/new.png"), "{text}");
+        }
+        replaced.remove("party");
+        timeline.update(cx, |t, cx| t.set_custom_emoji(replaced, cx));
+        for text in party_texts(&timeline, cx) {
+            assert!(!text.contains("![:party:]"), "{text}");
+        }
+
+        // Prepared off the UI thread before the emoji arrived.
+        let (timeline, _) = self::timeline(cx);
+        timeline.update(cx, |t, cx| {
+            t.set_custom_emoji(party.clone(), cx);
+            t.replace_all(2, snapshot(bots().collect()), 0, cx);
+        });
+        for text in party_texts(&timeline, cx) {
+            assert!(
+                text.contains("![:party:](https://example.com/p.png)"),
+                "{text}"
+            );
+        }
     }
 
     #[gpui_kit::test]

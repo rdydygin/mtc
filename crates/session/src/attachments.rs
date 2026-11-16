@@ -2,6 +2,7 @@
 use crate::{
     CustomEmojis, PreparedMessage,
     image_policy::{ImageBudget, is_web_image},
+    prepare::custom_emoji_names,
 };
 use mattermost::Post;
 use serde_json::Value;
@@ -83,7 +84,10 @@ pub struct MessageAttachment {
     footer_icon: Arc<str>,
     actions: bool,
     summary: Arc<str>,
-    emoji_source: Arc<str>,
+    /// The custom emoji names its prepared texts use. Each text is
+    /// scanned on its own, as each is prepared on its own: a fence left
+    /// open in one must not hide another's emoji.
+    emoji_names: Arc<[String]>,
 }
 impl MessageAttachment {
     pub fn parse(post: &Post, custom: &CustomEmojis) -> Arc<[Self]> {
@@ -121,7 +125,18 @@ impl MessageAttachment {
                 let footer = read("footer", MAX_LABEL);
                 let footer_icon =
                     image_url(&read("footer_icon", MAX_URL), images, &mut image_links);
-                let mut emoji_source = format!("{pretext}\n{text}\n{fallback}");
+                let mut emoji_names = Vec::new();
+                let mut note_emoji = |source: &str| {
+                    for name in custom_emoji_names(source) {
+                        if !emoji_names.iter().any(|known| known == &name) {
+                            emoji_names.push(name.into_owned());
+                        }
+                    }
+                };
+                // The body is the text or, failing that, the fallback.
+                for source in [&pretext, &text, &fallback] {
+                    note_emoji(source);
+                }
                 let fields: Vec<AttachmentField> = value
                     .get("fields")
                     .and_then(Value::as_array)
@@ -148,8 +163,7 @@ impl MessageAttachment {
                         )
                         .to_string();
                         budget -= value.len();
-                        emoji_source.push('\n');
-                        emoji_source.push_str(&value);
+                        note_emoji(&value);
                         Some(AttachmentField {
                             label: format!("{title}: {value}").into(),
                             title: title.into(),
@@ -207,7 +221,7 @@ impl MessageAttachment {
                         .and_then(Value::as_array)
                         .is_some_and(|a| !a.is_empty()),
                     summary: summary.into(),
-                    emoji_source: emoji_source.into(),
+                    emoji_names: emoji_names.into(),
                 })
             })
             .collect()
@@ -227,8 +241,9 @@ impl MessageAttachment {
     pub fn has_actions(&self) -> bool {
         self.actions
     }
-    pub fn emoji_source(&self) -> &str {
-        &self.emoji_source
+    /// The custom emoji names in its texts, each text scanned on its own.
+    pub fn emoji_names(&self) -> &[String] {
+        &self.emoji_names
     }
     pub fn author_name(&self) -> &Arc<str> {
         &self.author_name
