@@ -1,0 +1,49 @@
+name: Release cache
+
+# Release runs start from tags, and caches saved under one tag are invisible to
+# the next. Keep the release build's dependency cache on main instead, where
+# every tag run can restore it. Restoring on each push also keeps it recently
+# used, so the repository's 10 GB LRU limit doesn't evict it between releases.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cache
+  # Let a cold build finish and save rather than restart on every merge.
+  cancel-in-progress: false
+
+# Must match release.yml: rust-cache hashes CARGO_* and RUST* variables into the key.
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  warm:
+    name: Warm the release build cache
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      # Same shared-key as release.yml's build job, so both use one cache.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        id: cache
+        with:
+          shared-key: macos-release
+      # An exact hit means the dependencies haven't changed: the restore
+      # alone refreshed the cache, and rust-cache skips saving it again.
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: script/bundle-macos --universal

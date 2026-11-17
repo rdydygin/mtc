@@ -39,9 +39,9 @@ jobs:
       contents: read
     uses: ./.github/workflows/ci.yml
 
+  # Builds alongside CI; publish waits for both.
   build:
     name: Build mtc.app
-    needs: ci
     runs-on: macos-latest
     permissions:
       contents: read
@@ -62,9 +62,11 @@ jobs:
         with:
           toolchain: stable
           targets: aarch64-apple-darwin, x86_64-apple-darwin
+      # Restores the cache release-cache.yml keeps warm on main. Tag runs can't
+      # share caches with later tags, so only main saves.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: macos-release
+          shared-key: macos-release
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Pick the release version
@@ -267,7 +269,7 @@ jobs:
 
   publish:
     name: Publish release
-    needs: [build, verify]
+    needs: [ci, build, verify]
     # Only manual runs may opt out; tag pushes always publish after verification.
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
     runs-on: ubuntu-latest

@@ -94,12 +94,15 @@ verify without publishing anything.
 
 The Release workflow:
 
-1. reruns full CI on the exact commit,
-2. stamps the version into the checkout (nothing is committed) and builds a universal
-   `mtc.app` with `script/bundle-macos --universal`,
+1. reruns full CI on the exact commit while, in parallel,
+2. stamping the version into the checkout (nothing is committed) and building a
+   universal `mtc.app` with `script/bundle-macos --universal`,
 3. packages a zip, its SHA-256 and `latest.json`, and verifies them in a read-only job,
-4. creates a draft release, uploads the assets, checks the tag still points at the
-   built commit, and publishes.
+4. once CI has passed, creates a draft release, uploads the assets, checks the tag
+   still points at the built commit, and publishes.
+
+The build restores a dependency cache that `release-cache.yml` keeps warm on `main`
+(tag runs can't share caches with each other).
 
 Existing releases, including drafts, are refused; if publishing fails, inspect and
 delete the draft before retrying.
