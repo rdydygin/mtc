@@ -4,223 +4,126 @@
 
 A fast, keyboard-first Mattermost desktop client built with [GPUI Kit](https://gpui-kit.com).
 
-Download `mtc.app` for macOS from [Releases](https://github.com/rdydygin/mtc/releases), or build it:
+## Install
+
+Download `mtc-vX.Y.Z-macos-universal.zip` from [Releases](https://github.com/rdydygin/mtc/releases).
+It runs on Apple Silicon and Intel Macs (macOS 12 or later).
+
+The app is ad-hoc signed, not notarized. After unzipping, move `mtc.app` to
+Applications, then either right-click → **Open** the first time or run:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/mtc.app
+```
+
+On Linux and Windows, build from source:
 
 ```sh
 cargo run --release -p mtc
 ```
 
-Sign in with your server address and a password, a personal access token, or your
-company's single sign-on.
+Sign in with your server address and a password, a personal access token, or single
+sign-on (SAML, OpenID, Microsoft, Google, GitLab).
 
-### Updates
+## Features
 
-mtc keeps itself up to date. A few seconds after launch, and every six hours while it
-runs, it looks for a new release. On macOS it downloads the new `mtc.app` in the
-background, checks it against the release's SHA-256 checksum, its bundle identifier,
-version, and signature, and atomically exchanges it with the running copy on
-filesystems that support it. Other filesystems keep a backup during replacement
-and try to restore it if installation fails. If restoration fails, the backup’s
-location is reported for manual recovery. The new version starts the next time you
-open mtc, or right away with **Restart to update** in the title bar.
+- **Fast on any link.** One-round-trip startup, compressed responses, virtualized
+  timelines and sidebar, and no I/O on the UI thread. On slow 3G, the last conversation
+  is on screen in 0.5 s (3.8 s before).
+- **Keyboard everywhere.** ⌘K finds channels, people and commands; every pane is
+  reachable and navigable by keyboard.
+- **Composer.** Optimistic sends with Retry/Discard, drafts kept per conversation across
+  restarts, file attachments (paperclip, drop or paste), and completion for `@people`,
+  `~channels`, `:emoji:` and `/commands` (including server commands).
+- **Threads.** Collapsed reply threads open beside the channel; the **Threads** view
+  lists the threads you follow with unread and mention counts.
+- **Search** the current conversation (⌘F) or the whole team (⌘⇧F) with Mattermost's
+  search syntax.
+- **Saved and pinned messages**, reactions with a searchable emoji picker, custom emoji,
+  favorites, muting, mark as unread, group messages, and channel browsing.
+- **Integrations.** Bot and webhook attachments render with fields, pictures and
+  Markdown. Interactive buttons and menus open in the browser.
+- **In-app links.** Mattermost permalinks and channel links on your server open in mtc.
+- **Notifications** for mentions and DMs, honoring channel preferences, muting and
+  Do Not Disturb.
+- **Automatic updates** on macOS (see below).
 
-To install itself, mtc must run from a folder it can write to, such as `/Applications`
-or `~/Applications`. A copy opened straight from Downloads runs from a read-only
-location until it is moved; that copy, a symlink to an app, builds you made yourself,
-and Linux and Windows show **Update available** instead, linking to the release.
+Not implemented yet: multiple servers, interactive integration actions, and
+"all messages" notifications.
 
-**Settings** (⌘,) shows the version you're running under **Updates**, with a **Check for
-updates** button that reports the result in place: up to date, a new version, or why the
-check failed. **Check for Updates** in the mtc menu (or ⌘K) checks too. Turn off **Update
-automatically** in Settings, or uncheck it in the mtc menu, to only check when you ask.
+## Keyboard shortcuts
 
-### Single sign-on (SAML, OpenID, Microsoft, Google, GitLab)
-
-Type your server address and mtc shows a "Continue with …" button for each SSO method
-the server offers. Sign-in happens in your default browser; Mattermost then hands a
-one-time code back to mtc through a `mattermost-dev://` link, and mtc trades it for a
-session. The official Mattermost app keeps `mattermost://`, so the two don't collide.
-
-Servers older than 9.1 don't have that hand-back, so mtc uses the mobile apps' flow
-instead: the browser returns an `mmauth://` link that carries the session itself. mtc
-picks the flow from the server's version and only accepts the link while it is waiting
-for a sign-in. Since these legacy links are not tied to the sign-in attempt, mtc asks
-you to check the full name, @username, and server before continuing. This also applies
-to pasted links. Choose "Continue as @username" only for your account, or choose "Use
-a different account" (Escape) to discard the session and return to the provider
-buttons. Keyboard focus starts on the account summary; Tab reaches "Use a different
-account" first, then "Continue as @username". mtc also tries to revoke the discarded
-session on the server. Canceling, changing servers, or starting again clears the pending confirmation; a newer callback
-replaces it. Servers 9.1 and later keep their attempt-bound desktop flow without this
-extra step.
-
-macOS only delivers these links to an installed app bundle, so for SSO run mtc as an app:
-
-```sh
-script/bundle-macos --install   # builds mtc.app into ~/Applications and registers it
-open ~/Applications/mtc.app
-```
-
-On Linux and Windows mtc registers the links itself each time it starts, pointing them
-at the executable you ran. On Linux that's a hidden `mtc-sso-callback.desktop` entry in
-`~/.local/share/applications`, set as the handler with `xdg-mime`. On Windows it's a
-per-user key under `HKEY_CURRENT_USER\Software\Classes`. When the browser opens a link,
-the new mtc process passes it to the window that's already running and exits. If that
-window is from an older version with an incompatible sign-in protocol, the new process
-exits without forwarding the link or starting a second window. Quit the old mtc, reopen
-mtc, and retry sign-in, or paste the link into the waiting sign-in panel.
-
-Linux and Windows hold an exclusive profile lock until exit. An ordinary second
-launch requests activation through the authenticated v2 handoff and exits. It retries
-for up to three seconds if the first instance is still publishing its listener. If the
-running instance cannot be contacted, the second launch reports that and exits;
-it never opens another writer. macOS app bundles use LaunchServices.
-
-If the browser can't hand control back, copy the address of the page it ends on
-(`…/login/desktop?client_token=…&server_token=…`) and paste it into mtc. On older
-servers, copy the "click here" link on the final page (`mmauth://callback?…`) instead. Servers
-without a license hide some providers from their public settings;
-`MTC_SSO_PROVIDERS=gitlab,saml` shows them anyway.
-
-## Using it
-
-On Linux and Windows, use Ctrl where the table says ⌘, Alt for ⌥, and Shift for ⇧.
+On Linux and Windows, use Ctrl for ⌘, Alt for ⌥, and Shift for ⇧. ⌘/ lists them all.
 
 | Shortcut | Action |
 | --- | --- |
-| ⌘K / ⌘T | Jump to a channel, person, or app command |
-| ⌘F | Search the conversation's messages |
-| ⌘⇧F | Search all channels in the current team |
+| ⌘K / ⌘T | Jump to a channel, person, or command |
+| ⌘F | Search the conversation |
+| ⌘⇧F | Search all channels in the team |
 | ⌘⇧T | Threads you follow |
 | ⌘⇧S | Saved messages |
-| ⌘⇧P | Pinned messages in the current channel |
+| ⌘⇧P | Pinned messages in the channel |
 | ⌥↑ / ⌥↓ | Previous / next channel |
 | ⌥⇧↑ / ⌥⇧↓ | Previous / next unread channel |
-| Enter / ⇧Enter | Accept a visible suggestion or send / new line |
+| Enter / ⇧Enter | Send (or accept a suggestion) / new line |
 | ↑ in an empty field | Edit your last message |
-| ↑ / ↓ in composer suggestions | Select a command, person, channel, or emoji |
-| Tab / Enter in composer suggestions | Complete the selected suggestion |
-| Esc | Dismiss composer suggestions, cancel an edit, close the panel, or mark the channel read |
-| ⌘L | Focus the visible conversation’s message field (reveals the channel if search replaces it) |
+| Tab / Enter in suggestions | Complete the selected suggestion |
+| Esc | Dismiss suggestions, cancel an edit, close the panel, or mark the channel read |
+| ⌘L | Focus the message field |
 | ⌘W | Close the conversation (keeps its draft) |
 | ⌘= / ⌘- / ⌘0 | Zoom in / out / actual size |
-| ⌘/ | All shortcuts |
-| ⌘, | Settings: appearance, text size, updates, version |
+| ⌘, | Settings |
 
-Attach files with the paperclip, by dropping them on a conversation, or by pasting an
-image; they upload right away and send with the message. Click a picture to see it large
-in mtc: ← and → step through the message's other pictures, Esc closes it, and Download
-saves it to Downloads and shows it there. Click any other attachment to download it to
-Downloads and open documents and media with the system application. Programs, scripts,
-shortcuts, and unrecognized file types are shown in the file manager instead of opened.
-On macOS, downloaded attachments are marked for Gatekeeper checks. On Windows,
-documents and media are marked as Internet downloads before opening; if marking fails,
-they are shown in the file manager instead.
-Mattermost message permalinks on your signed-in server open in mtc, including
-older messages, replies in their threads, and messages in other joined teams. Channel
-links open joined channels. If a message cannot be opened, a notification offers
-**Open in browser**; unknown channel links open in the browser.
-Other message links open web pages (`http` and `https`) and email addresses (`mailto`);
-other link types show a notification and are not sent to system handlers.
+Right-click a message to reply, react, save, pin, mark it unread, copy its text or
+link, edit, or delete it. Right-click a conversation in the sidebar to favorite, mute,
+or leave it.
 
-Bot, webhook, and integration messages show their attachments below the message:
-author, title, Markdown text, fields, pictures, and footer. Short fields sit side by
-side and stack when the conversation narrows. **Show more** expands long text;
-**Show less** collapses it. Picture previews open in the image viewer. Links follow
-the same web/email allowlist and in-app Mattermost navigation as ordinary messages.
-When a message has no text, its attachment fallback (or pretext, title, and text; field titles and values when those are empty)
-appears in search, thread previews, notifications, and **Copy text**.
-Integration actions are readonly: **Open in browser** opens the message in Mattermost
-to use its buttons and menus. Interactive integration actions are a follow-up.
+## Updates
 
-Search a conversation's messages with ⌘F, or all channels in the current team with ⌘⇧F.
-Switch between **This conversation** and **All channels** in the search pane (Tab reaches
-the scope buttons). Team results name their channel or direct message; opening one
-navigates there. Results appear beside the conversation as you type, newest first, with
-the matching words marked; ↑ and ↓ move through them and Enter
-opens one. A message scrolls into view in the conversation and is marked for a moment
-(older messages load as needed); a reply opens in its thread, with a button back to the
-results. Mattermost's search syntax works, such as `"exact phrase"`, `from:username`,
-and `-word`. The last word you type also matches longer words that start with it.
+A few seconds after launch, and every six hours while running, mtc checks for a new
+release. On macOS it downloads it in the background, verifies its SHA-256 checksum,
+bundle identifier, version and signature, and swaps it in. The new version starts the
+next time you open mtc, or right away with **Restart to update** in the title bar.
 
-Type `:` and at least two letters at a word start to complete emoji shortcodes,
-including custom emoji from your server. Prefix matches appear before substring
-matches. Accepting inserts `:name: ` without sending; code, URLs and times do not
-trigger completion.
+mtc can only update itself when it runs from a writable folder such as `/Applications`
+or `~/Applications`. Copies run from Downloads, your own builds, and Linux and Windows
+show **Update available** with a link to the release instead.
 
-Use **+** beside a message’s reactions or **Add reaction…** in its context or
-More actions menu to search emoji. Recent choices appear first. ↑/↓ selects,
-Enter toggles the reaction, and Esc closes the picker and returns focus.
+**Settings → Updates** shows your version and has **Check for updates**. Turn off
+**Update automatically** there (or in the mtc menu) to check only when you ask.
 
-Type `@` at a word start to suggest people and `@here`, `@channel`, or `@all`.
-Known people appear immediately; server matches put current-channel members first,
-then other team members. Type `~` to suggest joined channels in the current team,
-or `/` at the beginning for commands. Server commands appear with their argument
-hints and descriptions alongside built-in extension commands; extensions take precedence
-when names match. The team's command list is cached and refreshed when switching teams
-or reconnecting. If loading fails, cached and built-in commands remain available.
-Argument values are not autocompleted. ↑/↓ selects a row; Tab or Enter inserts it
-at the caret without sending. Enter sends when no suggestions are visible; Esc
-hides the list without changing your text. Suggestions stay out of code spans and
-fences and leave IME composition keys alone.
+## Single sign-on
 
-Editing keeps your unsent text and attachments; saving or canceling restores them.
+Enter your server address and mtc shows a **Continue with …** button for each SSO
+method the server offers. Sign-in happens in your browser, which hands control back to
+mtc through a `mattermost-dev://` link (the official app keeps `mattermost://`).
 
-Use **Save message** in a message’s menu to keep it in **Saved** (⌘⇧S or ⌘K).
-Saved messages sync with Mattermost’s flagged posts. **Pin to channel** shares a
-message with the channel; open **Pinned messages** from the pin in the channel
-header, ⌘⇧P, or ⌘K. Saved and pinned messages carry a labeled icon. Both panes
-list newest messages first; ↑ / ↓ / Home / End selects, Enter opens the message
-in its channel or thread, and Esc closes the pane. **Show more messages** loads
-older saved messages. **Remove from saved** and **Unpin** reverse the actions.
-Pinning may require permission from your channel administrator.
+- **macOS** only delivers these links to an installed app, so use the release build or
+  `script/bundle-macos --install`.
+- **Linux and Windows** register the link handler each time mtc starts.
+- **Servers older than 9.1** use the mobile apps' `mmauth://` flow. Because those links
+  aren't tied to your sign-in attempt, mtc shows the account and server and asks you to
+  confirm before continuing.
+- **If the browser can't hand back control**, copy the address of the page it ends on
+  (`…/login/desktop?…`, or the `mmauth://callback?…` link on older servers) and paste
+  it into mtc.
+- Unlicensed servers may hide some providers; `MTC_SSO_PROVIDERS=gitlab,saml` shows
+  them anyway.
 
-Right-click a message to reply, react, mark it unread, copy its text or Mattermost link,
-edit, or delete it. **Mark as unread** is available for root messages, not thread
-replies. It moves the "New messages" divider to that message and keeps the channel
-unread until you leave and reopen it, send a message, or press Esc. A read confirmed
-by the server clears it here too.
-Click a message to open its replies in a thread panel beside the channel (collapsed
-reply threads); the reply count sits at the end of the message's reactions line. Click someone's name or avatar, or
-an @mention of them in a message, to see their profile and start a direct message.
+## Data and privacy
 
-**Threads**, at the top of the sidebar (⌘⇧T), lists the threads you follow (ones you
-started, replied to, or were mentioned in) across the team's channels and your direct
-messages, newest reply first, like Mattermost's own Threads view. Unread threads carry a
-dot and mentions a count, which the sidebar entry adds up. **All** and **Unread** switch
-between every thread and the ones with replies you haven't read. Pick one and it opens beside
-the list, marked read; in a narrow window it takes the list's place until you close it.
-Use ↑ / ↓ / Home / End to select a thread and Enter to open it. Tab to **More actions**
-for the selected thread to open it in its channel, mark it read, or unfollow it;
-the same commands are available by right-clicking. Closing the detail pane returns
-focus to the selected thread. Reading a
-thread anywhere, including beside its channel or on another device, clears it here too.
-
-Type in ⌘K to find joined conversations instantly and search people on the server.
-Choose a person to open a direct message. **New group message** in ⌘K lets you pick
-2–7 people: Enter adds or removes a person, and **Open group message** starts the
-conversation. Selected people stay visible while you search for others.
-**Browse channels** lists public channels in the current team you haven't joined;
-type to search, then Enter joins and opens the selected channel. **Load more channels**
-continues the list on larger teams. Esc clears the search, then closes the palette.
-
-Star a conversation from the star in its header, by right-clicking it in the sidebar, or
-with "Add to favorites" in ⌘K. Favorites sit in their own section at the top of the
-sidebar and sync with your other Mattermost apps.
-
-Mute or unmute a conversation by right-clicking it in the sidebar, or with
-"Mute channel" / "Unmute channel" in ⌘K. A crossed-out bell marks muted channels;
-muting syncs with your other Mattermost apps and silences desktop notifications.
-
-Leave a channel by right-clicking it in the sidebar, or with "Leave channel" in ⌘K.
-mtc asks first. Rejoin public channels with **Browse channels** in ⌘K; for private
-channels, ask someone in the channel to add you back. Town Square and direct messages
-can't be left.
-
-The server's custom emoji show up inline in messages, in reactions, and in custom statuses,
-next to the standard ones. The emoji on screen are looked up by name as they appear, so
-they show even on servers with thousands of custom emoji, or where the full list can't
-be read.
+- On macOS the session token lives in the login keychain (item `mtc`). Since releases
+  are ad-hoc signed, macOS may ask after an update whether mtc may use it; choose
+  **Always Allow**. On Linux and Windows the token is stored in `state.json`.
+- Preferences, drafts and the rest of the session are in `state.json` in
+  `~/Library/Application Support/mtc` (macOS), `~/.config/mtc` (Linux), or
+  `%APPDATA%\mtc` (Windows), readable only by you on macOS and Linux.
+- Drafts belong to the signed-in account and are discarded on sign-out. Attachments and
+  failed sends are not kept across restarts.
+- The session token is sent only to your signed-in server, never to external image
+  hosts. Server SVG images render in a separate helper process.
+- Downloaded programs, scripts, and unknown file types are revealed in the file manager
+  rather than opened.
 
 ## Architecture
 
@@ -228,269 +131,27 @@ be read.
 crates/
 ├── mattermost/   REST + WebSocket client. No UI. Executor-agnostic.
 ├── session/      The signed-in state as GPUI entities. No rendering.
-│   ├── Session     teams, channels, read state, event routing, sending
-│   ├── Directory   users and presence, batched lookups
-│   ├── Timeline    ordered posts of one channel or thread
+│   ├── Session          teams, channels, read state, event routing, sending
+│   ├── Directory        users and presence, batched lookups
+│   ├── Timeline         ordered posts of one channel or thread
 │   └── FollowedThreads  the Threads pane's lists and unread totals
 └── app/          The window: sign-in, sidebar, timelines, composer, ⌘K
 ```
 
-Dependencies point downward. The app depends on `gpui-kit` alone for UI.
-
-### Performance
-
-- **No I/O on the UI thread.** The client runs requests, JSON decoding, and the
-  WebSocket on a private tokio runtime. Its futures can be awaited from GPUI's executor.
-  Saved state is read once and written by a background thread, so neither rendering
-  nor switching channels waits on the disk.
-- **Startup in one round trip.** A restored session opens the window from the profile
-  saved last time and sends every startup request at once: the remembered team's
-  channels, the last conversation's posts, favorites, emoji, and a check of the token.
-  (They used to wait on one another: profile, then teams, then channels, then posts.)
-  Profiles and presence for a page of authors arrive together, too.
-- **Compressed responses.** Requests accept gzip, Brotli, zstd, and deflate. Mattermost
-  compresses its JSON about fifteenfold (a team's 80-channel list: 70 KB → 4.6 KB).
-- **Built for slow links.** Timeouts measure silence, not size, so a large download
-  on a slow connection finishes while a dead connection fails within 30 seconds.
-  Startup loads that fail for reasons that may pass (a timeout, a 5xx) are retried
-  with backoff, and again once the socket reconnects.
-- **Skeletons while loading.** The window, sidebar, and conversation show their shape
-  while their content is on the way, with the same lanes as the real rows, so
-  nothing moves when it arrives.
-- **Large-team sidebar.** Conversation sections, lowercase sort keys, and group labels
-  are retained across renders; presence and custom-status updates reuse them.
-  Expanded sections use a GPUI virtual list, so only viewport rows are built and
-  collapsed sections build none. Keyboard navigation and ⌘K share the cached order.
-- **Virtualized timelines.** Posts render through a GPUI list anchored to the composer
-  (`app/src/post_scroller.rs`). `Timeline` emits splice events
-  (`Spliced { old, new_count }`, `Updated(ix)`), so a new post or an edit measures one
-  row, not the whole list.
-- **Work happens once, at ingest.** Emoji shortcodes, @mentions, autolinks, and the plain
-  vs rich decision run when a post arrives, never during render. Custom emoji are looked
-  up by name as posts, reactions, and statuses name them, batched like users, while the
-  full list loads in the background; when they arrive, open timelines re-prepare only
-  the posts that name one. Most chat messages are plain
-  text and skip Markdown entirely. Rich posts keep their parsed state per post, so
-  scrolling back never re-parses.
-- **Bounded integration attachments.** At ingest, attachments are limited to 10 cards,
-  20 fields per card, 8 KiB per text value, 512 bytes per label, 2 KiB per URL,
-  and a shared 32 KiB source budget per post (UTF-8-safe). Unknown keys and odd
-  value types are ignored. Prepared text and parsed Markdown documents are retained;
-  cards render no HTML. A post admits at most eight distinct HTTP(S) image URLs,
-  shared by ordinary message Markdown, attachment Markdown,
-  and explicit integration images/icons. Known custom emoji from the signed-in
-  server’s emoji endpoint use a separate allowance of 200 distinct images per post;
-  they do not consume the eight-image budget. Non-HTTP(S) and excess Markdown images
-  become literal alt text; excess explicit images become links. Collapsed previews
-  reuse the admitted URLs. Images use the existing authenticated cache and 32 MiB
-  response cap; external hosts never receive the session token. Named status bars
-  use theme tokens; supplied hex colors are adjusted for boundary contrast.
-- **Instant switching.** The 8 most recent channel views stay alive with their scroll
-  position, parsed text, and draft. Timelines are cached a little longer (24).
-- **Batched lookups.** Author lookups requested within one frame become a single
-  `users/ids` call.
-- **Avatars use GPUI's image cache.** An authenticated HTTP client (`app/src/http.rs`)
-  attaches the token only for the signed-in server. Decoding happens off the UI thread.
-- **Resilient real-time.** The socket detects silent connections, reconnects with
-  backoff, and catches up live timelines with `posts?since=` on the first connection
-  as well as reconnects, after overlapping REST loads finish. Catch-up keeps newer
-  live changes and preserves the visible post and scroll offset when rows reorder.
-
-Failed conversation loads replace skeletons with **Retry**, including the remembered
-conversation at startup. Failed older-message pages, search pages, and file uploads
-keep existing content and offer an inline retry.
-
-### Effortless UX
-
-Posts send optimistically, with Retry or Discard if a send fails. Unresolved sends
-(text, uploaded attachments, thread and pending ID) live in a session outbox even
-when their timeline leaves the cache. Failed sends survive switching conversations,
-including their uploaded attachments, but **do not survive quitting**.
-Retry reuses the original pending ID;
-a nonce in post props also lets REST catch-up confirm committed sends when the
-server omits the pending ID. Confirmation or Discard removes the outbox entry.
-Rejected deletes restore the post immediately; uncertain outcomes refetch it from the server.
-Followed threads remain listed until deletion is confirmed. Drafts are kept per
-conversation across app restarts (channels and threads), and a "New messages" divider marks where you left off. You also get
-typing indicators, presence dots, and mention badges. Native notifications cover
-mentions and DMs. Channel desktop preferences can restrict those notifications;
-"none" silences them, and "default" inherits the account setting from Mattermost.
-"All messages" currently keeps the mentions-and-DMs baseline; notifying for every
-message is a follow-up. Change these preferences in Mattermost.
-In group DMs, an explicit channel "mentions" override requires an explicit mention
-in the message or attachment text, pretext, title, or fields. Channel settings for
-ignoring channel-wide mentions override the account setting. Inherited account
-mentions settings keep the usual implicit group-DM mentions.
-Muted channels, Do Not Disturb, and the conversation visible in an active window
-silence notifications. Replies count as visible when their thread is open.
-On macOS the app must run as a `.app` bundle for system notifications. The app restores
-your session, team, last channel, zoom, appearance, and sidebar width on launch, and
-follows the system light/dark setting.
-
-### Extensibility
-
-`app/src/extensions.rs` defines the `Extension` trait. An extension can:
-
-- add slash commands (`SlashCommand::new(..).on_run(..)`, returning `Send`, `Handled`,
-  or `Pass` to the server),
-- render particular posts its own way (`render_post_body`),
-- observe session events, including server events this client doesn't model
-  (`SessionEvent::Raw`).
-
-The built-in behavior (`/shrug`, `/me`, `/theme`, `/read`, system-message rendering,
-notifications) is itself registered as the `Core` extension.
-
-## Notes
-
-- On macOS the session token is kept in the login keychain (a generic password named
-  `mtc`, with the server address as its account); a token saved by an older version is
-  moved there on the next launch. Because releases are ad-hoc signed, macOS may ask once
-  after each update whether mtc may use it; choose Always Allow. Preferences and the
-  rest of the session are stored in `state.json` in the platform config directory
-  (`~/Library/Application Support/mtc` on macOS, `~/.config/mtc` on Linux,
-  `%APPDATA%\mtc` on Windows). Where there is no keychain (Linux and Windows for now),
-  or it refuses, the token stays in that file: owner-only on macOS and Linux, relying on
-  your profile folder's permissions on Windows.
-- Text drafts share `state.json` and its owner-only permissions and background writer.
-  Writes are debounced for 500 ms; closing a thread or evicting a conversation queues
-  a save immediately, and quitting flushes the latest text. Drafts belong to
-  the signed-in server and user and are discarded on sign-out or account changes.
-  Up to 100 drafts of 64 KiB each are saved (UTF-8-safe truncation); the oldest changed
-  drafts are dropped first. Attachments are not persisted. While editing an older
-  message, the unsent draft is saved rather than the edit in progress.
-- Not implemented yet: multiple servers.
+Dependencies point downward; the app depends on `gpui-kit` alone for UI.
+`app/src/extensions.rs` defines an `Extension` trait for slash commands, custom post
+rendering, and raw server events. Built-ins such as `/shrug`, `/me`, `/theme` and
+`/read` are registered as the `Core` extension.
 
 ## Development
 
 ```sh
-cargo test --workspace --locked # client parsing, message preparation, Timeline behavior
+cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-# Live SSO exchange against a server, after running the browser leg yourself:
-MTC_SSO_SERVER=… MTC_SSO_CALLBACK='…/login/desktop?…' cargo test -p mattermost -- --ignored
 ```
 
-Live REST/WebSocket contracts and GPUI session flows run against a disposable
-Mattermost server, with no browser setup:
-
-```sh
-script/live-test                  # Docker + curl; starts/reuses mtc-live-mattermost
-# Or point at an already running disposable server:
-MTC_LIVE_SERVER=http://localhost:8065 cargo test --locked -p mattermost --test live -- --ignored --test-threads=1
-MTC_LIVE_SERVER=http://localhost:8065 cargo test --locked -p session --test live -- --ignored --test-threads=1
-# Delete all local test data and bootstrap credentials:
-docker rm -f mtc-live-mattermost
-```
-
-The script and the informational **Live Mattermost contract tests** CI job pin
-`mattermost/mattermost-preview:10.11.26` (a 10.x release; preview bundles the database).
-The tests create the first user `mtc_live_admin` with password
-`Live-test-Password9!`, then provision uniquely named users, a team and public/private
-channels on every run. They retain the test data so reruns can be inspected. Use a
-fresh preview instance initially; an existing server needs that bootstrap admin.
-Tests enable open signup/user creation, disable email verification, and set
-`ServiceSettings.CollapsedThreads=always_on`, `EnableCommands`, `EnableCustomEmoji`
-and `TeamSettings.EnableCustomUserStatuses` through the admin config API. CI/script
-set the same values in environment variables; tests also save the user's CRT preference. No local
-mode or license is required. These tests change server configuration: point them
-only at disposable instances. Custom emoji checks skip only if the resulting config
-explicitly reports them disabled. External OpenGraph scraping is excluded; uploaded
-file metadata is checked instead.
-
-Both integration targets are ignored by normal workspace tests, and explicitly
-skip with a message when `MTC_LIVE_SERVER` is absent even under `--ignored`.
-A recording proxy forwards every request to the real server and captures request,
-status, response body and raw WebSocket events in test output (printed on failure by
-the test harness). It also interrupts WebSockets for reconnect/catch-up assertions;
-REST stays live. Credentials are omitted from request logs. Run with `--nocapture`
-to see passing transcripts too. The live CI job uses the normal workflow triggers
-and read-only permissions; it is not yet a required branch-protection check.
-
-Work on a short-lived feature branch, open a pull request into `main`, and merge after
-all required CI checks pass. Merging does not publish a release. CI
-(`.github/workflows/ci.yml`) runs on PRs targeting `main` and pushes to `main`, and can
-also be run manually. It checks rustfmt on Ubuntu, clippy (warnings denied) and tests
-on macOS, and builds, clippy and tests on Linux and Windows. Cargo builds and tests
-use `--locked`; all compilation denies warnings. GPUI tests use the in-process test
-platform, without a display server or GPU rendering tests. CI and releases use the
-stable Rust toolchain.
-
-To release, push a `vMAJOR.MINOR.PATCH` tag (for example,
-`git tag v0.3.0 && git push origin v0.3.0`), or go to **Actions → Release → Run workflow**
-and choose a branch or tag. Manual branch runs accept an optional `version` such as
-`0.3.0`; when empty, the version is the next patch after the newest `v*` tag, or the
-workspace version in `Cargo.toml` when higher. A tag run uses that tag's exact version.
-To start a new minor or major series by default, bump `version` in `Cargo.toml`.
-
-Select `dry_run` in **Run workflow** (or use
-`gh workflow run release.yml --ref main -F dry_run=true`) to run full CI, build and
-verify the uploaded archive, checksum, feed and bundle version without creating any
-tag, release or draft. Tag pushes always publish after verification.
-
-The Release workflow reruns the full CI on the exact source commit before building.
-It stamps the selected version into the checkout (nothing is committed back), builds a
-universal (Apple Silicon and Intel) `mtc.app` with `script/bundle-macos --universal`,
-and packages a zip, SHA-256 checksum and update feed. A read-only job verifies the
-downloaded artifacts before a separate publishing job creates a draft release,
-uploads all assets, verifies that the tag still points to the built
-commit, then publishes. Existing releases, including drafts, are refused; if publication
-fails, inspect and remove the draft before retrying. Only the publishing job can write
-tags or releases. Linux and Windows are checked by CI; release downloads remain macOS-only.
-
-The release also carries `latest.json`, the update feed: the version, the release page,
-and each download's URL and SHA-256. Installed copies read it from
-`https://github.com/rdydygin/mtc/releases/latest/download/latest.json`, which GitHub
-redirects to the newest release that isn't a draft or pre-release, so publishing a
-release is all it takes to ship an update. Release downloads, unlike the GitHub API,
-aren't rate-limited per address. To try an update end to end, bump the version, bundle
-it, serve a `latest.json` that points at its zip, and start an older build with
-`MTC_UPDATE_FEED=http://127.0.0.1:8000/latest.json` on a **debug build**
-(bundle with `script/bundle-macos --debug`). Debug builds only check on their own
-when this variable is set. Release builds ignore it and log why;
-they always use the official feed. Start the test bundle directly with
-
-```sh
-MTC_UPDATE_FEED=http://127.0.0.1:8000/latest.json target/debug/bundle/mtc.app/Contents/MacOS/mtc
-```
-
-The feed, declared downloads, and every redirect hop must use HTTPS, regardless
-of hostname. Only debug overrides starting on loopback HTTP may use HTTP to
-localhost or a loopback IP for local testing. HTTPS can never redirect or point
-to an HTTP download, including loopback. Redirect counts are limited. Release
-builds trust the fixed official HTTPS feed; archive integrity is checked against
-its SHA-256 plus the bundle identifier, version, and signature.
-
-On Linux and Windows, `MTC_ALLOW_MULTIPLE=1 cargo run -p mtc` bypasses the profile
-lock for development; use it only with throwaway profile data, since processes then
-share state and caches. Normal `cargo run` uses the same lock as release builds.
-macOS direct `cargo run` launches remain unlocked.
-
-To run a throwaway server locally:
-`docker run --platform linux/amd64 -d --name mtc-mattermost -p 8065:8065 mattermost/mattermost-preview`.
-
-### Testing on a slow network
-
-`script/slow-network` sits between mtc and a server and adds latency and a bandwidth
-cap to everything that passes, WebSocket included. Sign in to `http://localhost:8066`
-instead of the server's address:
-
-```sh
-script/slow-network --upstream localhost:8065 --profile slow-3g --log   # 400 ms, 400 kbit/s
-script/slow-network --upstream localhost:8065 --rtt 800 --kbps 120      # your own numbers
-```
-
-`--log` prints each request as it passes, so the order and overlap of startup requests
-is visible. The automated tests do the same in-process: `mattermost::testing::SlowServer`
-(feature `test-support`) is a stand-in server with latency and bandwidth, used to check
-that startup takes one round trip, that slow downloads finish and stalled ones fail,
-and that startup survives failed requests.
-
-Measured against a real server with an 80-channel team, from the first request until
-the last conversation's messages are on screen:
-
-| Link | Before | After |
-| --- | --- | --- |
-| Slow 3G: 400 ms, 400 kbit/s | 3.8 s | 0.5 s |
-| EDGE: 800 ms, 120 kbit/s | 11.5 s | 1.0 s |
+See [CONTRIBUTING.md](CONTRIBUTING.md) for live-server tests, slow-network testing,
+testing updates, and the release process.
 
 ## License
 
