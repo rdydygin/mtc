@@ -84,12 +84,21 @@ impl EmojiSearch {
         self.store.read(cx).custom()
     }
 
+    /// The custom emoji's revision; see [`EmojiStore::revision`].
+    pub fn custom_revision(&self, cx: &App) -> u64 {
+        self.store.read(cx).revision()
+    }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.rows = session::emoji_matches(self.custom(cx), &self.query, &self.recent, 8);
         cx.notify();
     }
 
     pub fn set_query(&mut self, query: &str, cx: &mut Context<Self>) {
+        // Nothing typed, still: the rows and any listener stay as they are.
+        if query.is_empty() && self.query.is_empty() && !self.loading {
+            return;
+        }
         self.generation += 1;
         self.task = None;
         self.query = query.to_lowercase();

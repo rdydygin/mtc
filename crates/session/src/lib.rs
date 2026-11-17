@@ -6,6 +6,8 @@
 //! - [`Timeline`] holds the ordered posts of one channel or thread.
 //! - [`FollowedThreads`] lists the threads the user follows, for the
 //!   Threads pane, with their unread totals.
+//! - [`Typing`] tracks who is typing where, so a signal reaches only the
+//!   typing line that shows it.
 //! - [`EmojiStore`] looks up the server's custom emoji as they appear;
 //!   [`CustomEmojis`] is its snapshot, mapping names to images.
 //!
@@ -21,6 +23,7 @@ mod search;
 mod session;
 mod threads;
 mod timeline;
+mod typing;
 
 pub use attachments::{AttachmentColor, AttachmentText, MessageAttachment, post_text};
 pub use directory::{Directory, UsernameLookup};
@@ -33,3 +36,4 @@ pub use search::{SEARCH_PAGE_SIZE, SearchScope, search_terms};
 pub use session::{ChannelEntry, ChannelSections, Connection, Session, SessionEvent};
 pub use threads::{FollowedThread, FollowedThreads, ThreadFilter, ThreadsEvent};
 pub use timeline::{Delivery, Entry, LoadState, PAGE_SIZE, Timeline, TimelineEvent, TimelineKind};
+pub use typing::{Typing, TypingChanged};

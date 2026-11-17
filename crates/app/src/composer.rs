@@ -14,7 +14,7 @@ mod suggestions;
 use suggestions::{Kind, Suggestion, Token, channel_matches, token_at, user_matches};
 
 use gpui_kit::assets::IconName;
-use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{cell::RefCell, collections::HashSet, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _,
@@ -31,15 +31,18 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity, EntityInputHandler as _,
-    EventEmitter, FocusHandle, Focusable, Image, ImageFormat, ImageSource, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Render, SharedString,
+    EventEmitter, FocusHandle, Focusable, Image, ImageFormat, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ParentElement as _, PathPromptOptions, Render, Resource, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div,
     prelude::FluentBuilder as _,
 };
 use mattermost::{ChannelId, Client, FileInfo, TeamId, UserAutocomplete};
 use session::Session;
 
-use crate::extensions;
+use crate::{
+    extensions,
+    image_scope::{ImageStore, held_image, image_scope},
+};
 
 /// Where attached files are uploaded.
 #[derive(Clone)]
@@ -71,6 +74,8 @@ struct PendingFile {
     status: AttachmentStatus,
     uploaded: Option<FileInfo>,
     error: Option<SharedString>,
+    /// The thumbnail, freed with the file when it is removed or sent.
+    images: Entity<ImageStore>,
     _upload: Option<Task<()>>,
 }
 
@@ -107,7 +112,38 @@ pub struct Composer {
     target: UploadTarget,
     files: Vec<PendingFile>,
     next_file_id: u64,
+    /// Pictures in the suggestions: people's avatars and custom emoji. It
+    /// holds only those the suggestions show (see
+    /// [`Self::sync_suggestion_pictures`]) and goes with the composer.
+    images: Entity<ImageStore>,
+    /// The suggestions for what's typed, worked out again only when what
+    /// they depend on changes, so render, selection and pruning share them.
+    suggestions: RefCell<Option<(SuggestionInputs, Rc<[Suggestion]>)>>,
+    /// Counts changes to autocomplete answers, custom emoji, channels and
+    /// commands, which the suggestions depend on.
+    suggestion_data: u64,
+    /// The pictures the suggestions showed when last pruned.
+    shown_pictures: HashSet<String>,
+    /// How often the suggestions were worked out, for tests.
+    #[cfg(test)]
+    computations: std::cell::Cell<usize>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// What the suggestions were worked out from.
+#[derive(PartialEq)]
+struct SuggestionInputs {
+    token: Option<Token>,
+    dismissed: Option<Token>,
+    /// Whether an autocomplete answer for the token is in; which answer is
+    /// told by `data`.
+    answered: bool,
+    /// For people: the directory's user revision, which presence doesn't
+    /// move.
+    directory: u64,
+    /// For emoji: the custom emoji's revision.
+    emoji: u64,
+    data: u64,
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -190,6 +226,12 @@ impl Composer {
             target,
             files: Vec::new(),
             next_file_id: 0,
+            images: ImageStore::new(cx),
+            suggestions: RefCell::new(None),
+            suggestion_data: 0,
+            shown_pictures: HashSet::new(),
+            #[cfg(test)]
+            computations: std::cell::Cell::new(0),
             _subscriptions: vec![subscription, caret, focus_in, focus_out, emoji_updates],
         }
     }
@@ -352,6 +394,7 @@ impl Composer {
             status: AttachmentStatus::Uploading,
             uploaded: None,
             error: None,
+            images: ImageStore::new(cx),
             _upload: None,
         });
         self.upload(local_id, cx);
@@ -482,9 +525,28 @@ impl Composer {
     ) -> Self {
         let directory = session.read(cx).directory().clone();
         self._subscriptions
-            .push(cx.observe(&directory, |_, _, cx| cx.notify()));
+            .push(cx.observe(&directory, |this, _, cx| {
+                // People's names and pictures; the suggestions are worked
+                // out again only if a user changed, not on presence.
+                if this
+                    .current_token(cx)
+                    .is_some_and(|token| token.kind == Kind::Person)
+                {
+                    this.sync_suggestion_pictures(cx);
+                }
+                cx.notify()
+            }));
         self._subscriptions
             .push(cx.observe_in(&session, window, |this, _, window, cx| {
+                // Channels and commands come from the session; people and
+                // emoji have their own revisions, so typing a name isn't
+                // worked out again on every session change.
+                if this
+                    .current_token(cx)
+                    .is_some_and(|token| matches!(token.kind, Kind::Channel | Kind::Command))
+                {
+                    this.suggestion_data += 1;
+                }
                 this.refresh_suggestions(window, cx);
                 this.reconcile_command_selection(cx);
                 cx.notify();
@@ -551,6 +613,7 @@ impl Composer {
                 .map(|row| row.completion.clone());
         }
         self.reconcile_command_selection(cx);
+        self.sync_suggestion_pictures(cx);
         let (Some(token), Some(team)) = (token, team) else {
             return;
         };
@@ -611,6 +674,7 @@ impl Composer {
             .suggestion_matches(cx)
             .get(self.selected_suggestion)
             .map(|s| s.id.clone());
+        self.suggestion_data += 1;
         self.remote_users = users
             .users()
             .iter()
@@ -618,6 +682,8 @@ impl Composer {
             .cloned()
             .map(Arc::new)
             .collect();
+        // The directory learns these people, and its notification prunes
+        // the pictures of rows the answer pushed out.
         if let Some(session) = &self.session {
             let directory = session.read(cx).directory().clone();
             directory.update(cx, |d, cx| {
@@ -634,6 +700,8 @@ impl Composer {
         cx.notify();
     }
 
+    /// The emoji search changed: its query, its loading, or the custom emoji
+    /// themselves, which the suggestions key on by their own revision.
     fn reconcile_emoji_selection(&mut self, cx: &mut Context<Self>) {
         if self
             .current_token(cx)
@@ -643,6 +711,7 @@ impl Composer {
             self.selected_emoji = matches
                 .get(self.selected_index(&matches))
                 .map(|row| row.completion.clone());
+            self.sync_suggestion_pictures(cx);
         }
         cx.notify();
     }
@@ -707,6 +776,7 @@ impl Composer {
                     self.emoji_search.update(cx, |search, cx| search.cancel(cx));
                     self.lookup_generation += 1;
                     self._lookup = None;
+                    self.sync_suggestion_pictures(cx);
                 }
                 _ => {
                     cx.propagate();
@@ -741,6 +811,7 @@ impl Composer {
             self.emoji_search.update(cx, |search, cx| search.cancel(cx));
             self.lookup_generation += 1;
             self._lookup = None;
+            self.sync_suggestion_pictures(cx);
             cx.notify();
             cx.stop_propagation();
             return;
@@ -779,8 +850,83 @@ impl Composer {
         self.focus_handle(cx).focus(window, cx);
     }
 
-    fn suggestion_matches(&self, cx: &gpui_kit::App) -> Vec<Suggestion> {
-        let Some(token) = self.current_token(cx) else {
+    /// The picture `suggestion` shows: a person's avatar or a custom emoji.
+    fn suggestion_picture(&self, suggestion: &Suggestion, cx: &gpui_kit::App) -> Option<String> {
+        if let Some(user) = &suggestion.user {
+            return Some(crate::http::avatar_url(
+                &self.target.client,
+                user.id.as_str(),
+                user.last_picture_update,
+            ));
+        }
+        let name = suggestion.completion.strip_prefix(':')?.strip_suffix(':')?;
+        crate::status::custom_emoji_url(name, self.emoji_search.read(cx).custom(cx))
+            .map(|url| url.to_string())
+    }
+
+    /// Keep only the pictures of the suggestions shown now, after what they
+    /// depend on changed. It looks at those few rows, reusing the list
+    /// render reads, and lets pictures go only when the set changed.
+    /// Channels and commands show none.
+    fn sync_suggestion_pictures(&mut self, cx: &mut Context<Self>) {
+        let pictured = self
+            .current_token(cx)
+            .is_some_and(|token| matches!(token.kind, Kind::Person | Kind::Emoji));
+        let shown: HashSet<String> = if pictured {
+            self.suggestion_matches(cx)
+                .iter()
+                .filter_map(|suggestion| self.suggestion_picture(suggestion, cx))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        if shown == self.shown_pictures {
+            return;
+        }
+        self.images.update(cx, |images, cx| {
+            images.retain(
+                |picture| matches!(picture, Resource::Uri(uri) if shown.contains(uri.as_ref())),
+                cx,
+            )
+        });
+        self.shown_pictures = shown;
+    }
+
+    /// The suggestions for what's typed now, worked out again only when
+    /// what they depend on changed since the last call.
+    fn suggestion_matches(&self, cx: &gpui_kit::App) -> Rc<[Suggestion]> {
+        let token = self.current_token(cx);
+        let kind = token.as_ref().map(|token| token.kind);
+        let inputs = SuggestionInputs {
+            dismissed: self.dismissed.clone(),
+            answered: self.token == token && !self.remote_users.is_empty(),
+            directory: match (&self.session, kind) {
+                (Some(session), Some(Kind::Person)) => {
+                    session.read(cx).directory().read(cx).revision()
+                }
+                _ => 0,
+            },
+            emoji: match kind {
+                Some(Kind::Emoji) => self.emoji_search.read(cx).custom_revision(cx),
+                _ => 0,
+            },
+            data: self.suggestion_data,
+            token,
+        };
+        if let Some((cached, matches)) = &*self.suggestions.borrow()
+            && *cached == inputs
+        {
+            return matches.clone();
+        }
+        let matches: Rc<[Suggestion]> = self.compute_suggestions(inputs.token.clone(), cx).into();
+        *self.suggestions.borrow_mut() = Some((inputs, matches.clone()));
+        matches
+    }
+
+    fn compute_suggestions(&self, token: Option<Token>, cx: &gpui_kit::App) -> Vec<Suggestion> {
+        #[cfg(test)]
+        self.computations.set(self.computations.get() + 1);
+        let Some(token) = token else {
             return Vec::new();
         };
         if self.dismissed.as_ref() == Some(&token) {
@@ -859,6 +1005,12 @@ impl Composer {
                 local.sort_by_key(|u| (u.username.to_lowercase(), u.id.clone()));
                 let mut seen = HashSet::new();
                 let remote_current = self.token.as_ref() == Some(&token);
+                // The directory's copy, where it has one, carries the current
+                // picture; an autocomplete answer can be older.
+                let directory = self
+                    .session
+                    .as_ref()
+                    .map(|s| s.read(cx).directory().read(cx));
                 let mut matches: Vec<_> = self
                     .remote_users
                     .iter()
@@ -866,7 +1018,7 @@ impl Composer {
                     .chain(local.iter())
                     .filter(|u| user_matches(u, &token.query) && seen.insert(u.id.clone()))
                     .take(6)
-                    .cloned()
+                    .map(|u| directory.and_then(|d| d.user(&u.id)).unwrap_or(u).clone())
                     .map(Suggestion::person)
                     .collect();
                 for (name, description) in [
@@ -896,59 +1048,55 @@ impl Composer {
         }
         let selected = self.selected_index(&matches);
         let theme = cx.theme();
-        Some(
-            v_flex()
-                .py_1()
-                .border_b_1()
-                .border_color(theme.border)
-                .children(matches.into_iter().enumerate().map(|(ix, suggestion)| {
-                    let completion = suggestion.completion.clone();
-                    let avatar = suggestion.user.as_ref().map(|user| {
-                        Avatar::new().name(suggestion.label.clone()).size_6().src(
-                            crate::http::avatar_url(
-                                &self.target.client,
-                                user.id.as_str(),
-                                user.last_picture_update,
+        let suggestions = v_flex()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .children(matches.iter().cloned().enumerate().map(|(ix, suggestion)| {
+                let completion = suggestion.completion.clone();
+                let avatar = suggestion.user.as_ref().map(|_| {
+                    Avatar::new()
+                        .name(suggestion.label.clone())
+                        .size_6()
+                        .when_some(self.suggestion_picture(&suggestion, cx), Avatar::src)
+                });
+                ListItem::new(SharedString::from(suggestion.id))
+                    .selected(ix == selected)
+                    .aria_selected(ix == selected)
+                    .accessibility_label(format!("{}: {}", suggestion.label, suggestion.detail))
+                    .text_sm()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .min_w_0()
+                            .children(avatar)
+                            .when(suggestion.completion.starts_with(':'), |row| {
+                                row.child(crate::status::emoji_element(
+                                    suggestion.completion.trim_matches(':'),
+                                    self.emoji_search.read(cx).custom(cx),
+                                ))
+                            })
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_semibold()
+                                    .child(suggestion.label),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.muted_foreground)
+                                    .child(suggestion.detail),
                             ),
-                        )
-                    });
-                    ListItem::new(SharedString::from(suggestion.id))
-                        .selected(ix == selected)
-                        .aria_selected(ix == selected)
-                        .accessibility_label(format!("{}: {}", suggestion.label, suggestion.detail))
-                        .text_sm()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .min_w_0()
-                                .children(avatar)
-                                .when(suggestion.completion.starts_with(':'), |row| {
-                                    row.child(crate::status::emoji_element(
-                                        suggestion.completion.trim_matches(':'),
-                                        self.emoji_search.read(cx).custom(cx),
-                                    ))
-                                })
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .font_semibold()
-                                        .child(suggestion.label),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_color(theme.muted_foreground)
-                                        .child(suggestion.detail),
-                                ),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.complete_suggestion(&completion, window, cx)
-                        }))
-                })),
-        )
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.complete_suggestion(&completion, window, cx)
+                    }))
+            }));
+        Some(image_scope(&self.images, suggestions))
     }
 }
 
@@ -1125,13 +1273,13 @@ fn render_file(
 ) -> impl IntoElement + use<> {
     let local_id = file.local_id;
     let media = match &file.preview {
-        Some(image) => AttachmentMedia::new().src(ImageSource::Image(image.clone())),
+        Some(image) => AttachmentMedia::new().src(held_image(&file.images, image.clone())),
         None => AttachmentMedia::new().child(Icon::new(IconName::File)),
     };
     let description: SharedString = format_size(file.size).into();
     let remove = entity.clone();
     let retry = entity.clone();
-    v_flex()
+    let card = v_flex()
         .child(
             Attachment::new()
                 .id(SharedString::from(format!("upload-{local_id}")))
@@ -1157,7 +1305,10 @@ fn render_file(
                 ),
                 cx,
             ))
-        })
+        });
+    // A file's own store: a picked file's thumbnail loads from its path into
+    // it, and a pasted one decodes into it.
+    image_scope(&file.images, card)
 }
 
 fn image_extension(name: &str) -> bool {
@@ -1357,16 +1508,23 @@ mod tests {
             (preview.format(), preview.bytes()),
             (ImageFormat::Png, &png()[..])
         );
+        // GPUI draws the bytes read, decoded into the file's own store.
+        wait_until(cx, |cx| {
+            cx.update(|cx| handle.update(cx, |_, window, _| window.refresh()).unwrap());
+            cx.run_until_parked();
+            composer.read_with(cx, |c, cx| {
+                c.files[0].images.read(cx).get_held(&preview).is_some()
+            })
+        });
         cx.update(|cx| {
-            assert!(preview.is_asset_cached(cx), "GPUI draws the bytes read");
-            assert!(!ImageSource::from(path.clone()).is_asset_cached(cx));
+            assert!(!gpui_kit::ImageSource::from(path.clone()).is_asset_cached(cx));
         });
 
         // Picked again, the file is read as the SVG it now is: no preview.
         composer.update(cx, |c, cx| c.attach_paths([path.clone()], cx));
         redraw(cx);
         composer.read_with(cx, |c, _| assert!(c.files[1].preview.is_none()));
-        cx.update(|cx| assert!(!ImageSource::from(path.clone()).is_asset_cached(cx)));
+        cx.update(|cx| assert!(!gpui_kit::ImageSource::from(path.clone()).is_asset_cached(cx)));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -2036,6 +2194,7 @@ mod tests {
                         },
                         uploaded: (id == 2).then(FileInfo::default),
                         error: (id == 1).then(|| "Upload failed".into()),
+                        images: ImageStore::new(cx),
                         _upload: None,
                     });
                 }
@@ -2062,6 +2221,423 @@ mod tests {
             assert!(c.files[2].uploaded.is_some());
         });
         assert_eq!(&*events.borrow(), &[("Saved edit".into(), 0)]);
+    }
+
+    /// An uploaded file, as one that finished uploading, with its own store.
+    fn uploaded_file(
+        local_id: u64,
+        source: FileSource,
+        preview: Arc<Image>,
+        cx: &mut gpui_kit::App,
+    ) -> PendingFile {
+        PendingFile {
+            local_id,
+            name: format!("picture-{local_id}.png").into(),
+            size: 74,
+            source,
+            preview: Some(preview),
+            _preview: None,
+            status: AttachmentStatus::Complete,
+            uploaded: Some(FileInfo::default()),
+            error: None,
+            images: ImageStore::new(cx),
+            _upload: None,
+        }
+    }
+
+    /// Upload thumbnails, picked from disk or pasted, paint from each
+    /// file's own store, not GPUI's app-wide one, and go when the file is
+    /// removed or sent.
+    #[gpui_kit::test]
+    fn upload_thumbnails_go_when_removed_or_sent(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        use gpui_kit::{ImgResourceLoader, Resource};
+        let (handle, composer) = open_composer(cx);
+        let png = crate::http::PictureClient::PNG.to_vec();
+        let path =
+            std::env::temp_dir().join(format!("mtc-upload-thumbnail-{}.png", std::process::id()));
+        std::fs::write(&path, &png).unwrap();
+        let picked_path = Resource::Path(path.clone().into());
+        // A picked file previews from the bytes read once, held like a
+        // pasted picture; its path is never handed to GPUI.
+        let picked = Arc::new(Image::from_bytes(ImageFormat::Png, png.clone()));
+        let pasted = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+        let stores = composer.update(cx, |c, cx| {
+            c.files.push(uploaded_file(
+                0,
+                FileSource::Path(path.clone()),
+                picked.clone(),
+                cx,
+            ));
+            c.files.push(uploaded_file(
+                1,
+                FileSource::Pasted(pasted.clone()),
+                pasted.clone(),
+                cx,
+            ));
+            cx.notify();
+            [c.files[0].images.clone(), c.files[1].images.clone()]
+        });
+        let painted = draw_until_painted(cx, handle, {
+            let (stores, picked, pasted) = (stores.clone(), picked.clone(), pasted.clone());
+            move |cx| {
+                vec![
+                    stores[0].read(cx).get_held(&picked),
+                    stores[1].read(cx).get_held(&pasted),
+                ]
+            }
+        });
+        assert!(!cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&picked_path)));
+        assert!(
+            !cx.update(|cx| picked.is_asset_cached(cx)),
+            "a picked picture stays out of the app-wide store"
+        );
+        assert!(
+            !cx.update(|cx| pasted.is_asset_cached(cx)),
+            "a pasted picture stays out of the app-wide store"
+        );
+        let [picked_store, pasted_store] = stores.map(|store| store.downgrade());
+
+        composer.update(cx, |c, cx| c.remove_file(0, cx));
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            picked_store.upgrade().is_none(),
+            "removing frees the file's"
+        );
+        assert!(!in_atlas(cx, handle, &painted[0]), "from the GPU atlas too");
+        assert!(in_atlas(cx, handle, &painted[1]), "and only that file's");
+
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("", window, cx));
+            window.click("send", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(composer.read_with(cx, |c, _| c.files.is_empty()));
+        assert!(pasted_store.upgrade().is_none(), "sending frees the rest");
+        assert!(!in_atlas(cx, handle, &painted[1]));
+        std::fs::remove_file(path).ok();
+    }
+
+    /// People's pictures in the suggestions paint from the composer's own
+    /// store, which goes with the composer.
+    #[gpui_kit::test]
+    fn suggestion_pictures_belong_to_the_composer(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::draw_until_painted;
+        use gpui_kit::{ImgResourceLoader, Resource};
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        cx.update(crate::http::PictureClient::install);
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("", window, cx));
+            window.input("@an", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            composer.read_with(cx, |c, cx| {
+                c.suggestion_matches(cx)
+                    .iter()
+                    .any(|s| s.user.as_ref().is_some_and(|u| u.id.as_str() == "ann"))
+            })
+        });
+        let (avatar, images) = composer.read_with(cx, |c, _| {
+            let url = crate::http::avatar_url(&c.target.client, "ann", 0);
+            (Resource::Uri(url.into()), c.images.clone())
+        });
+        draw_until_painted(cx, handle, {
+            let (images, avatar) = (images.clone(), avatar.clone());
+            move |cx| vec![images.read(cx).get(&avatar)]
+        });
+        assert!(
+            !cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&avatar)),
+            "the suggestion's picture stays out of the app-wide store"
+        );
+        let images = {
+            let weak = images.downgrade();
+            drop(images);
+            weak
+        };
+        cx.update_window(handle, |_, window, _| window.remove_window())
+            .unwrap();
+        drop(composer);
+        // GPUI releases dropped entities when it next flushes effects.
+        cx.update(|_| {});
+        cx.run_until_parked();
+        assert!(
+            images.upgrade().is_none(),
+            "the composer's pictures go with it"
+        );
+    }
+
+    /// The suggestions' store holds only what they show: a replaced
+    /// profile picture frees its old version while they are open, and
+    /// dismissing them frees the rest. A person's row uses the directory's
+    /// copy, so an earlier autocomplete answer can't keep an old picture.
+    #[gpui_kit::test]
+    fn suggestion_pictures_follow_what_the_suggestions_show(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        use gpui_kit::Resource;
+        // The server's autocomplete keeps the copy of Ann it read first.
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("GET", "/api/v4/users/autocomplete") => Reply::json(json!({
+                    "users": [{ "id": "ann", "username": "anna", "last_picture_update": 1 }],
+                    "out_of_channel": [],
+                })),
+                _ => route(request),
+            }
+        });
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        cx.update(crate::http::PictureClient::install);
+        let (images, client, directory) = composer.read_with(cx, |c, cx| {
+            let session = c.session.as_ref().unwrap().read(cx);
+            (
+                c.images.clone(),
+                c.target.client.clone(),
+                session.directory().clone(),
+            )
+        });
+        let avatar =
+            |version: i64| Resource::Uri(crate::http::avatar_url(&client, "ann", version).into());
+        let lookup = |picture: Resource| {
+            let images = images.clone();
+            move |cx: &gpui_kit::App| vec![images.read(cx).get(&picture)]
+        };
+        let open = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| {
+                composer.update(cx, |c, cx| c.set_text("", window, cx));
+                window.input("@an", cx);
+            })
+            .unwrap();
+            wait_until(cx, |cx| {
+                composer.read_with(cx, |c, _| !c.remote_users.is_empty())
+            });
+        };
+
+        open(cx);
+        let old = draw_until_painted(cx, handle, lookup(avatar(1))).remove(0);
+        // Render, selection and pruning share one list, which presence
+        // doesn't make stale.
+        let before = composer.read_with(cx, |c, cx| c.suggestion_matches(cx));
+        directory.update(cx, |d, cx| {
+            d.set_status("ann".into(), mattermost::Status::Away, cx)
+        });
+        cx.run_until_parked();
+        let after = composer.read_with(cx, |c, cx| c.suggestion_matches(cx));
+        assert!(Rc::ptr_eq(&before, &after), "presence reuses the list");
+
+        // Ann changes her picture while the suggestions are open.
+        directory.update(cx, |d, cx| {
+            d.update_user(&"ann".into(), |ann| ann.last_picture_update = 5, cx)
+        });
+        let new = draw_until_painted(cx, handle, lookup(avatar(5))).remove(0);
+        assert!(
+            images.read_with(cx, |images, _| images.get(&avatar(1)).is_none()),
+            "the replaced version goes"
+        );
+        assert!(!in_atlas(cx, handle, &old), "from the GPU atlas too");
+
+        cx.update_window(handle, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            images.read_with(cx, |images, _| images.get(&avatar(5)).is_none()),
+            "dismissing the suggestions frees their pictures"
+        );
+        assert!(!in_atlas(cx, handle, &new), "from the GPU atlas too");
+
+        // Reopened, the older autocomplete answer arrives after the change;
+        // it doesn't take Ann's picture back.
+        open(cx);
+        let new = draw_until_painted(cx, handle, lookup(avatar(5))).remove(0);
+        assert_eq!(
+            directory.read_with(cx, |d, _| d
+                .user(&"ann".into())
+                .unwrap()
+                .last_picture_update),
+            5
+        );
+        assert!(images.read_with(cx, |images, _| images.get(&avatar(1)).is_none()));
+
+        // Typing on to a channel shows no people: their pictures go.
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("", window, cx));
+            window.input("~to", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            images.read_with(cx, |images, _| images.get(&avatar(5)).is_none()),
+            "a new token frees the pictures it no longer shows"
+        );
+        assert!(!in_atlas(cx, handle, &new), "from the GPU atlas too");
+    }
+
+    /// A keystroke works the suggestions out once, through the observers
+    /// it sets off and the frames after it; a frame with nothing new
+    /// reuses them.
+    #[gpui_kit::test]
+    fn a_keystroke_works_the_suggestions_out_once(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        let computations =
+            |cx: &mut TestAppContext| composer.read_with(cx, |c, _| c.computations.get());
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap()
+        };
+        for (typed, key) in [("@a", "n"), (":pa", "r")] {
+            cx.update_window(handle, |_, window, cx| {
+                composer.update(cx, |c, cx| c.set_text("", window, cx));
+                window.input(typed, cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            draw(cx);
+            let before = computations(cx);
+            // Typing a name leaves the emoji search, and its catalogue, be.
+            let searches = Rc::new(std::cell::Cell::new(0));
+            let emoji_search = composer.read_with(cx, |c, _| c.emoji_search.clone());
+            let _watch = cx.update(|cx| {
+                let searches = searches.clone();
+                cx.observe(&emoji_search, move |_, _| searches.set(searches.get() + 1))
+            });
+            cx.update_window(handle, |_, window, cx| window.input(key, cx))
+                .unwrap();
+            cx.run_until_parked();
+            draw(cx);
+            draw(cx);
+            assert_eq!(
+                computations(cx) - before,
+                1,
+                "typing {key:?} after {typed:?}"
+            );
+            if typed.starts_with('@') {
+                assert_eq!(searches.get(), 0, "a name doesn't search emoji");
+            }
+            draw(cx);
+            assert_eq!(computations(cx) - before, 1, "an unchanged frame");
+        }
+    }
+
+    /// An autocomplete answer ranks people above the directory's; a person
+    /// it pushes out of the six shown loses their picture.
+    #[gpui_kit::test]
+    fn an_autocomplete_answer_frees_the_rows_it_pushes_out(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        use gpui_kit::Resource;
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("GET", "/api/v4/users/autocomplete") => Reply::json(json!({
+                    "users": [{ "id": "anne", "username": "anne", "last_picture_update": 1 }],
+                    "out_of_channel": [],
+                })),
+                _ => route(request),
+            }
+        });
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        cx.update(crate::http::PictureClient::install);
+        let (images, client, directory) = composer.read_with(cx, |c, cx| {
+            let session = c.session.as_ref().unwrap().read(cx);
+            (
+                c.images.clone(),
+                c.target.client.clone(),
+                session.directory().clone(),
+            )
+        });
+        directory.update(cx, |d, cx| {
+            d.insert(
+                (1..=6).map(|i| {
+                    serde_json::from_value(json!({
+                        "id": format!("anna{i}"), "username": format!("anna{i}"),
+                        "last_picture_update": 1,
+                    }))
+                    .unwrap()
+                }),
+                cx,
+            )
+        });
+        let avatar = |user: &str| Resource::Uri(crate::http::avatar_url(&client, user, 1).into());
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("", window, cx));
+            window.input("@an", cx);
+        })
+        .unwrap();
+        // The six people the directory knows show before the answer.
+        let last = {
+            let (images, picture) = (images.clone(), avatar("anna6"));
+            draw_until_painted(cx, handle, move |cx| vec![images.read(cx).get(&picture)]).remove(0)
+        };
+        wait_until(cx, |cx| {
+            composer.read_with(cx, |c, _| !c.remote_users.is_empty())
+        });
+        {
+            let (images, picture) = (images.clone(), avatar("anne"));
+            draw_until_painted(cx, handle, move |cx| vec![images.read(cx).get(&picture)]);
+        }
+        assert!(
+            images.read_with(cx, |images, _| images.get(&avatar("anna6")).is_none()),
+            "the row the answer pushed out loses its picture"
+        );
+        assert!(!in_atlas(cx, handle, &last), "from the GPU atlas too");
+    }
+
+    /// A custom emoji recreated under the same name changes its picture
+    /// while the suggestions stay open: the old one goes.
+    #[gpui_kit::test]
+    fn a_replaced_custom_emoji_frees_its_old_picture(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        use gpui_kit::Resource;
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let (handle, composer) = open_connected_composer(Some(&server), cx);
+        cx.update(crate::http::PictureClient::install);
+        let (images, client, store) = composer.read_with(cx, |c, cx| {
+            let session = c.session.as_ref().unwrap().read(cx);
+            (
+                c.images.clone(),
+                c.target.client.clone(),
+                session.emoji_store().clone(),
+            )
+        });
+        let add = |id: &str, cx: &mut TestAppContext| {
+            let emoji =
+                serde_json::from_value(json!({ "id": id, "name": "party_popper" })).unwrap();
+            store.update(cx, |s, cx| s.add(vec![emoji], cx));
+        };
+        let picture = |id: &str| Resource::Uri(client.custom_emoji_url(&id.into()).into());
+        let lookup = |picture: Resource| {
+            let images = images.clone();
+            move |cx: &gpui_kit::App| vec![images.read(cx).get(&picture)]
+        };
+        add("first", cx);
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            composer.update(cx, |c, cx| c.set_text("", window, cx));
+            window.input(":party", cx);
+        })
+        .unwrap();
+        let old = draw_until_painted(cx, handle, lookup(picture("first"))).remove(0);
+
+        add("second", cx);
+        draw_until_painted(cx, handle, lookup(picture("second")));
+        assert!(
+            images.read_with(cx, |images, _| images.get(&picture("first")).is_none()),
+            "the replaced emoji's picture goes"
+        );
+        assert!(!in_atlas(cx, handle, &old), "from the GPU atlas too");
     }
 
     #[gpui_kit::test]

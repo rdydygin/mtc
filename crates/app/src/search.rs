@@ -4,7 +4,12 @@
 //! follow the typing. Choosing one scrolls the conversation to it, or opens
 //! its thread for a reply, and the results stay for the next choice.
 
-use std::{collections::HashMap, ops::Range, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    sync::Arc,
+    time::Duration,
+};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -19,14 +24,18 @@ use gpui_kit::component::{
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Styled as _, StyledText, Subscription, Task, TestSupportExt as _, Window, div,
-    prelude::FluentBuilder as _,
+    ParentElement as _, Render, Resource, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, StyledText, Subscription, Task,
+    TestSupportExt as _, Window, div, prelude::FluentBuilder as _,
 };
 use mattermost::{ChannelId, Post, PostId, PostSearch, TeamId};
 use session::{CustomEmojis, SearchScope, Session};
 
-use crate::{http::avatar_url, time};
+use crate::{
+    http::avatar_url,
+    image_scope::{ImageStore, image_scope, release_replaced_avatars},
+    time,
+};
 
 /// How long typing pauses before the search runs.
 const DEBOUNCE: Duration = Duration::from_millis(300);
@@ -78,6 +87,12 @@ pub struct SearchView {
     more_failed: bool,
     selected: Option<usize>,
     scroll: ScrollHandle,
+    /// The authors' pictures in the results. The view stays for the
+    /// workspace's life, kept while hidden, so each new set of results
+    /// frees the pictures the last one showed that it doesn't (see
+    /// [`Self::release_pictures`]), a replaced profile picture frees its
+    /// old version, and the rest go with the view.
+    images: Entity<ImageStore>,
     _search: Option<Task<()>>,
     /// The next page loading. Kept apart from `_search` so asking for more
     /// of the old results never cancels a search for newer words.
@@ -102,6 +117,7 @@ impl SearchView {
         let placeholder = search_placeholder(&session, &scope, cx);
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let directory = session.read(cx).directory().clone();
+        let images = ImageStore::new(cx);
         let subscriptions = vec![
             cx.subscribe_in(&input, window, |this, _, event, _, cx| match event {
                 InputEvent::Change => this.search(Some(DEBOUNCE), cx),
@@ -115,6 +131,7 @@ impl SearchView {
             }),
             // Authors' names and pictures arrive after the results.
             cx.observe(&directory, |_, _, cx| cx.notify()),
+            release_replaced_avatars(&images, &session, cx),
         ];
         Self {
             collection: None,
@@ -143,6 +160,7 @@ impl SearchView {
             more_failed: false,
             selected: None,
             scroll: ScrollHandle::new(),
+            images,
             _search: None,
             _more: None,
             _subscriptions: subscriptions,
@@ -181,6 +199,7 @@ impl SearchView {
         self.next_page = None;
         self._more = None;
         self.loading_more = false;
+        self.release_pictures(cx);
         self.search(None, cx);
     }
 
@@ -234,6 +253,7 @@ impl SearchView {
             self.loading_more = false;
             self.selected = None;
             self.status = Status::Idle;
+            self.release_pictures(cx);
             cx.notify();
             return;
         }
@@ -330,6 +350,9 @@ impl SearchView {
                 self.matches.extend(found.matches);
                 self.next_page = found.has_next.then_some(page + 1);
                 self.status = Status::Done;
+                if page == 0 {
+                    self.release_pictures(cx);
+                }
             }
             // A later page that fails leaves the results there, and the
             // button to try it again.
@@ -342,6 +365,33 @@ impl SearchView {
             }
         }
         cx.notify();
+    }
+
+    /// The picture of `post`'s author, once the directory knows them.
+    fn author_picture(&self, post: &Post, cx: &App) -> Option<String> {
+        let session = self.session.read(cx);
+        let author = session.directory().read(cx).user(&post.user_id)?;
+        Some(avatar_url(
+            session.client(),
+            author.id.as_str(),
+            author.last_picture_update,
+        ))
+    }
+
+    /// Free the pictures of results no longer shown. Authors of the results
+    /// now shown keep theirs, so a new search doesn't redraw them.
+    fn release_pictures(&mut self, cx: &mut Context<Self>) {
+        let shown: HashSet<String> = self
+            .results
+            .iter()
+            .filter_map(|post| self.author_picture(post, cx))
+            .collect();
+        self.images.update(cx, |images, cx| {
+            images.retain(
+                |picture| matches!(picture, Resource::Uri(uri) if shown.contains(uri.as_ref())),
+                cx,
+            )
+        });
     }
 
     fn open(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -539,20 +589,16 @@ impl SearchView {
     ) -> AnyElement {
         let theme = cx.theme();
         let session = self.session.read(cx);
-        let author = session.directory().read(cx).user(&post.user_id).cloned();
-        let name: SharedString = match (post.override_username(), &author) {
+        let author = session.directory().read(cx).user(&post.user_id);
+        let name: SharedString = match (post.override_username(), author) {
             (Some(name), _) => name.to_string().into(),
             (None, Some(user)) => user.display_name().into(),
             (None, None) => "…".into(),
         };
-        let mut avatar = Avatar::new().name(name.clone()).xsmall();
-        if let Some(user) = &author {
-            avatar = avatar.src(avatar_url(
-                session.client(),
-                user.id.as_str(),
-                user.last_picture_update,
-            ));
-        }
+        let avatar = Avatar::new()
+            .name(name.clone())
+            .xsmall()
+            .when_some(self.author_picture(post, cx), Avatar::src);
         let when = format!(
             "{} at {}",
             time::day_label(post.create_at),
@@ -578,7 +624,7 @@ impl SearchView {
             .join(", ");
         let selected = self.selected == Some(ix);
         let id: ElementId = post.id.as_arc().clone().into();
-        v_flex()
+        let row = v_flex()
             .id(id)
             .role(gpui_kit::Role::ListItem)
             .aria_label(format!(
@@ -660,8 +706,11 @@ impl SearchView {
                         .child(Icon::new(IconName::Paperclip).xsmall())
                         .child(div().min_w_0().truncate().child(files)),
                 )
-            })
-            .into_any_element()
+            });
+        // Each row draws inside the store: a collection's list lays rows out
+        // while it prepaints, and their pictures must not reach the
+        // app-wide store.
+        image_scope(&self.images, row).into_any_element()
     }
 }
 
@@ -1356,6 +1405,238 @@ mod tests {
             cx.executor().advance_clock(Duration::from_millis(50));
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Results hold their authors' pictures in the view's own store, not
+    /// GPUI's app-wide one. The view outlives many searches, so a new set
+    /// of results frees the pictures only the last one showed, and closing
+    /// the view frees the rest.
+    #[gpui_kit::test]
+    fn result_pictures_go_with_their_results_and_the_view(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        use gpui_kit::ImgResourceLoader;
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            // Stray local connections reach test ports too: answer by
+            // method and path.
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("POST", "/api/v4/users/ids") => Reply::json(json!([
+                    { "id": "ann", "username": "ann", "last_picture_update": 1 },
+                    { "id": "bob", "username": "bob", "last_picture_update": 2 },
+                ])),
+                ("POST", "/api/v4/teams/team/posts/search") => {
+                    let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                    let author = if body["terms"].as_str().unwrap_or_default().contains("bye") {
+                        "bob"
+                    } else {
+                        "ann"
+                    };
+                    Reply::json(json!({
+                        "order": [author],
+                        "posts": { author: { "id": author, "channel_id": "town",
+                                             "user_id": author, "message": "hello bye" } },
+                    }))
+                }
+                _ => route(request),
+            }
+        });
+        let (window, view) = open_search(&server, cx);
+        cx.update(crate::http::PictureClient::install);
+        let picture = |user: &str, cx: &mut TestAppContext| {
+            let version = if user == "ann" { 1 } else { 2 };
+            view.read_with(cx, |v, cx| {
+                let client = v.session.read(cx).client().clone();
+                Resource::Uri(avatar_url(&client, user, version).into())
+            })
+        };
+        let (ann, bob) = (picture("ann", cx), picture("bob", cx));
+        let images = view.read_with(cx, |v, _| v.images.clone());
+        let held = |picture: &Resource| {
+            let images = images.clone();
+            let picture = picture.clone();
+            move |cx: &App| vec![images.read(cx).get(&picture)]
+        };
+
+        cx.update_window(window, |_, window, cx| window.input("hello", cx))
+            .unwrap();
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, cx| {
+                v.results.len() == 1 && v.author_picture(&v.results[0], cx).is_some()
+            })
+        });
+        let anns = draw_until_painted(cx, window, held(&ann)).remove(0);
+        assert!(
+            !cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&ann)),
+            "the picture stays out of the app-wide store"
+        );
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.focus(window, cx));
+            window.input("bye", cx);
+        })
+        .unwrap();
+        wait_until(cx, |cx| {
+            view.read_with(cx, |v, _| {
+                v.results.first().is_some_and(|p| p.id.as_str() == "bob")
+            })
+        });
+        draw_until_painted(cx, window, held(&bob));
+        assert!(
+            images.read_with(cx, |images, _| images.get(&ann).is_none()),
+            "results for other words free the last ones' pictures"
+        );
+        assert!(!in_atlas(cx, window, &anns), "from the GPU atlas too");
+
+        drop(images);
+        let images = view.read_with(cx, |v, _| v.images.downgrade());
+        cx.update_window(window, |_, window, _| window.remove_window())
+            .unwrap();
+        drop(view);
+        // GPUI releases dropped entities when it next flushes effects.
+        cx.update(|_| {});
+        cx.run_until_parked();
+        assert!(images.upgrade().is_none(), "closing frees the pictures");
+        assert!(!cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&bob)));
+    }
+
+    /// Ann's and Bob's pictures, as the directory now has them, once it
+    /// knows both.
+    fn author_pictures(view: &Entity<SearchView>, cx: &mut TestAppContext) -> (Resource, Resource) {
+        let picture = |user: &str, cx: &mut TestAppContext| {
+            view.read_with(cx, |v, cx| {
+                let session = v.session.read(cx);
+                let version = session
+                    .directory()
+                    .read(cx)
+                    .user(&user.into())?
+                    .last_picture_update;
+                Some(Resource::Uri(
+                    avatar_url(session.client(), user, version).into(),
+                ))
+            })
+        };
+        wait_until(cx, |cx| {
+            picture("ann", cx).is_some() && picture("bob", cx).is_some()
+        });
+        (picture("ann", cx).unwrap(), picture("bob", cx).unwrap())
+    }
+
+    /// Unpinning, unsaving or refreshing replaces a collection's rows
+    /// without a new search; pictures of authors no row shows go too.
+    #[gpui_kit::test]
+    fn collection_rows_free_their_authors_pictures_when_they_go(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let unpinned = Arc::new(AtomicBool::new(false));
+        let server = SlowServer::start(Network::new(Duration::ZERO), {
+            let unpinned = unpinned.clone();
+            move |request| match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("POST", "/api/v4/users/ids") => Reply::json(json!([
+                    { "id": "ann", "username": "ann", "last_picture_update": 1 },
+                    { "id": "bob", "username": "bob", "last_picture_update": 2 },
+                ])),
+                ("GET", "/api/v4/channels/town/pinned") => {
+                    let mut posts = json!({
+                        "bob": { "id": "bob", "channel_id": "town", "user_id": "bob",
+                                 "message": "kept", "create_at": 2 },
+                    });
+                    if !unpinned.load(Ordering::SeqCst) {
+                        posts["ann"] = json!({ "id": "ann", "channel_id": "town",
+                                               "user_id": "ann", "message": "pinned",
+                                               "create_at": 1 });
+                    }
+                    Reply::json(json!({ "posts": posts }))
+                }
+                _ => route(request),
+            }
+        });
+        let (window, view) = open_collection(&server, Collection::Pinned("town".into()), cx);
+        cx.update(crate::http::PictureClient::install);
+        let (ann, bob) = author_pictures(&view, cx);
+        let images = view.read_with(cx, |v, _| v.images.clone());
+        let painted = draw_until_painted(cx, window, {
+            let (images, ann, bob) = (images.clone(), ann.clone(), bob.clone());
+            move |cx| vec![images.read(cx).get(&ann), images.read(cx).get(&bob)]
+        });
+
+        unpinned.store(true, Ordering::SeqCst);
+        view.update(cx, |v, cx| v.load_collection(0, cx));
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 1));
+        cx.run_until_parked();
+        assert!(
+            images.read_with(cx, |images, _| images.get(&ann).is_none()),
+            "the unpinned post's author's picture goes"
+        );
+        assert!(!in_atlas(cx, window, &painted[0]), "from the GPU atlas too");
+        assert!(images.read_with(cx, |images, _| images.get(&bob).is_some()));
+        assert!(in_atlas(cx, window, &painted[1]), "the kept row's stays");
+    }
+
+    /// A new profile picture for someone in the results frees the old one,
+    /// though the results stay the same.
+    #[gpui_kit::test]
+    fn a_replaced_profile_picture_frees_its_old_version(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        let server = SlowServer::start(Network::new(Duration::ZERO), |request| {
+            match (
+                request.method(),
+                request.path().split('?').next().unwrap_or_default(),
+            ) {
+                ("POST", "/api/v4/users/ids") => Reply::json(json!([
+                    { "id": "ann", "username": "ann", "last_picture_update": 1 },
+                    { "id": "bob", "username": "bob", "last_picture_update": 2 },
+                ])),
+                ("POST", "/api/v4/teams/team/posts/search") => Reply::json(json!({
+                    "order": ["ann", "bob"],
+                    "posts": {
+                        "ann": { "id": "ann", "channel_id": "town", "user_id": "ann",
+                                 "message": "hello", "create_at": 2 },
+                        "bob": { "id": "bob", "channel_id": "town", "user_id": "bob",
+                                 "message": "hello", "create_at": 1 },
+                    },
+                })),
+                _ => route(request),
+            }
+        });
+        let (window, view) = open_search(&server, cx);
+        cx.update(crate::http::PictureClient::install);
+        cx.update_window(window, |_, window, cx| window.input("hello", cx))
+            .unwrap();
+        wait_until(cx, |cx| view.read_with(cx, |v, _| v.results.len() == 2));
+        let (old, bob) = author_pictures(&view, cx);
+        let images = view.read_with(cx, |v, _| v.images.clone());
+        let lookup = |pictures: Vec<Resource>| {
+            let images = images.clone();
+            move |cx: &App| {
+                pictures
+                    .iter()
+                    .map(|picture| images.read(cx).get(picture))
+                    .collect()
+            }
+        };
+        let painted = draw_until_painted(cx, window, lookup(vec![old.clone(), bob.clone()]));
+
+        let directory = view.read_with(cx, |v, cx| v.session.read(cx).directory().clone());
+        directory.update(cx, |d, cx| {
+            d.update_user(&"ann".into(), |ann| ann.last_picture_update = 5, cx)
+        });
+        let (new, _) = author_pictures(&view, cx);
+        assert_ne!(new, old);
+        draw_until_painted(cx, window, lookup(vec![new]));
+        assert!(
+            images.read_with(cx, |images, _| images.get(&old).is_none()),
+            "the old version goes"
+        );
+        assert!(!in_atlas(cx, window, &painted[0]), "from the GPU atlas too");
+        assert!(in_atlas(cx, window, &painted[1]), "others' pictures stay");
     }
 
     #[gpui_kit::test]
