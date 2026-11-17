@@ -128,6 +128,7 @@ impl TimelineView {
         });
         let typing = cx.new(|cx| TypingIndicator::new(kind.clone(), &session, cx));
         let directory = session.read(cx).directory().clone();
+        let images = crate::image_scope::ImageStore::new(cx);
 
         let subscriptions = vec![
             cx.on_app_quit(|this, cx| {
@@ -140,6 +141,9 @@ impl TimelineView {
                 cx.notify();
             }),
             cx.observe(&directory, |_, _, cx| cx.notify()),
+            // Workspace keeps recent conversations open; a replaced profile
+            // picture must not keep its old version in this one's store.
+            crate::image_scope::release_replaced_avatars(&images, &session, cx),
             cx.observe(&session, |_, _, cx| cx.notify()),
             cx.observe(&scroller, Self::on_scroll),
             cx.subscribe_in(&composer, window, Self::on_composer_event),
@@ -152,7 +156,7 @@ impl TimelineView {
             scroller,
             composer,
             typing,
-            images: crate::image_scope::ImageStore::new(cx),
+            images,
             row_ids: Vec::new(),
             rich_text: HashMap::new(),
             attachment_cards: HashMap::new(),
@@ -1382,6 +1386,36 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         panic!("pictures never painted from the view's store: {states:?}");
+    }
+
+    /// The workspace keeps recent conversations open, so a new profile
+    /// picture for an author on screen frees the old one from the view's
+    /// store, though the posts stay the same.
+    #[gpui_kit::test]
+    fn a_replaced_profile_picture_frees_its_old_version(cx: &mut TestAppContext) {
+        use crate::image_scope::testing::{draw_until_painted, in_atlas};
+        let (_server, view, handle) = open_with_author_avatar(cx);
+        let old = ann_avatar(&view, cx);
+        let images = view.read_with(cx, |v, _| v.images.clone());
+        let lookup = |picture: gpui_kit::Resource| {
+            let images = images.clone();
+            move |cx: &App| vec![images.read(cx).get(&picture)]
+        };
+        let painted = draw_until_painted(cx, handle, lookup(old.clone())).remove(0);
+        let (directory, client) = view.read_with(cx, |v, cx| {
+            let session = v.session.read(cx);
+            (session.directory().clone(), session.client().clone())
+        });
+        directory.update(cx, |d, cx| {
+            d.update_user(&"ann".into(), |ann| ann.last_picture_update = 5, cx)
+        });
+        let new = gpui_kit::Resource::Uri(avatar_url(&client, "ann", 5).into());
+        draw_until_painted(cx, handle, lookup(new));
+        assert!(
+            images.read_with(cx, |images, _| images.get(&old).is_none()),
+            "the old version goes"
+        );
+        assert!(!in_atlas(cx, handle, &painted), "from the GPU atlas too");
     }
 
     /// How many times `entity` notifies, while the subscription lives.

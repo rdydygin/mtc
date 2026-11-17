@@ -40,6 +40,7 @@ pub struct Directory {
     /// can tell when it is out of date.
     revision: u64,
     names_revision: u64,
+    pictures_revision: u64,
     statuses: HashMap<UserId, Status>,
     /// Only active status reads have tokens; status events invalidate them.
     status_requests: HashMap<UserId, u64>,
@@ -65,6 +66,7 @@ impl Directory {
             remembered: HashSet::new(),
             revision: 0,
             names_revision: 0,
+            pictures_revision: 0,
             statuses: HashMap::new(),
             status_requests: HashMap::new(),
             next_status_request: 0,
@@ -110,13 +112,28 @@ impl Directory {
         self.names_revision
     }
 
-    fn insert_user(&mut self, user: User) {
-        if self
-            .users
-            .get(&user.id)
-            .is_none_or(|old| old.display_name() != user.display_name())
+    /// Changes only when a known user's profile picture is replaced, so
+    /// pictures kept for its old version can be let go.
+    pub fn pictures_revision(&self) -> u64 {
+        self.pictures_revision
+    }
+
+    fn insert_user(&mut self, mut user: User) {
+        let old = self.users.get(&user.id);
+        // Copies from different requests can arrive out of order, such as an
+        // autocomplete answer read before the user changed their picture.
+        // A picture version is the time it was set, negated when the default
+        // came back, so a copy never takes the picture back to an older one.
+        if let Some(old) = old
+            && old.last_picture_update.abs() > user.last_picture_update.abs()
         {
+            user.last_picture_update = old.last_picture_update;
+        }
+        if old.is_none_or(|old| old.display_name() != user.display_name()) {
             self.names_revision += 1;
+        }
+        if old.is_some_and(|old| old.last_picture_update != user.last_picture_update) {
+            self.pictures_revision += 1;
         }
         self.users.insert(user.id.clone(), Arc::new(user));
     }
@@ -312,9 +329,13 @@ impl Directory {
     ) {
         if let Some(user) = self.users.get_mut(id) {
             let name = user.display_name().to_string();
+            let picture = user.last_picture_update;
             change(Arc::make_mut(user));
             if name != user.display_name() {
                 self.names_revision += 1;
+            }
+            if picture != user.last_picture_update {
+                self.pictures_revision += 1;
             }
             let user = user.clone();
             self.request_status_emoji([user.as_ref()], cx);
@@ -435,6 +456,42 @@ mod tests {
             .iter()
             .filter(|r| r.path() == "/api/v4/users/ids")
             .count()
+    }
+
+    /// Only a known user's new picture moves the pictures revision: not a
+    /// newly known user, a new name, presence, or an older copy.
+    #[gpui_kit::test]
+    fn pictures_revision_moves_only_when_a_known_picture_changes(cx: &mut TestAppContext) {
+        let server = SlowServer::start(Network::new(Duration::ZERO), route);
+        let directory = start(&server, cx);
+        directory.update(cx, |d, cx| {
+            let ann = mattermost::UserId::from("ann");
+            let mut first = user("ann", "Ann");
+            first.last_picture_update = 1;
+            d.insert([first.clone()], cx);
+            assert_eq!(d.pictures_revision(), 0);
+            d.insert([user("bob", "Bob")], cx);
+            d.update_user(&ann, |ann| ann.first_name = "Anna".into(), cx);
+            d.set_status(ann.clone(), Status::Away, cx);
+            assert_eq!(d.pictures_revision(), 0);
+            first.last_picture_update = 2;
+            d.insert([first], cx);
+            assert_eq!(d.pictures_revision(), 1);
+            d.update_user(&ann, |ann| ann.last_picture_update = 3, cx);
+            assert_eq!(d.pictures_revision(), 2);
+            // A copy read before the change keeps the newer picture, and
+            // moves nothing; a newer copy or a picture reset still lands.
+            let mut stale = user("ann", "Anna");
+            stale.last_picture_update = 2;
+            d.insert([stale], cx);
+            assert_eq!(d.user(&ann).unwrap().last_picture_update, 3);
+            assert_eq!(d.pictures_revision(), 2);
+            let mut reset = user("ann", "Anna");
+            reset.last_picture_update = -4;
+            d.insert([reset], cx);
+            assert_eq!(d.user(&ann).unwrap().last_picture_update, -4);
+            assert_eq!(d.pictures_revision(), 3);
+        });
     }
 
     #[gpui_kit::test]

@@ -93,6 +93,16 @@ pub fn avatar_url(client: &Client, user: &str, version: i64) -> String {
     format!("{}api/v4/users/{user}/image?_={version}", client.server())
 }
 
+/// The user and picture version `url` was made for by [`avatar_url`], if
+/// it is one of `client`'s profile pictures.
+pub fn avatar_version<'a>(client: &Client, url: &'a str) -> Option<(&'a str, i64)> {
+    let rest = url
+        .strip_prefix(client.server().as_str())?
+        .strip_prefix("api/v4/users/")?;
+    let (user, version) = rest.split_once("/image?_=")?;
+    Some((user, version.parse().ok()?))
+}
+
 /// Whether `url` is a server image whose content never changes, and so may
 /// be kept on disk: an uploaded file or a custom emoji, which get a new ID
 /// when replaced, or a profile picture at a given version.
@@ -116,7 +126,7 @@ pub(crate) struct PictureClient;
 #[cfg(test)]
 impl PictureClient {
     /// A 2 × 2 red PNG.
-    const PNG: [u8; 74] = [
+    pub(crate) const PNG: [u8; 74] = [
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 6,
         0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 17, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
         31, 132, 25, 96, 12, 0, 71, 202, 7, 249, 103, 89, 110, 183, 0, 0, 0, 0, 73, 69, 78, 68,
@@ -160,6 +170,10 @@ mod tests {
         let client = Client::new_unverified("https://chat.example.com", "token").unwrap();
         let server = "https://chat.example.com/api/v4";
         assert!(never_changes(&client, &avatar_url(&client, "u1", 7)));
+        assert_eq!(
+            avatar_version(&client, &avatar_url(&client, "u1", 7)),
+            Some(("u1", 7))
+        );
         assert!(never_changes(
             &client,
             &format!("{server}/files/f1/preview")
