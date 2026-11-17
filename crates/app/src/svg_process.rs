@@ -273,3 +273,49 @@ pub fn wrap(png: &[u8]) -> Option<Vec<u8>> {
         .into_bytes(),
     )
 }
+
+/// SVGs the helper's tests draw, here so that the integration tests, which
+/// compile this file alone, draw the same ones.
+#[cfg(test)]
+pub mod test_svgs {
+    /// 666 bytes usvg never finishes, though the image guard lets them
+    /// through: a style rule whose selector it matches by trying every set
+    /// of a shape's 60 ancestors, 2⁶⁰ of them. The guard leaves what usvg
+    /// spends time on, rather than stack, to the helper's time limit.
+    pub fn hang() -> Vec<u8> {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><style>{}rect{{fill:red}}</style>{}<rect width="9" height="9"/>{}</svg>"#,
+            "g ".repeat(61),
+            "<g>".repeat(60),
+            "</g>".repeat(60)
+        )
+        .into_bytes()
+    }
+
+    /// `links` patterns, each filling a shape `levels` groups deep with the
+    /// next. usvg draws each one's content from where the last is drawn,
+    /// recursively.
+    pub fn pattern_chain(links: usize, levels: usize) -> Vec<u8> {
+        let mut svg =
+            String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4">"#);
+        for link in 0..links {
+            let fill = if link + 1 == links {
+                "#f00".to_string()
+            } else {
+                format!("url(#p{})", link + 1)
+            };
+            svg.push_str(&format!(
+                r#"<pattern id="p{link}" width="4" height="4" patternUnits="userSpaceOnUse">{}<rect width="4" height="4" fill="{fill}"/>{}</pattern>"#,
+                "<g>".repeat(levels),
+                "</g>".repeat(levels)
+            ));
+        }
+        svg.push_str(r##"<rect width="4" height="4" fill="url(#p0)"/></svg>"##);
+        svg.into_bytes()
+    }
+
+    /// The deepest [`pattern_chain`] of 50-group links the image guard lets
+    /// through, as the helper's tests use it.
+    pub const DEEPEST_LINKS: usize = 18;
+    pub const DEEPEST_LEVELS: usize = 50;
+}

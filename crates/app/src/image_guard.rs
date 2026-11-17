@@ -24,6 +24,8 @@ use std::collections::{HashMap, HashSet};
 
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
 
+use crate::svg_process;
+
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
@@ -690,15 +692,24 @@ const MAX_HREF_CHAIN: u32 = 16;
 /// Inheriting from a parent and two references to one element add nothing.
 /// Editors nest a few dozen levels, and follow a reference or two.
 ///
-/// A level took about 1.5 KB of stack, so at the bound usvg needs about
-/// 1.5 MB. That assumes usvg renders on a thread of 16 MB or more, as the
-/// helper process does: about ten times what it needs. GPUI's own threads
-/// have less, as little as 512 KB on macOS. The guard itself recurses
-/// nowhere with the document's depth: roxmltree parses nesting in a loop
-/// and entities at most ten deep, simplecss matches the guard's stand-in
-/// two calls deep, and the reference graph is searched with a stack of
-/// its own.
+/// At the bound usvg needs about 1.5 MiB of stack, [`LEVEL_STACK`] a
+/// level: more than GPUI's own threads have, as little as 512 KiB on
+/// macOS, so the helper renders on one of [`svg_process::RENDER_STACK`],
+/// about ten times as much. The guard itself recurses nowhere with the
+/// document's depth: roxmltree parses nesting in a loop and entities at
+/// most ten deep, simplecss matches the guard's stand-in two calls deep,
+/// and the reference graph is searched with a stack of its own.
 const MAX_RENDER_DEPTH: u32 = 1024;
+
+/// The stack a level of [`MAX_RENDER_DEPTH`] took usvg, the most of any
+/// kind: a chain of 101 patterns, each drawing the next ten groups deep,
+/// overflowed a 2 MiB thread.
+const LEVEL_STACK: usize = 1536;
+
+const _: () = assert!(
+    MAX_RENDER_DEPTH as usize * LEVEL_STACK * 10 <= svg_process::RENDER_STACK,
+    "the helper's render stack holds the deepest drawing ten times over"
+);
 
 /// The levels of nesting a reference counts as in [`MAX_RENDER_DEPTH`]:
 /// what drawing a pattern or marker costs usvg's stack, about four levels'
