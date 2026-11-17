@@ -11,12 +11,15 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "6"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 futures.workspace = true
 getrandom = "0.3"
 hmac = "0.12"
+# The same crate GPUI decodes images with: its format check, and PNG for SVG helpers.
+image = { version = "0.25", default-features = false, features = ["png"] }
 gpui-kit = { workspace = true, default-features = true, features = ["syntect"] }
 log.workspace = true
 mattermost.workspace = true
@@ -26,6 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 session.workspace = true
 sha2 = "0.10"
+tokio = { workspace = true, features = ["process", "io-util"] }
 url.workspace = true
 # What usvg, GPUI's SVG renderer, parses with; the same versions.
 data-url = "0.3"
@@ -33,13 +37,15 @@ imagesize = "0.14"
 roxmltree = "0.21"
 simplecss = "0.2"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
-tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, default-features = true, features = ["test-support"] }

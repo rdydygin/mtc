@@ -84,14 +84,25 @@ pub fn emoji_char(name: &str) -> SharedString {
 /// An emoji as drawn beside text: the character, or the server's image for
 /// a custom emoji, sized to the surrounding text.
 pub fn emoji_element(name: &str, custom: &CustomEmojis) -> AnyElement {
-    let name = session::emoji_name(name);
-    match custom.image_url(name) {
-        Some(url) if session::emoji_for(name).is_none() => img(SharedString::from(url.clone()))
+    match custom_emoji_url(name, custom) {
+        Some(url) => img(SharedString::from(url.clone()))
             .flex_none()
             .size_4()
             .into_any_element(),
-        _ => emoji_char(name).into_any_element(),
+        None => emoji_char(session::emoji_name(name)).into_any_element(),
     }
+}
+
+/// The picture [`emoji_element`] draws for `name`: a custom emoji's, unless
+/// a standard emoji has that name.
+pub fn custom_emoji_url<'a>(
+    name: &str,
+    custom: &'a CustomEmojis,
+) -> Option<&'a std::sync::Arc<str>> {
+    let name = session::emoji_name(name);
+    custom
+        .image_url(name)
+        .filter(|_| session::emoji_for(name).is_none())
 }
 
 fn status_for_save(

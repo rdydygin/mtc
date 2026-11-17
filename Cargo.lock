@@ -4542,6 +4542,7 @@ name = "mtc"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "data-url",
  "dirs 6.0.0",
@@ -4550,6 +4551,7 @@ dependencies = [
  "getrandom 0.3.4",
  "gpui-kit",
  "hmac",
+ "image",
  "imagesize 0.14.0",
  "libc",
  "log",
@@ -4567,6 +4569,7 @@ dependencies = [
  "url",
  "usvg 0.46.0",
  "windows-registry 0.6.1",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7485,6 +7488,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

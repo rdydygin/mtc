@@ -10,6 +10,10 @@
 //! kept on disk (see [`crate::cache`]), so they show at once after a
 //! restart. Requests arrive here on GPUI's background threads, where
 //! reading the disk is fine.
+//!
+//! Every picture GPUI loads by URL comes through here, so this is where an
+//! SVG body is handed to a helper process and GPUI gets only its raster
+//! image (see [`crate::svg_process`]).
 
 use std::sync::Arc;
 
@@ -17,7 +21,7 @@ use futures::future::BoxFuture;
 use gpui_kit::http_client::{AsyncBody, HttpClient, Request, Response, Url, http::HeaderValue};
 use mattermost::Client;
 
-use crate::{cache, image_guard::is_safe_image};
+use crate::{cache, image_guard::is_safe_image, svg_process};
 
 pub struct ServerHttpClient {
     client: Client,
@@ -57,6 +61,9 @@ impl HttpClient for ServerHttpClient {
                 if !is_safe_image(&body) {
                     return refused();
                 }
+                let Some(body) = renderable(body).await else {
+                    return refused();
+                };
                 return Ok(Response::builder()
                     .status(200)
                     .body(AsyncBody::from(body))?);
@@ -71,13 +78,36 @@ impl HttpClient for ServerHttpClient {
             if keep && fetched.status == 200 && !fetched.body.is_empty() {
                 cache::save_image(generation, &uri, &fetched.body);
             }
+            // GPUI reads the body of a successful response only.
+            let body = if (200..300).contains(&fetched.status) {
+                match renderable(fetched.body).await {
+                    Some(body) => body,
+                    None => return refused(),
+                }
+            } else {
+                fetched.body
+            };
             let mut response = Response::builder().status(fetched.status);
             if let Some(content_type) = fetched.content_type {
                 response = response.header("content-type", content_type);
             }
-            Ok(response.body(AsyncBody::from(fetched.body))?)
+            Ok(response.body(AsyncBody::from(body))?)
         })
     }
+}
+
+/// `body`, which [`is_safe_image`] allows, as GPUI may draw it: a raster
+/// image untouched, an SVG rendered by a helper process. `None` if the
+/// helper refused it or couldn't render it in time.
+async fn renderable(body: Vec<u8>) -> Option<Vec<u8>> {
+    if !svg_process::needs_helper(&body) {
+        return Some(body);
+    }
+    let raster = svg_process::helpers()?.rasterize(body).await;
+    if raster.is_none() {
+        log::warn!("not showing an SVG image its helper refused or couldn't render in time");
+    }
+    raster
 }
 
 /// A failed response, which GPUI shows as a picture that can't be shown.
@@ -91,6 +121,16 @@ fn refused() -> anyhow::Result<Response<AsyncBody>> {
 /// uploads a new picture, so the image cache never serves a stale one.
 pub fn avatar_url(client: &Client, user: &str, version: i64) -> String {
     format!("{}api/v4/users/{user}/image?_={version}", client.server())
+}
+
+/// The user and picture version `url` was made for by [`avatar_url`], if
+/// it is one of `client`'s profile pictures.
+pub fn avatar_version<'a>(client: &Client, url: &'a str) -> Option<(&'a str, i64)> {
+    let rest = url
+        .strip_prefix(client.server().as_str())?
+        .strip_prefix("api/v4/users/")?;
+    let (user, version) = rest.split_once("/image?_=")?;
+    Some((user, version.parse().ok()?))
 }
 
 /// Whether `url` is a server image whose content never changes, and so may
@@ -116,7 +156,7 @@ pub(crate) struct PictureClient;
 #[cfg(test)]
 impl PictureClient {
     /// A 2 × 2 red PNG.
-    const PNG: [u8; 74] = [
+    pub(crate) const PNG: [u8; 74] = [
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 6,
         0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 17, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
         31, 132, 25, 96, 12, 0, 71, 202, 7, 249, 103, 89, 110, 183, 0, 0, 0, 0, 73, 69, 78, 68,
@@ -156,10 +196,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raster_images_reach_gpui_untouched() {
+        let png = PictureClient::PNG.to_vec();
+        assert!(!svg_process::needs_helper(&png));
+        let body = futures::executor::block_on(renderable(png.clone()));
+        assert_eq!(body, Some(png));
+    }
+
+    #[test]
     fn only_server_images_that_never_change_are_kept() {
         let client = Client::new_unverified("https://chat.example.com", "token").unwrap();
         let server = "https://chat.example.com/api/v4";
         assert!(never_changes(&client, &avatar_url(&client, "u1", 7)));
+        assert_eq!(
+            avatar_version(&client, &avatar_url(&client, "u1", 7)),
+            Some(("u1", 7))
+        );
         assert!(never_changes(
             &client,
             &format!("{server}/files/f1/preview")

@@ -54,7 +54,7 @@ impl SearchView {
                         .filter(|post| this.session.read(cx).is_saved(&post.id))
                         .cloned()
                         .collect();
-                    this.replace_collection_rows(rows);
+                    this.replace_collection_rows(rows, cx);
                     this.load_collection(0, cx);
                 }
                 SessionEvent::PostChanged(post) => {
@@ -79,7 +79,8 @@ impl SearchView {
 
     /// Preserve selection and the visible post (including its fractional offset),
     /// rather than scrolling to the selection when rows arrive or disappear.
-    fn replace_collection_rows(&mut self, rows: Vec<Arc<Post>>) {
+    /// Pictures of authors no row shows any more are freed.
+    fn replace_collection_rows(&mut self, rows: Vec<Arc<Post>>, cx: &mut Context<Self>) {
         let selected = self
             .selected
             .and_then(|ix| self.results.get(ix))
@@ -107,6 +108,7 @@ impl SearchView {
             .unwrap_or_else(|| offset.item_ix.min(self.results.len().saturating_sub(1)));
         self.collection_scroll.reset(self.results.len());
         self.collection_scroll.scroll_to(offset);
+        self.release_pictures(cx);
     }
 
     fn prune_collection_channels(&mut self, cx: &mut Context<Self>) {
@@ -123,7 +125,7 @@ impl SearchView {
             self._search = None;
             self.loading_more = false;
             self.next_page = None;
-            self.replace_collection_rows(Vec::new());
+            self.replace_collection_rows(Vec::new(), cx);
             cx.emit(SearchEvent::Close);
             cx.notify();
             return;
@@ -135,7 +137,7 @@ impl SearchView {
             .cloned()
             .collect();
         if rows.len() != self.results.len() {
-            self.replace_collection_rows(rows);
+            self.replace_collection_rows(rows, cx);
             cx.notify();
         }
     }
@@ -232,7 +234,7 @@ impl SearchView {
                         rows.sort_by(|a, b| {
                             b.create_at.cmp(&a.create_at).then_with(|| a.id.cmp(&b.id))
                         });
-                        this.replace_collection_rows(rows);
+                        this.replace_collection_rows(rows, cx);
                         this.collection_pages = depth;
                         this.next_page = next;
                         this.results_scope = Some(SearchScope::Team);

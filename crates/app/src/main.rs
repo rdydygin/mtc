@@ -38,10 +38,13 @@ mod sidebar;
 mod skeleton;
 mod sso;
 mod status;
+mod svg_helper;
+mod svg_process;
 mod switcher;
 mod threads_view;
 mod time;
 mod timeline_view;
+mod typing_indicator;
 mod update;
 mod workspace;
 
@@ -51,6 +54,9 @@ use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
 use crate::app_root::AppRoot;
 
 fn main() {
+    // A helper renders one untrusted SVG and exits, before the app starts.
+    svg_helper::run_if_requested();
+
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn,mtc=info,session=info,mattermost=info"),
     )
@@ -122,6 +128,9 @@ fn main() {
         // background; finish before the process ends.
         // Run the flush future after all quit hooks have captured composers.
         cx.on_app_quit(|_| async {
+            if let Some(helpers) = svg_process::helpers() {
+                helpers.close();
+            }
             persist::flush();
             cache::flush();
         })

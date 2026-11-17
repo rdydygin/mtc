@@ -158,6 +158,9 @@ pub struct EmojiStore {
     /// The server can't look up names in a batch; look up one at a time.
     one_by_one: bool,
     flush_task: Option<Task<()>>,
+    /// Counts changes to `custom`, so what is worked out from it can tell
+    /// when it is out of date; lookups and loading don't move it.
+    revision: u64,
 }
 
 impl EmojiStore {
@@ -172,11 +175,17 @@ impl EmojiStore {
             complete: false,
             one_by_one: false,
             flush_task: None,
+            revision: 0,
         }
     }
 
     pub fn custom(&self) -> &CustomEmojis {
         &self.custom
+    }
+
+    /// Changes whenever a custom emoji is added, replaced or dropped.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Look up any custom emoji among `names` not already known or asked
@@ -340,6 +349,7 @@ impl EmojiStore {
         for (name, url) in new {
             self.custom.insert(name, url);
         }
+        self.revision += 1;
         cx.notify();
     }
 
@@ -369,6 +379,7 @@ impl EmojiStore {
             }
         }
         if added {
+            self.revision += 1;
             cx.notify();
         }
     }
@@ -385,6 +396,7 @@ impl EmojiStore {
             }
         }
         if changed {
+            self.revision += 1;
             cx.notify();
         }
     }
