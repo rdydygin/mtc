@@ -63,7 +63,14 @@ struct PendingFile {
     name: SharedString,
     size: u64,
     source: FileSource,
-    is_image: bool,
+    /// The picture the attachment shows, if it is one: bytes the app holds,
+    /// whose raster format was read from those same bytes. GPUI is never
+    /// given a path to read again, which by then could hold an SVG it would
+    /// render in the app (see `crate::svg_process`). Without one the
+    /// attachment shows a file icon.
+    preview: Option<Arc<Image>>,
+    /// Reading the preview; dropped, and so stopped, with the file.
+    _preview: Option<Task<()>>,
     status: AttachmentStatus,
     uploaded: Option<FileInfo>,
     error: Option<SharedString>,
@@ -310,9 +317,33 @@ impl Composer {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "file".into());
-            let is_image = image_extension(&name);
-            self.add_file(name, metadata.len(), FileSource::Path(path), is_image, cx);
+            let wants_preview = image_extension(&name);
+            let source = FileSource::Path(path.clone());
+            let local_id = self.add_file(name, metadata.len(), source, None, cx);
+            if wants_preview {
+                self.load_preview(local_id, path, cx);
+            }
         }
+    }
+
+    /// Read the picture at `path` once, off the UI thread, and show those
+    /// bytes if they are a raster image.
+    fn load_preview(&mut self, local_id: u64, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(file) = self.files.iter_mut().find(|f| f.local_id == local_id) else {
+            return;
+        };
+        file._preview = Some(cx.spawn(async move |this, cx| {
+            let preview = cx
+                .background_spawn(async move { read_preview(&path) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(file) = this.files.iter_mut().find(|f| f.local_id == local_id) {
+                    file.preview = preview;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Attach images from a paste; returns whether the paste was handled.
@@ -326,13 +357,11 @@ impl Composer {
                 ClipboardEntry::Image(image) => {
                     let name = format!("Pasted image.{}", format_extension(image.format));
                     let size = image.bytes.len() as u64;
-                    self.add_file(
-                        name,
-                        size,
-                        FileSource::Pasted(Arc::new(image.clone())),
-                        true,
-                        cx,
-                    );
+                    let image = Arc::new(image.clone());
+                    // GPUI decodes a pasted image by the format it claims.
+                    let preview =
+                        (raster_format(&image.bytes) == Some(image.format)).then(|| image.clone());
+                    self.add_file(name, size, FileSource::Pasted(image), preview, cx);
                     handled = true;
                 }
                 ClipboardEntry::ExternalPaths(paths) => {
@@ -350,9 +379,9 @@ impl Composer {
         name: String,
         size: u64,
         source: FileSource,
-        is_image: bool,
+        preview: Option<Arc<Image>>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> u64 {
         let local_id = self.next_file_id;
         self.next_file_id += 1;
         self.files.push(PendingFile {
@@ -360,7 +389,8 @@ impl Composer {
             name: name.into(),
             size,
             source,
-            is_image,
+            preview,
+            _preview: None,
             status: AttachmentStatus::Uploading,
             uploaded: None,
             error: None,
@@ -368,6 +398,7 @@ impl Composer {
             _upload: None,
         });
         self.upload(local_id, cx);
+        local_id
     }
 
     fn upload(&mut self, local_id: u64, cx: &mut Context<Self>) {
@@ -382,7 +413,7 @@ impl Composer {
         file._upload = Some(cx.spawn(async move |this, cx| {
             let bytes = match source {
                 FileSource::Path(path) => cx
-                    .background_spawn(async move { std::fs::read(path) })
+                    .background_spawn(async move { read_upload(&path) })
                     .await
                     .map_err(anyhow::Error::from),
                 FileSource::Pasted(image) => Ok(image.bytes.clone()),
@@ -1241,12 +1272,9 @@ fn render_file(
     cx: &gpui_kit::App,
 ) -> impl IntoElement + use<> {
     let local_id = file.local_id;
-    let media = match (&file.source, file.is_image) {
-        (FileSource::Pasted(image), _) => {
-            AttachmentMedia::new().src(held_image(&file.images, image.clone()))
-        }
-        (FileSource::Path(path), true) => AttachmentMedia::new().src(path.clone()),
-        (FileSource::Path(_), false) => AttachmentMedia::new().child(Icon::new(IconName::File)),
+    let media = match &file.preview {
+        Some(image) => AttachmentMedia::new().src(held_image(&file.images, image.clone())),
+        None => AttachmentMedia::new().child(Icon::new(IconName::File)),
     };
     let description: SharedString = format_size(file.size).into();
     let remove = entity.clone();
@@ -1292,6 +1320,90 @@ fn image_extension(name: &str) -> bool {
     .any(|ext| lower.ends_with(ext))
 }
 
+/// The most bytes read to preview a picked file: as many as a picture
+/// from the server may have.
+const MAX_PREVIEW_BYTES: usize = crate::svg_process::MAX_INPUT;
+
+/// `path` opened for reading if it is, by then, a regular file. A picked
+/// file can since have been replaced by one that never ends or never
+/// answers; opening one doesn't wait, and it is refused before any read.
+///
+/// On Unix opening a FIFO waits for a writer unless it is non-blocking,
+/// which changes nothing for a regular file. On Windows a pipe reached
+/// through a link opens at once, or fails, and std's `is_file` accepts it,
+/// so the handle must be a disk file.
+fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    #[cfg(windows)]
+    let regular = {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
+        // SAFETY: the handle is open for as long as `file` lives.
+        unsafe { GetFileType(file.as_raw_handle()) == FILE_TYPE_DISK }
+    };
+    #[cfg(not(windows))]
+    let regular = file.metadata()?.is_file();
+    if !regular {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// The whole file at `path`, to upload.
+fn read_upload(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    open_regular_file(path)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// The file at `path`, read once and held, if it is a raster image of at
+/// most [`MAX_PREVIEW_BYTES`].
+fn read_preview(path: &std::path::Path) -> Option<Arc<Image>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    open_regular_file(path)
+        .ok()?
+        .take(MAX_PREVIEW_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_PREVIEW_BYTES {
+        return None;
+    }
+    let format = raster_format(&bytes)?;
+    Some(Arc::new(Image::from_bytes(format, bytes)))
+}
+
+/// The raster format `bytes` are in, if GPUI decodes it. GPUI renders any
+/// other picture as SVG, in the app, whatever its name or claimed format.
+///
+/// GPUI decodes WebP from bytes as a still image: an animated one shows its
+/// first frame.
+fn raster_format(bytes: &[u8]) -> Option<ImageFormat> {
+    use image::ImageFormat as Raster;
+    Some(match image::guess_format(bytes).ok()? {
+        Raster::Png => ImageFormat::Png,
+        Raster::Jpeg => ImageFormat::Jpeg,
+        Raster::WebP => ImageFormat::Webp,
+        Raster::Gif => ImageFormat::Gif,
+        Raster::Bmp => ImageFormat::Bmp,
+        Raster::Tiff => ImageFormat::Tiff,
+        Raster::Ico => ImageFormat::Ico,
+        Raster::Pnm => ImageFormat::Pnm,
+        _ => return None,
+    })
+}
+
 fn format_extension(format: ImageFormat) -> &'static str {
     match format {
         ImageFormat::Jpeg => "jpg",
@@ -1331,6 +1443,218 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    /// Gradients that inherit from each other in a cycle: usvg, GPUI's SVG
+    /// renderer, follows them forever.
+    const HANG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><linearGradient id="a" xlink:href="#b"/><linearGradient id="b" xlink:href="#c"/><linearGradient id="c" xlink:href="#b"/><rect width="9" height="9" fill="url(#a)"/></svg>"##;
+
+    fn png() -> Vec<u8> {
+        use image::ImageEncoder as _;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[255; 16], 2, 2, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        png
+    }
+
+    fn scratch_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("mtc-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn previews_only_bytes_that_are_a_raster_image() {
+        let directory = scratch_directory("preview-bytes");
+        let disguised = directory.join("disguised.png");
+        std::fs::write(&disguised, HANG).unwrap();
+        let picture = directory.join("picture.png");
+        std::fs::write(&picture, png()).unwrap();
+        assert!(read_preview(&disguised).is_none());
+        let preview = read_preview(&picture).unwrap();
+        assert_eq!(
+            (preview.format(), preview.bytes()),
+            (ImageFormat::Png, &png()[..])
+        );
+        assert!(read_preview(&directory.join("missing.png")).is_none());
+        assert_eq!(raster_format(HANG), None);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A picked picture is read once; replacing the file afterwards, here
+    /// with an SVG that would hang GPUI's renderer, changes nothing GPUI
+    /// draws, and GPUI never reads the path itself.
+    #[gpui_kit::test]
+    fn a_picked_picture_shows_the_bytes_it_was_admitted_with(cx: &mut TestAppContext) {
+        let (handle, composer) = open_composer(cx);
+        // Attaching also starts an upload, which fails on the I/O runtime.
+        cx.executor().allow_parking();
+        let directory = scratch_directory("preview-swap");
+        let path = directory.join("picture.png");
+        std::fs::write(&path, png()).unwrap();
+        composer.update(cx, |c, cx| c.attach_paths([path.clone()], cx));
+        wait_until(cx, |cx| {
+            composer.read_with(cx, |c, _| c.files[0].preview.is_some())
+        });
+
+        std::fs::write(&path, HANG).unwrap();
+        let redraw = |cx: &mut TestAppContext| {
+            cx.update(|cx| handle.update(cx, |_, window, _| window.refresh()).unwrap());
+            cx.run_until_parked();
+        };
+        redraw(cx);
+        let preview = composer.read_with(cx, |c, _| c.files[0].preview.clone().unwrap());
+        assert_eq!(
+            (preview.format(), preview.bytes()),
+            (ImageFormat::Png, &png()[..])
+        );
+        // GPUI draws the bytes read, decoded into the file's own store.
+        wait_until(cx, |cx| {
+            cx.update(|cx| handle.update(cx, |_, window, _| window.refresh()).unwrap());
+            cx.run_until_parked();
+            composer.read_with(cx, |c, cx| {
+                c.files[0].images.read(cx).get_held(&preview).is_some()
+            })
+        });
+        cx.update(|cx| {
+            assert!(!gpui_kit::ImageSource::from(path.clone()).is_asset_cached(cx));
+        });
+
+        // Picked again, the file is read as the SVG it now is: no preview.
+        composer.update(cx, |c, cx| c.attach_paths([path.clone()], cx));
+        redraw(cx);
+        composer.read_with(cx, |c, _| assert!(c.files[1].preview.is_none()));
+        cx.update(|cx| assert!(!gpui_kit::ImageSource::from(path.clone()).is_asset_cached(cx)));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn previews_files_up_to_the_size_limit() {
+        let directory = scratch_directory("preview-limit");
+        let mut bytes = png();
+        bytes.resize(MAX_PREVIEW_BYTES, 0);
+        let largest = directory.join("largest.png");
+        std::fs::write(&largest, &bytes).unwrap();
+        bytes.push(0);
+        let larger = directory.join("larger.png");
+        std::fs::write(&larger, &bytes).unwrap();
+        assert_eq!(
+            read_preview(&largest).unwrap().bytes().len(),
+            MAX_PREVIEW_BYTES
+        );
+        assert!(read_preview(&larger).is_none());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn raster_formats_are_the_ones_gpui_decodes() {
+        assert_eq!(raster_format(&png()), Some(ImageFormat::Png));
+        assert_eq!(raster_format(ICO), Some(ImageFormat::Ico));
+        assert_eq!(
+            raster_format(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some(ImageFormat::Webp)
+        );
+        assert_eq!(raster_format(b"GIF89a"), Some(ImageFormat::Gif));
+        assert_eq!(raster_format(HANG), None);
+        assert_eq!(raster_format(b""), None);
+    }
+
+    /// The start of an icon file: one 1 × 1 picture.
+    const ICO: &[u8] = b"\0\0\x01\0\x01\0\x01\x01\0\0\x01\0\x20\0";
+
+    #[gpui_kit::test]
+    fn a_pasted_picture_previews_only_if_it_is_what_it_claims(cx: &mut TestAppContext) {
+        let (_, composer) = open_composer(cx);
+        // Each paste also starts an upload, which fails on the I/O runtime.
+        cx.executor().allow_parking();
+        let pastes = [
+            (ImageFormat::Png, png(), true),
+            (ImageFormat::Ico, ICO.to_vec(), true),
+            (ImageFormat::Png, HANG.to_vec(), false),
+            (ImageFormat::Svg, HANG.to_vec(), false),
+            (ImageFormat::Jpeg, png(), false),
+        ];
+        for (format, bytes, _) in &pastes {
+            let item = ClipboardItem::new_image(&Image::from_bytes(*format, bytes.clone()));
+            composer.update(cx, |c, cx| assert!(c.attach_pasted(&item, cx)));
+        }
+        composer.read_with(cx, |c, _| {
+            let shown: Vec<_> = c.files.iter().map(|f| f.preview.is_some()).collect();
+            let expected: Vec<_> = pastes.iter().map(|(_, _, shown)| *shown).collect();
+            assert_eq!(shown, expected);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn removing_a_file_stops_its_preview(cx: &mut TestAppContext) {
+        let (_, composer) = open_composer(cx);
+        cx.executor().allow_parking();
+        let directory = scratch_directory("preview-removed");
+        let path = directory.join("picture.png");
+        std::fs::write(&path, png()).unwrap();
+        // The read is still to run when the file goes.
+        composer.update(cx, |c, cx| {
+            c.attach_paths([path.clone()], cx);
+            assert!(c.files[0]._preview.is_some());
+            let local_id = c.files[0].local_id;
+            c.remove_file(local_id, cx);
+        });
+        cx.run_until_parked();
+        composer.read_with(cx, |c, _| assert!(c.files.is_empty()));
+        // Later files still get theirs.
+        composer.update(cx, |c, cx| c.attach_paths([path.clone()], cx));
+        wait_until(cx, |cx| {
+            composer.read_with(cx, |c, _| c.files[0].preview.is_some())
+        });
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a valid C string for the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    /// Opening a FIFO for reading waits for a writer that never comes,
+    /// unless it doesn't wait.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_waiting_for_it() {
+        let directory = scratch_directory("preview-fifo");
+        let fifo = directory.join("picture.png");
+        make_fifo(&fifo);
+        let (done, results) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = done.send((read_preview(&path).is_none(), read_upload(&path).is_err()));
+        });
+        let refused = results.recv_timeout(Duration::from_secs(20));
+        assert_eq!(refused, Ok((true, true)), "a read waited on the FIFO");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A picked file replaced by a FIFO before it is read: the preview and
+    /// the upload both give up at once.
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    fn a_file_swapped_for_a_fifo_fails_at_once(cx: &mut TestAppContext) {
+        let (_, composer) = open_composer(cx);
+        let directory = scratch_directory("preview-fifo-swap");
+        let path = directory.join("picture.png");
+        std::fs::write(&path, png()).unwrap();
+        composer.update(cx, |c, cx| c.attach_paths([path.clone()], cx));
+        std::fs::remove_file(&path).unwrap();
+        make_fifo(&path);
+        cx.run_until_parked();
+        composer.read_with(cx, |c, _| {
+            let file = &c.files[0];
+            assert!(file.preview.is_none());
+            assert_eq!(file.status, AttachmentStatus::Failed);
+        });
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1861,7 +2185,8 @@ mod tests {
                         name: format!("draft-{id}.txt").into(),
                         size: 10,
                         source: FileSource::Path("draft.txt".into()),
-                        is_image: false,
+                        preview: None,
+                        _preview: None,
                         status: match id {
                             0 => AttachmentStatus::Uploading,
                             1 => AttachmentStatus::Failed,
@@ -1899,13 +2224,19 @@ mod tests {
     }
 
     /// An uploaded file, as one that finished uploading, with its own store.
-    fn uploaded_file(local_id: u64, source: FileSource, cx: &mut gpui_kit::App) -> PendingFile {
+    fn uploaded_file(
+        local_id: u64,
+        source: FileSource,
+        preview: Arc<Image>,
+        cx: &mut gpui_kit::App,
+    ) -> PendingFile {
         PendingFile {
             local_id,
             name: format!("picture-{local_id}.png").into(),
             size: 74,
             source,
-            is_image: true,
+            preview: Some(preview),
+            _preview: None,
             status: AttachmentStatus::Complete,
             uploaded: Some(FileInfo::default()),
             error: None,
@@ -1926,13 +2257,24 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("mtc-upload-thumbnail-{}.png", std::process::id()));
         std::fs::write(&path, &png).unwrap();
-        let picked = Resource::Path(path.clone().into());
+        let picked_path = Resource::Path(path.clone().into());
+        // A picked file previews from the bytes read once, held like a
+        // pasted picture; its path is never handed to GPUI.
+        let picked = Arc::new(Image::from_bytes(ImageFormat::Png, png.clone()));
         let pasted = Arc::new(Image::from_bytes(ImageFormat::Png, png));
         let stores = composer.update(cx, |c, cx| {
-            c.files
-                .push(uploaded_file(0, FileSource::Path(path.clone()), cx));
-            c.files
-                .push(uploaded_file(1, FileSource::Pasted(pasted.clone()), cx));
+            c.files.push(uploaded_file(
+                0,
+                FileSource::Path(path.clone()),
+                picked.clone(),
+                cx,
+            ));
+            c.files.push(uploaded_file(
+                1,
+                FileSource::Pasted(pasted.clone()),
+                pasted.clone(),
+                cx,
+            ));
             cx.notify();
             [c.files[0].images.clone(), c.files[1].images.clone()]
         });
@@ -1940,12 +2282,16 @@ mod tests {
             let (stores, picked, pasted) = (stores.clone(), picked.clone(), pasted.clone());
             move |cx| {
                 vec![
-                    stores[0].read(cx).get(&picked),
+                    stores[0].read(cx).get_held(&picked),
                     stores[1].read(cx).get_held(&pasted),
                 ]
             }
         });
-        assert!(!cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&picked)));
+        assert!(!cx.update(|cx| cx.has_asset::<ImgResourceLoader>(&picked_path)));
+        assert!(
+            !cx.update(|cx| picked.is_asset_cached(cx)),
+            "a picked picture stays out of the app-wide store"
+        );
         assert!(
             !cx.update(|cx| pasted.is_asset_cached(cx)),
             "a pasted picture stays out of the app-wide store"
