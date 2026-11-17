@@ -78,6 +78,11 @@ pub fn rasterize(svg: &[u8]) -> Option<Vec<u8>> {
     if !needs_helper(svg) || !is_safe_image(svg) {
         return None;
     }
+    render(svg)
+}
+
+/// `svg` as [`rasterize`] draws it, without checking it first.
+fn render(svg: &[u8]) -> Option<Vec<u8>> {
     let renderer = SvgRenderer::new(Arc::new(AppAssets));
     let parsed = renderer.parse_svg(svg).ok()?;
     // What GPUI's image loader calls, which draws at twice the size.
@@ -189,10 +194,29 @@ mod tests {
     #[test]
     fn a_deep_reference_chain_renders_on_the_render_stack() {
         // Drawn on this test thread's 2 MiB stack, this chain overflows it.
+        // The image guard refuses it; the stack is what's under test.
         let svg = clip_chain(2000);
-        assert!(is_safe_image(&svg));
-        let png = on_render_stack(move || rasterize(&svg)).flatten().unwrap();
+        assert!(!is_safe_image(&svg));
+        let png = on_render_stack(move || render(&svg)).flatten().unwrap();
         assert_eq!(png_size(&png), (8, 8));
+    }
+
+    /// What the integration tests send the real helper: the deepest chain
+    /// the guard lets through, which overflows a 1 MiB thread, and a
+    /// document it lets through that usvg never finishes.
+    #[test]
+    fn the_helper_tests_documents_pass_the_guard() {
+        use crate::svg_process::test_svgs::{DEEPEST_LEVELS, DEEPEST_LINKS, hang, pattern_chain};
+        assert!(is_safe_image(&pattern_chain(DEEPEST_LINKS, DEEPEST_LEVELS)));
+        assert!(!is_safe_image(&pattern_chain(
+            DEEPEST_LINKS + 1,
+            DEEPEST_LEVELS
+        )));
+        let png = on_render_stack(|| rasterize(&pattern_chain(DEEPEST_LINKS, DEEPEST_LEVELS)))
+            .flatten()
+            .unwrap();
+        assert_eq!(png_size(&png), (8, 8));
+        assert!(is_safe_image(&hang()));
     }
 
     #[test]

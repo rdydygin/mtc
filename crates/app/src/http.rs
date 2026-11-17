@@ -71,7 +71,7 @@ impl HttpClient for ServerHttpClient {
             let fetched = client.fetch(&uri).await?;
             if !is_safe_image(&fetched.body) {
                 log::warn!(
-                    "not showing an SVG image that reads local files, nests compressed SVG, or is too costly to parse"
+                    "not showing an SVG image that reads local files, nests compressed SVG, loops through its own references, or is too costly to parse"
                 );
                 return refused();
             }

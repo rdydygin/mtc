@@ -21,11 +21,11 @@ use futures::{
     future::{Either, join_all, select},
 };
 use gpui_kit::{AssetSource, RenderImage, SharedString, SvgRenderer};
-use svg_process::{GRACE, HELPER_ARG, Helpers, MAX_RUNNING, TIMEOUT, wrap};
-
-/// Gradients that inherit from each other in a cycle, `a → b → c → b`:
-/// usvg follows the links forever.
-const HANG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><linearGradient id="a" xlink:href="#b"/><linearGradient id="b" xlink:href="#c"/><linearGradient id="c" xlink:href="#b"/><rect width="9" height="9" fill="url(#a)"/></svg>"##;
+use svg_process::{
+    GRACE, HELPER_ARG, Helpers, MAX_RUNNING, TIMEOUT,
+    test_svgs::{DEEPEST_LEVELS, DEEPEST_LINKS, hang, pattern_chain},
+    wrap,
+};
 
 /// Shapes with soft edges and translucent paint, so that alpha survives the
 /// trip through the helper only if handled right.
@@ -90,20 +90,12 @@ fn an_svg_drawn_by_the_helper_matches_gpui_drawing_it() {
 
 #[test]
 fn a_deep_reference_chain_renders_in_the_helper() {
-    // About a kilobyte of stack a link: more than a 1 MiB main thread has,
-    // as on Windows, well within the helper's render stack.
-    let mut svg = String::from(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><clipPath id="c0"><rect width="4" height="4"/></clipPath>"#,
-    );
-    for i in 1..=2000 {
-        svg.push_str(&format!(
-            r#"<clipPath id="c{i}" clip-path="url(#c{})"><rect width="4" height="4"/></clipPath>"#,
-            i - 1
-        ));
-    }
-    svg.push_str(r##"<rect width="4" height="4" fill="#f00" clip-path="url(#c2000)"/></svg>"##);
+    // The deepest drawing the image guard lets through: about 1.5 MiB of
+    // stack, more than a 1 MiB main thread has, as on Windows, well within
+    // the helper's render stack.
+    let svg = pattern_chain(DEEPEST_LINKS, DEEPEST_LEVELS);
     let helpers = helpers(TIMEOUT);
-    let raster = futures::executor::block_on(helpers.rasterize(svg.into_bytes()));
+    let raster = futures::executor::block_on(helpers.rasterize(svg));
     assert!(raster.is_some());
 }
 
@@ -112,7 +104,7 @@ fn a_hanging_svg_times_out_without_holding_a_thread() {
     let helpers = helpers(TIMEOUT);
     // Both are driven on this one thread. Were the hang to hold it, the
     // picture couldn't finish first.
-    let hang = helpers.rasterize(HANG.to_vec()).boxed();
+    let hang = helpers.rasterize(hang()).boxed();
     let picture = helpers.rasterize(PICTURE.to_vec()).boxed();
     let started = Instant::now();
     let Either::Right((picture, hang)) = futures::executor::block_on(select(hang, picture)) else {
@@ -129,7 +121,7 @@ fn a_hanging_svg_times_out_without_holding_a_thread() {
 fn dropping_loads_kills_helpers_and_a_flood_waits_its_turn() {
     // Far longer than the test waits: only dropping can end these.
     let helpers = helpers(Duration::from_secs(600));
-    let mut flood = join_all((0..MAX_RUNNING * 3).map(|_| helpers.rasterize(HANG.to_vec())));
+    let mut flood = join_all((0..MAX_RUNNING * 3).map(|_| helpers.rasterize(hang())));
     // Start them; the runtime drives them from here on.
     futures::executor::block_on(futures::future::poll_fn(|cx| {
         assert!(flood.poll_unpin(cx).is_pending());
@@ -146,7 +138,7 @@ fn dropping_loads_kills_helpers_and_a_flood_waits_its_turn() {
 #[test]
 fn quitting_kills_helpers_and_starts_no_more() {
     let helpers = helpers(Duration::from_secs(600));
-    let mut hang = helpers.rasterize(HANG.to_vec()).boxed();
+    let mut hang = helpers.rasterize(hang()).boxed();
     futures::executor::block_on(futures::future::poll_fn(|cx| {
         assert!(hang.poll_unpin(cx).is_pending());
         Poll::Ready(())
@@ -172,7 +164,7 @@ fn a_helper_ends_itself_when_its_time_is_up() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    helper.stdin.take().unwrap().write_all(HANG).unwrap();
+    helper.stdin.take().unwrap().write_all(&hang()).unwrap();
     let deadline = Instant::now() + TIMEOUT + GRACE + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = helper.try_wait().unwrap() {

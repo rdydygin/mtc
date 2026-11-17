@@ -12,10 +12,19 @@
 //! to text, for one, is resolved only when fonts are loaded. So the check
 //! doesn't ask the renderer. It reads the document the way usvg does and
 //! refuses every reference that could leave it, wherever it appears.
+//!
+//! References within the document can loop. usvg catches only the shortest
+//! loops: a longer one hangs it, or recurses until the stack overflows and
+//! aborts the app, and each short one it repairs costs it another pass over
+//! the document. So the check also refuses every loop usvg could follow,
+//! whether or not anything draws it.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
+
+use crate::svg_process;
 
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
@@ -78,6 +87,7 @@ pub fn is_safe_image(body: &[u8]) -> bool {
     document
         .descendants()
         .all(|node| is_self_contained(&ids, &node))
+        && reference_cost(&document, &ids).is_none()
 }
 
 fn parsing_options<'a>() -> ParsingOptions<'a> {
@@ -88,7 +98,7 @@ fn parsing_options<'a>() -> ParsingOptions<'a> {
 }
 
 /// What would make a document too costly to read: work that grows faster
-/// than its size, in roxmltree's parser or in usvg.
+/// than its size, or never ends, in roxmltree's parser or in usvg.
 #[derive(Debug, PartialEq, Eq)]
 enum Cost {
     /// An entity's value holds markup; see [`Entities::markup`].
@@ -104,6 +114,21 @@ enum Cost {
     /// Copying and searching the namespaces in scope; see
     /// [`Markup::namespace_lookups`] and [`Markup::distinct_namespaces`].
     NamespaceScopes,
+    /// References that loop; see [`References`].
+    ReferenceLoop,
+    /// An `href` chain longer than [`MAX_HREF_CHAIN`].
+    HrefChain,
+    /// Drawing that recurses deeper than [`MAX_RENDER_DEPTH`].
+    RenderDepth,
+    /// Parsing stylesheets and `style` attributes; see
+    /// [`MAX_STYLE_PARSING`].
+    Style,
+    /// Sorting the rules of many stylesheets; see [`MAX_STYLE_SORTING`].
+    StyleSheets,
+    /// Links style rules add; see [`MAX_STYLE_LINKS`].
+    StyleLinks,
+    /// `tref` lookups; see [`MAX_TREF_SEARCH`].
+    TrefLookups,
 }
 
 /// What would make parsing `text` too costly, read in linear time before
@@ -536,15 +561,32 @@ struct Target {
     /// Whether the (first) element is one an `<feImage>` can draw: usvg
     /// keeps it, it can be drawn, and it has a single id-like attribute.
     drawable: bool,
+    /// The id's place among the document's distinct ids, from 0.
+    index: usize,
+}
+
+/// Whether `node` is an SVG element usvg reads, named one of `names`.
+fn svg_element(node: &Node, names: &[&str]) -> bool {
+    node.is_element()
+        && matches!(node.tag_name().namespace(), None | Some(SVG_NS))
+        && names.contains(&node.tag_name().name())
+}
+
+/// The ids `node` carries: every attribute usvg could index it by.
+fn element_ids<'a>(node: &Node<'a, '_>) -> impl Iterator<Item = &'a str> {
+    node.attributes()
+        .filter(|attribute| {
+            attribute.name() == "id"
+                && matches!(
+                    attribute.namespace(),
+                    None | Some(SVG_NS) | Some(XLINK_NS) | Some(XML_NS)
+                )
+        })
+        .map(|attribute| attribute.value())
 }
 
 impl<'a> Ids<'a> {
     fn new(document: &'a Document) -> Self {
-        let svg_element = |node: &Node, names: &[&str]| {
-            node.is_element()
-                && matches!(node.tag_name().namespace(), None | Some(SVG_NS))
-                && names.contains(&node.tag_name().name())
-        };
         // Whether every element above a node is a container usvg keeps as
         // written. Descendants come after their parent, so each node's
         // answer extends its parent's.
@@ -565,22 +607,28 @@ impl<'a> Ids<'a> {
                 .count()
                 == 1;
             let drawable = single_id && parent_kept && svg_element(&node, &DRAWABLE);
-            for attribute in node.attributes() {
-                let recognized = attribute.name() == "id"
-                    && matches!(
-                        attribute.namespace(),
-                        None | Some(SVG_NS) | Some(XLINK_NS) | Some(XML_NS)
-                    );
-                if recognized {
-                    let target = targets.entry(attribute.value()).or_insert(Target {
-                        elements: 0,
-                        drawable,
-                    });
-                    target.elements += 1;
-                }
+            for id in element_ids(&node) {
+                let index = targets.len();
+                let target = targets.entry(id).or_insert(Target {
+                    elements: 0,
+                    drawable,
+                    index,
+                });
+                target.elements += 1;
             }
         }
         Self { targets }
+    }
+
+    /// How many distinct ids the document has.
+    fn len(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// Where `id` is among the document's distinct ids, if any element
+    /// carries it.
+    fn index(&self, id: &str) -> Option<usize> {
+        self.targets.get(id).map(|target| target.index)
     }
 
     /// Whether `id` names exactly one element, one an `<feImage>` can draw.
@@ -588,6 +636,615 @@ impl<'a> Ids<'a> {
         self.targets
             .get(id)
             .is_some_and(|target| target.elements == 1 && target.drawable)
+    }
+}
+
+/// Properties whose `url(…)` usvg looks up among an element's ancestors
+/// when the element doesn't set one: paint, and markers. `marker` is the
+/// CSS shorthand for the other three.
+const INHERITED_LINKS: [&str; 6] = [
+    "fill",
+    "stroke",
+    "marker",
+    "marker-start",
+    "marker-mid",
+    "marker-end",
+];
+
+/// Properties whose `url(…)` applies to the element alone; `inherit` takes
+/// its parent's.
+const OWN_LINKS: [&str; 3] = ["clip-path", "mask", "filter"];
+
+/// Elements whose `href` usvg follows to another element of the document:
+/// `use` and `feImage` draw it; paint servers and filters inherit from it.
+const HREF_FOLLOWERS: [&str; 6] = [
+    "use",
+    "feImage",
+    "linearGradient",
+    "radialGradient",
+    "pattern",
+    "filter",
+];
+
+/// Elements that inherit attributes and content along a chain of `href`s.
+/// usvg walks the chain again for every attribute it resolves, and for a
+/// filter in bounding-box units, on every element the filter applies to.
+const HREF_INHERITORS: [&str; 4] = ["linearGradient", "radialGradient", "pattern", "filter"];
+
+/// Elements usvg reads only for their stops and attributes: it never draws
+/// them, their children or what they inherit.
+const GRADIENTS: [&str; 2] = ["linearGradient", "radialGradient"];
+
+/// The most elements an `href` chain may hold. usvg remembers nothing
+/// along one, so a chain of `n` that `n` gradients start from costs `n²`
+/// steps: 20 000 gradients, each inheriting from the one before, hung it.
+/// Editors link a gradient to the one that holds its stops, rarely through
+/// a third.
+const MAX_HREF_CHAIN: u32 = 16;
+
+/// How deep usvg's drawing may recurse, in levels of nesting, each
+/// reference it follows to draw something counted as [`REFERENCE_DEPTH`]
+/// levels. usvg draws nested elements by recursion, and refuses more than
+/// 1 024 levels of them, so nesting alone stays under this bound. But the
+/// content a reference draws nests from where the reference is: on a 2 MB
+/// thread, a chain of 330 patterns each filling the next overflowed, of
+/// 101 with ten groups in each, of 700 masks, of 1 600 clip paths.
+/// Inheriting from a parent and two references to one element add nothing.
+/// Editors nest a few dozen levels, and follow a reference or two.
+///
+/// At the bound usvg needs about 1.5 MiB of stack, [`LEVEL_STACK`] a
+/// level: more than GPUI's own threads have, as little as 512 KiB on
+/// macOS, so the helper renders on one of [`svg_process::RENDER_STACK`],
+/// about ten times as much. The guard itself recurses nowhere with the
+/// document's depth: roxmltree parses nesting in a loop and entities at
+/// most ten deep, simplecss matches the guard's stand-in two calls deep,
+/// and the reference graph is searched with a stack of its own.
+const MAX_RENDER_DEPTH: u32 = 1024;
+
+/// The stack a level of [`MAX_RENDER_DEPTH`] took usvg, the most of any
+/// kind: a chain of 101 patterns, each drawing the next ten groups deep,
+/// overflowed a 2 MiB thread.
+const LEVEL_STACK: usize = 1536;
+
+const _: () = assert!(
+    MAX_RENDER_DEPTH as usize * LEVEL_STACK * 10 <= svg_process::RENDER_STACK,
+    "the helper's render stack holds the deepest drawing ten times over"
+);
+
+/// The levels of nesting a reference counts as in [`MAX_RENDER_DEPTH`]:
+/// what drawing a pattern or marker costs usvg's stack, about four levels'
+/// worth, the most of any reference.
+const REFERENCE_DEPTH: u32 = 5;
+
+/// The most links style rules may add, summed over the elements each could
+/// apply to; see [`LinkRules`]. Illustrator writes a rule per gradient and
+/// clip path, `.cls-12{fill:url(#linear-gradient-3)}`, for the elements of
+/// that class: a link or two per element.
+const MAX_STYLE_LINKS: usize = 1 << 22;
+
+/// The most work parsing style may take simplecss, which usvg and the
+/// guard both parse stylesheets and `style` attributes with, in bytes
+/// reread; see [`style_parse_cost`]. Measured, a charged byte cost 0.14 to
+/// 0.63 ns, the most on lines without breaks, so at this bound a text takes
+/// a third of a second at most. A sheet of 300 rules on one line, each with
+/// a dash array and three transforms, 57 KB, is charged 290 million and
+/// took 90 ms; Illustrator's one-line sheets are charged this much at about
+/// 1 000 rules.
+const MAX_STYLE_PARSING: usize = 1 << 29;
+
+/// The most work sorting style rules may take usvg, in bytes of stylesheet
+/// sorted. usvg parses every `<style>` into one list of rules, and after
+/// each sorts all the rules gathered so far: `n` sheets cost `n²/2` sheets'
+/// worth. 20 000 one-rule sheets, 540 KB, took it 0.8 seconds; at this
+/// bound, 6 700 such sheets take a tenth of a second. Editors write one to
+/// three sheets, which cost about their length.
+const MAX_STYLE_SORTING: usize = 1 << 28;
+
+/// The most work usvg's `tref` lookups may take, in nodes read: it looks
+/// for each one's target from the start of the document. 50 000 of them in
+/// a megabyte took it five seconds. SVG 2 dropped `tref`, and browsers
+/// never drew it.
+const MAX_TREF_SEARCH: usize = 1 << 24;
+
+/// What would make usvg follow the references within `document` without
+/// end, or too many times: a loop among them, a long `href` chain, or
+/// lookups that cost more than a fixed multiple of the document's size.
+fn reference_cost(document: &Document, ids: &Ids) -> Option<Cost> {
+    let elements: Vec<Node> = document.descendants().filter(Node::is_element).collect();
+    let trefs = elements
+        .iter()
+        .filter(|node| node.tag_name().name() == "tref")
+        .count();
+    if trefs.saturating_mul(document.descendants().count()) > MAX_TREF_SEARCH {
+        return Some(Cost::TrefLookups);
+    }
+    let style_attributes = elements.iter().flat_map(|element| {
+        element
+            .attributes()
+            .filter(|attribute| attribute.name() == "style")
+            .map(|attribute| attribute.value())
+    });
+    let parsing = style_sheets(document)
+        .chain(style_attributes)
+        .fold(0usize, |work, style| {
+            work.saturating_add(style_parse_cost(style))
+        });
+    if parsing > MAX_STYLE_PARSING {
+        return Some(Cost::Style);
+    }
+    let mut gathered = 0usize;
+    let mut sorting = 0usize;
+    for sheet in style_sheets(document) {
+        gathered += sheet.len();
+        sorting = sorting.saturating_add(gathered);
+    }
+    if sorting > MAX_STYLE_SORTING {
+        return Some(Cost::StyleSheets);
+    }
+    let rules = LinkRules::new(document, ids);
+    let mut style_links = 0;
+    for element in &elements {
+        for links in rules.applying(element) {
+            style_links += links.count();
+            if style_links > MAX_STYLE_LINKS {
+                return Some(Cost::StyleLinks);
+            }
+        }
+    }
+    References::new(&elements, ids, &rules).cost()
+}
+
+/// What parsing `text` costs simplecss beyond reading it once, in bytes
+/// reread. Wherever an optional token turns out absent, or a part fails,
+/// simplecss works out a line and column, for an error nobody reads, by
+/// reading the text from its start (`gen_text_pos`). It does so
+///
+/// - after every number without a `%`, looking for a unit: `consume_term`;
+/// - after a `#` without a name, as in `#123`;
+/// - where each value ends: at `;`, `}` or `!`, or at anything a value
+///   can't hold, after which the rest of the block, or of a `style`, is
+///   skipped;
+/// - where a declaration's name, `:` or value is missing, then skipping
+///   the same; so at most three times in a block past its last `;`;
+/// - at an `@` rule, and at an unterminated comment, which ends the text;
+/// - in a selector, which it reads from a copy starting at the selector,
+///   so at the cost of the selector's length.
+///
+/// So each is charged the offset of the byte that starts its term or ends
+/// its value, `}` three times, and the few that a text's last block or
+/// `style` makes past its last such byte, the text's length.
+fn style_parse_cost(text: &str) -> usize {
+    let mut cost = text.len().saturating_mul(4);
+    for_each_style_probe(text, |offset| cost = cost.saturating_add(offset));
+    cost
+}
+
+/// Calls `probe` with the offset of each byte [`style_parse_cost`] charges,
+/// as often as it charges it. A term can start at `+`, `#` or `.`, at a `-`
+/// unless inside a name, and at a digit unless inside a name, a hex color
+/// or a number; a `.` that is a number's first stays in it.
+fn for_each_style_probe(text: &str, mut probe: impl FnMut(usize)) {
+    let in_name = |byte: u8| byte.is_ascii_alphabetic() || byte == b'_' || byte >= 0x80;
+    let mut previous = b' ';
+    // Whether the bytes since the last term start are a number's digits.
+    let mut whole_number = false;
+    for (offset, byte) in text.bytes().enumerate() {
+        let charged = match byte {
+            b'}' => 3,
+            b'#' | b';' | b'!' | b'@' => 1,
+            b'+' => {
+                whole_number = true;
+                1
+            }
+            b'.' => {
+                let starts = !whole_number;
+                whole_number = false;
+                usize::from(starts)
+            }
+            // A hex color stops before `-`, so a number can start there.
+            b'-' => {
+                let starts = !in_name(previous) || previous.is_ascii_hexdigit();
+                whole_number = starts;
+                usize::from(starts)
+            }
+            b'0'..=b'9' => {
+                let starts = !(in_name(previous) || matches!(previous, b'0'..=b'9' | b'.' | b'#'));
+                if starts {
+                    whole_number = true;
+                } else if !previous.is_ascii_digit() {
+                    whole_number = false;
+                }
+                usize::from(starts)
+            }
+            _ => {
+                whole_number = false;
+                0
+            }
+        };
+        for _ in 0..charged {
+            probe(offset);
+        }
+        previous = byte;
+    }
+}
+
+/// The text of every `<style>` usvg reads, as it reads it.
+fn style_sheets<'a>(document: &'a Document) -> impl Iterator<Item = &'a str> {
+    document
+        .descendants()
+        .filter(|node| node.has_tag_name("style"))
+        .filter(|node| matches!(node.attribute("type"), None | Some("text/css")))
+        .filter_map(|node| node.text())
+}
+
+/// The links a list of declarations sets, as the ids they name.
+#[derive(Default)]
+struct Declared {
+    /// Named by properties elements inherit.
+    inherited: Vec<usize>,
+    /// Named by the others.
+    own: Vec<usize>,
+    /// Whether one of the others is set to `inherit`.
+    inherits_own: bool,
+}
+
+impl Declared {
+    fn declare(&mut self, ids: &Ids, name: &str, value: &str) {
+        let targets = if INHERITED_LINKS.contains(&name) {
+            &mut self.inherited
+        } else if OWN_LINKS.contains(&name) {
+            self.inherits_own |= value.trim() == "inherit";
+            &mut self.own
+        } else {
+            return;
+        };
+        targets.extend(url_fragments(value).filter_map(|id| ids.index(id)));
+    }
+
+    /// How many links these add to an element's graph nodes, at least one.
+    fn count(&self) -> usize {
+        1 + self.inherited.len() + self.own.len()
+    }
+}
+
+/// The style rules that set links, from every `<style>` usvg reads, as it
+/// reads them. Each is indexed by what an element needs for the rule's
+/// selector to match: its id, one of its classes or its name, or nothing.
+/// An element gets the links of every rule indexed by what it has, so of
+/// every rule usvg applies to it, and of some it doesn't, without matching
+/// a selector: matching costs up to the selector's length times an
+/// attribute's, for every element.
+#[derive(Default)]
+struct LinkRules {
+    links: Vec<Declared>,
+    by_id: HashMap<String, Vec<usize>>,
+    by_class: HashMap<String, Vec<usize>>,
+    by_name: HashMap<String, Vec<usize>>,
+    anywhere: Vec<usize>,
+}
+
+impl LinkRules {
+    fn new(document: &Document, ids: &Ids) -> Self {
+        let mut rules = Self::default();
+        // One sheet at a time: simplecss sorts every rule gathered so far
+        // after each sheet it parses, and the order doesn't matter here.
+        for text in style_sheets(document) {
+            for rule in simplecss::StyleSheet::parse(text).rules {
+                rules.add(ids, &rule);
+            }
+        }
+        rules
+    }
+
+    fn add(&mut self, ids: &Ids, rule: &simplecss::Rule) {
+        let mut links = Declared::default();
+        for declaration in &rule.declarations {
+            links.declare(ids, declaration.name, declaration.value);
+        }
+        if links.count() == 1 && !links.inherits_own {
+            return;
+        }
+        let at = self.links.len();
+        self.links.push(links);
+        let needs = RefCell::new(Need::Nothing);
+        rule.selector.matches(&Probe::Subject(&needs));
+        match needs.into_inner() {
+            Need::Id(id) => self.by_id.entry(id).or_default().push(at),
+            Need::Class(class) => self.by_class.entry(class).or_default().push(at),
+            Need::Name(name) => self.by_name.entry(name).or_default().push(at),
+            Need::Nothing => self.anywhere.push(at),
+        }
+    }
+
+    /// The links of every rule that could apply to `element`. Ids and
+    /// classes are read as usvg's selectors read them.
+    fn applying(&self, element: &Node) -> impl Iterator<Item = &Declared> {
+        let classes = element.attribute("class").unwrap_or_default().split(' ');
+        let by_id = element
+            .attribute("id")
+            .and_then(|id| self.by_id.get(id))
+            .into_iter()
+            .flatten();
+        let by_class = classes
+            .filter_map(|class| self.by_class.get(class))
+            .flatten();
+        let by_name = self
+            .by_name
+            .get(element.tag_name().name())
+            .into_iter()
+            .flatten();
+        by_id
+            .chain(by_class)
+            .chain(by_name)
+            .chain(&self.anywhere)
+            .map(|&at| &self.links[at])
+    }
+}
+
+/// What a selector needs of the element it matches, from most to least
+/// telling.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Need {
+    Nothing,
+    Name(String),
+    Class(String),
+    Id(String),
+}
+
+/// A stand-in for the element a selector matches, which matches its every
+/// requirement and records the most telling. simplecss reads all of the
+/// selector's last compound against the element first, then recurses into
+/// the element's relatives, once per combinator; the stand-in has one
+/// relative and that has none, so a selector of any length costs two
+/// calls deep. (simplecss doesn't expose a selector's parts.)
+#[derive(Clone, Copy)]
+enum Probe<'a> {
+    Subject(&'a RefCell<Need>),
+    Relative,
+}
+
+impl Probe<'_> {
+    fn relative(&self) -> Option<Self> {
+        match self {
+            Self::Subject(_) => Some(Self::Relative),
+            Self::Relative => None,
+        }
+    }
+
+    fn needs(&self, need: Need) {
+        if let Self::Subject(needs) = self {
+            let mut needs = needs.borrow_mut();
+            if need > *needs {
+                *needs = need;
+            }
+        }
+    }
+}
+
+impl simplecss::Element for Probe<'_> {
+    fn parent_element(&self) -> Option<Self> {
+        self.relative()
+    }
+
+    fn prev_sibling_element(&self) -> Option<Self> {
+        self.relative()
+    }
+
+    fn has_local_name(&self, name: &str) -> bool {
+        self.needs(Need::Name(name.to_string()));
+        true
+    }
+
+    fn attribute_matches(&self, name: &str, operator: simplecss::AttributeOperator) -> bool {
+        // How simplecss reads `#id` and `.class`.
+        match (name, operator) {
+            ("id", simplecss::AttributeOperator::Matches(id)) => self.needs(Need::Id(id.into())),
+            ("class", simplecss::AttributeOperator::Contains(class)) => {
+                self.needs(Need::Class(class.into()))
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn pseudo_class_matches(&self, _: simplecss::PseudoClass) -> bool {
+        true
+    }
+}
+
+/// An element's nodes in [`References`], [`PARTS`] apart: what drawing it
+/// draws, the links it inherits and those it sets for itself, and what its
+/// `href` names.
+const DRAWN: u32 = 0;
+const INHERITED: u32 = 1;
+const OWN: u32 = 2;
+const HREF: u32 = 3;
+const PARTS: u32 = 4;
+
+/// What usvg reads to draw each element, as a graph: a loop in it is a
+/// loop usvg can follow. Drawing an element draws its children and reads
+/// its links, own and inherited; a link reads every element carrying the
+/// id it names, the way usvg resolves it or any other way. That covers
+/// usvg's paint servers, clip paths, masks, filters and markers, the
+/// content `use` and `feImage` draw, and `href` inheritance, including what
+/// stylesheets, `style` attributes, `inherit` and copies made by `use`
+/// contribute. Elements usvg doesn't keep, links it would refuse and
+/// stylesheet rules that don't apply only add nodes and links, so the graph
+/// can have loops usvg doesn't follow, never miss one it does.
+struct References {
+    /// Where each node's links start in `targets`, and where the last ends.
+    starts: Vec<u32>,
+    targets: Vec<u32>,
+    /// Whether each element inherits along `href` chains.
+    inheritors: Vec<bool>,
+}
+
+impl References {
+    fn new(elements: &[Node], ids: &Ids, rules: &LinkRules) -> Self {
+        let nodes = elements.len() as u32 * PARTS;
+        let node = |element: usize, part: u32| element as u32 * PARTS + part;
+        let id_node = |id: &str| ids.index(id).map(|index| nodes + index as u32);
+        let index: HashMap<NodeId, usize> = elements
+            .iter()
+            .enumerate()
+            .map(|(at, element)| (element.id(), at))
+            .collect();
+        let mut links = Vec::new();
+        for (at, element) in elements.iter().enumerate() {
+            let parent = element
+                .parent_element()
+                .and_then(|parent| index.get(&parent.id()).copied());
+            links.push((node(at, DRAWN), node(at, HREF)));
+            if !svg_element(element, &GRADIENTS) {
+                links.extend([INHERITED, OWN].map(|part| (node(at, DRAWN), node(at, part))));
+            }
+            if let Some(parent) = parent {
+                links.push((node(at, INHERITED), node(parent, INHERITED)));
+                if !svg_element(&elements[parent], &GRADIENTS) {
+                    links.push((node(parent, DRAWN), node(at, DRAWN)));
+                }
+            }
+            for id in element_ids(element) {
+                links.extend(id_node(id).map(|id| (id, node(at, DRAWN))));
+            }
+            if HREF_FOLLOWERS.contains(&element.tag_name().name()) {
+                for attribute in element.attributes() {
+                    if attribute.name() == "href"
+                        && let Some(target) = iri_fragment(attribute.value()).and_then(id_node)
+                    {
+                        links.push((node(at, HREF), target));
+                    }
+                }
+            }
+            let mut declared = Declared::default();
+            for attribute in element.attributes() {
+                if attribute.name() == "style" {
+                    for declaration in simplecss::DeclarationTokenizer::from(attribute.value()) {
+                        declared.declare(ids, declaration.name, declaration.value);
+                    }
+                } else {
+                    declared.declare(ids, attribute.name(), attribute.value());
+                }
+            }
+            for declared in std::iter::once(&declared).chain(rules.applying(element)) {
+                if declared.inherits_own
+                    && let Some(parent) = parent
+                {
+                    links.push((node(at, OWN), node(parent, OWN)));
+                }
+                for (part, ids) in [(INHERITED, &declared.inherited), (OWN, &declared.own)] {
+                    links.extend(ids.iter().map(|&id| (node(at, part), nodes + id as u32)));
+                }
+            }
+        }
+        // Grouped by source, in linear time.
+        let all = nodes as usize + ids.len();
+        let mut starts = vec![0u32; all + 1];
+        for &(from, _) in &links {
+            starts[from as usize + 1] += 1;
+        }
+        for at in 0..all {
+            starts[at + 1] += starts[at];
+        }
+        let mut next = starts.clone();
+        let mut targets = vec![0; links.len()];
+        for (from, to) in links {
+            targets[next[from as usize] as usize] = to;
+            next[from as usize] += 1;
+        }
+        let inheritors = elements
+            .iter()
+            .map(|element| svg_element(element, &HREF_INHERITORS))
+            .collect();
+        Self {
+            starts,
+            targets,
+            inheritors,
+        }
+    }
+
+    fn links(&self, node: u32) -> &[u32] {
+        &self.targets[self.starts[node as usize] as usize..self.starts[node as usize + 1] as usize]
+    }
+
+    /// Whether the graph has a loop, an `href` chain longer than
+    /// [`MAX_HREF_CHAIN`] or drawing deeper than [`MAX_RENDER_DEPTH`]: one
+    /// depth-first search, each node and link visited once. A node is
+    /// finished only after everything it links to, so the longest chain and
+    /// the deepest drawing from it are known then.
+    fn cost(&self) -> Option<Cost> {
+        const NEW: u8 = 0;
+        const OPEN: u8 = 1;
+        const DONE: u8 = 2;
+        let all = self.starts.len() - 1;
+        let elements = self.inheritors.len() as u32 * PARTS;
+        let mut state = vec![NEW; all];
+        // The most elements an `href` chain from each node holds.
+        let mut chain = vec![0u32; all];
+        // How deep drawing from each node recurses.
+        let mut depth = vec![0u32; all];
+        let mut stack: Vec<(u32, usize)> = Vec::new();
+        for root in 0..all as u32 {
+            if state[root as usize] != NEW {
+                continue;
+            }
+            state[root as usize] = OPEN;
+            stack.push((root, 0));
+            while let Some((node, next)) = stack.last_mut() {
+                let node = *node;
+                if let Some(&target) = self.links(node).get(*next) {
+                    *next += 1;
+                    match state[target as usize] {
+                        OPEN => return Some(Cost::ReferenceLoop),
+                        NEW => {
+                            state[target as usize] = OPEN;
+                            stack.push((target, 0));
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                stack.pop();
+                state[node as usize] = DONE;
+                chain[node as usize] = if node >= elements || node % PARTS == HREF {
+                    // An id, or an `href`: the longest chain it leads into.
+                    self.links(node)
+                        .iter()
+                        .map(|&target| chain[target as usize])
+                        .max()
+                        .unwrap_or(0)
+                } else if node % PARTS == DRAWN && self.inheritors[(node / PARTS) as usize] {
+                    1 + chain[(node + HREF) as usize]
+                } else {
+                    0
+                };
+                if chain[node as usize] > MAX_HREF_CHAIN {
+                    return Some(Cost::HrefChain);
+                }
+                // A reference recurses, as does drawing a child; nothing
+                // else does.
+                let draws_child = |target: u32| {
+                    node < elements && node % PARTS == DRAWN && target % PARTS == DRAWN
+                };
+                depth[node as usize] = self
+                    .links(node)
+                    .iter()
+                    .map(|&target| {
+                        let step = if target >= elements {
+                            REFERENCE_DEPTH
+                        } else {
+                            u32::from(draws_child(target))
+                        };
+                        step + depth[target as usize]
+                    })
+                    .max()
+                    .unwrap_or(0);
+                if depth[node as usize] > MAX_RENDER_DEPTH {
+                    return Some(Cost::RenderDepth);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -634,12 +1291,51 @@ fn is_local_reference(value: &str) -> bool {
 /// only fragment `<feImage>` doesn't treat as a path. Parses the link as
 /// svgtypes' IRI does; `ids` records ids as usvg's tree does.
 fn links_to_drawable(ids: &Ids, value: &str) -> bool {
-    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
-    let Some(rest) = value.trim_start_matches(is_space).strip_prefix('#') else {
-        return false;
-    };
+    iri_fragment(value).is_some_and(|id| ids.is_drawable(id))
+}
+
+/// The id an `href` names, read as svgtypes' IRI reads it: after optional
+/// whitespace, `#` and the id, up to a space, with only whitespace after.
+fn iri_fragment(value: &str) -> Option<&str> {
+    let rest = skip_space(value).strip_prefix('#')?;
     let (id, tail) = rest.split_at(rest.find(' ').unwrap_or(rest.len()));
-    !id.is_empty() && tail.trim_start_matches(is_space).is_empty() && ids.is_drawable(id)
+    (!id.is_empty() && skip_space(tail).is_empty()).then_some(id)
+}
+
+/// The ids the `url(…)` functions in `value` name, read as svgtypes'
+/// FuncIRI reads each: `url(`, optional whitespace and quote, `#`, then the
+/// id up to the quote, or else up to a space or `)`. Each read starts where
+/// the last ended, so `value` is read once.
+fn url_fragments(value: &str) -> impl Iterator<Item = &str> {
+    let mut rest = value;
+    std::iter::from_fn(move || {
+        loop {
+            let start = rest.find("url(")?;
+            let after = skip_space(&rest[start + "url(".len()..]);
+            let quote = after.chars().next().filter(|c| matches!(c, '"' | '\''));
+            let after = match quote {
+                Some(quote) => skip_space(&after[quote.len_utf8()..]),
+                None => after,
+            };
+            let Some(after) = after.strip_prefix('#') else {
+                rest = after;
+                continue;
+            };
+            let end = match quote {
+                Some(quote) => after.find(quote),
+                None => after.find([' ', ')']),
+            }
+            .unwrap_or(after.len());
+            rest = &after[end..];
+            let id = match quote {
+                Some(_) => after[..end].trim_end(),
+                None => &after[..end],
+            };
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    })
 }
 
 /// Every CSS `url(…)` in `value` names an element of the same document:
@@ -726,7 +1422,41 @@ mod tests {
             format!(r#"<filter id="f"><feImage href="data:image/png;base64,{PNG}"/></filter><rect width="1" height="1" filter="url(#f)"/>"#),
         ]
         .into_iter()
+        .chain(references_as_editors_write_them())
         .map(|inner| svg(&inner))
+        .collect()
+    }
+
+    /// References within the document as editors write them, none a loop:
+    /// each must still render.
+    fn references_as_editors_write_them() -> Vec<String> {
+        [
+            // Three stylesheets: an editor's, a pasted icon's, a font's.
+            r##"<defs><style>.cls-1{fill:url(#lg);}.cls-2{clip-path:url(#clip);}</style><linearGradient id="lg"><stop offset="0"/><stop offset="1" stop-color="red"/></linearGradient><clipPath id="clip"><rect width="8" height="8"/></clipPath></defs><style type="text/css">.st0{fill:#1d1d1b;} .st1 { fill: url(#lg) }</style><style>@font-face{font-family:x;} text{font-family:x, sans-serif;}</style><g class="cls-2"><rect class="cls-1" width="10" height="10"/><path class="st0" d="M0 0h5v5z"/><circle class="st1" r="2"/></g>"##,
+            // Inkscape: gradients sharing the stops of another, of either kind.
+            r##"<defs><linearGradient id="linearGradient1"><stop offset="0" style="stop-color:#ff0000"/><stop offset="1" style="stop-color:#0000ff"/></linearGradient><linearGradient xlink:href="#linearGradient1" id="linearGradient2" x1="0" y1="0" x2="10" y2="10" gradientUnits="userSpaceOnUse"/><radialGradient xlink:href="#linearGradient1" id="radialGradient3" cx="5" cy="5" r="5" gradientUnits="userSpaceOnUse"/></defs><rect width="10" height="10" style="fill:url(#linearGradient2)"/><circle cx="5" cy="5" r="5" style="fill:url(#radialGradient3)"/>"##,
+            // Stops and attributes inherited through three links.
+            r##"<linearGradient id="c" href="#b" gradientTransform="rotate(45)"/><linearGradient id="b" href="#a" spreadMethod="reflect"/><linearGradient id="a"><stop offset="0"/><stop offset="1" stop-color="red"/></linearGradient><rect width="10" height="10" fill="url(#c)"/>"##,
+            // A pattern moving another's content, painted with a gradient.
+            r##"<pattern id="base" width="2" height="2" patternUnits="userSpaceOnUse"><rect width="1" height="1" fill="url(#g)"/></pattern><pattern id="moved" href="#base" patternTransform="translate(1)"/><linearGradient id="g"><stop offset="0"/><stop offset="1" stop-color="red"/></linearGradient><rect width="10" height="10" fill="url(#moved)"/>"##,
+            // Illustrator: links set by class, pattern content styled too.
+            r##"<defs><style>.cls-1{fill:none;}.cls-2{clip-path:url(#clip-path);}.cls-3{fill:url(#linear-gradient);}.cls-4{fill:url(#pattern);}.cls-5{fill:#ed1c24;}</style><clipPath id="clip-path"><rect class="cls-1" width="8" height="8"/></clipPath><linearGradient id="linear-gradient" x2="1"><stop offset="0" stop-color="#fff"/><stop offset="1"/></linearGradient><pattern id="pattern" width="2" height="2" patternUnits="userSpaceOnUse"><rect class="cls-5" width="1" height="1"/></pattern></defs><g class="cls-2"><rect class="cls-3" width="10" height="10"/></g><rect class="cls-4" width="5" height="5"/>"##,
+            // Paint servers, clip paths, masks and filters inside what they
+            // apply to. Children never draw a gradient's stops or inherit
+            // their parent's clip path, mask or filter.
+            r##"<g fill="url(#g)"><linearGradient id="g"><stop offset="0"/><stop offset="1" stop-color="red"/></linearGradient><rect width="5" height="5"/></g>"##,
+            r##"<g clip-path="url(#c)" mask="url(#m)" filter="url(#f)"><clipPath id="c"><rect width="8" height="8"/></clipPath><mask id="m"><rect width="8" height="8" fill="white"/></mask><filter id="f"><feGaussianBlur stdDeviation="1"/></filter><rect width="10" height="10"/></g>"##,
+            // Filters drawing shapes in groups the other one filters.
+            r##"<g filter="url(#f2)"><rect id="r1" width="1" height="1"/></g><g filter="url(#f1)"><rect id="r2" width="1" height="1"/></g><filter id="f1"><feImage href="#r1"/></filter><filter id="f2"><feImage href="#r2"/></filter>"##,
+            // Inkscape's stock arrow, which sets markers of its own to none.
+            r##"<defs><marker id="Arrow1Lend" style="overflow:visible" orient="auto"><path d="M0 0L5 -5L-12.5 0L5 5z" style="fill-rule:evenodd;stroke:#000000;stroke-width:1pt;marker-start:none"/></marker></defs><path d="M1 1L9 9" style="stroke:#000000;marker-end:url(#Arrow1Lend)"/>"##,
+            // A shape drawn clipped by a clip path that draws it too.
+            r##"<defs><path id="shape" d="M0 0h5v5z"/><clipPath id="c"><use href="#shape"/></clipPath></defs><use href="#shape" clip-path="url(#c)"/>"##,
+            // A symbol drawn twice; a hyperlink to the group holding it.
+            r##"<g id="top"><symbol id="s"><circle r="1" fill="url(#g)"/></symbol><use href="#s"/><use href="#s" x="5"/><a href="#top"><rect width="1" height="1"/></a></g><linearGradient id="g"><stop offset="0"/><stop offset="1" stop-color="red"/></linearGradient>"##,
+        ]
+        .into_iter()
+        .map(String::from)
         .collect()
     }
 
@@ -890,7 +1620,8 @@ mod tests {
     /// billions of steps.
     fn large_documents() -> Vec<(String, bool)> {
         const REFERENCES: usize = 50_000;
-        const DEPTH: usize = 5_000;
+        // As deep as usvg draws: it refuses 1 024 levels of nesting.
+        const DEPTH: usize = 1_000;
 
         // Many feImages naming one rect, inside unused <defs>.
         let mut many = String::from(r#"<defs><rect id="r" width="1" height="1"/><filter id="f">"#);
@@ -1018,6 +1749,451 @@ mod tests {
         }
     }
 
+    /// Why usvg would follow the references in `text` without end or too
+    /// often, if it would.
+    fn reference_cost_of(text: &str) -> Option<Cost> {
+        let document = Document::parse_with_options(text, parsing_options()).unwrap();
+        reference_cost(&document, &Ids::new(&document))
+    }
+
+    /// Documents whose references loop. Unless noted, usvg 0.46 never
+    /// returned from each, or overflowed its stack and aborted.
+    fn reference_loops() -> Vec<(&'static str, String)> {
+        let pattern = |id: &str, content: &str| {
+            format!(r#"<pattern id="{id}" width="1" height="1">{content}</pattern>"#)
+        };
+        let filled = |paint: &str| format!(r#"<rect width="1" height="1" fill="url(#{paint})"/>"#);
+        let loops = [
+            // `href` inheritance: usvg stops only on coming back to where it
+            // started, so a loop entered from outside it never ends.
+            ("patterns inheriting in a loop", r##"<pattern id="a" href="#b" width="1" height="1"/><pattern id="b" href="#c"/><pattern id="c" href="#b"/><rect width="1" height="1" fill="url(#a)"/>"##.to_string()),
+            ("filters inheriting in a loop", r##"<filter id="a" href="#b"/><filter id="b" href="#c"/><filter id="c" href="#b"/><rect width="1" height="1" filter="url(#a)"/>"##.into()),
+            ("gradients of both kinds inheriting in a loop", r##"<radialGradient id="a" xlink:href="#b"/><linearGradient id="b" xlink:href="#c"/><radialGradient id="c" xlink:href="#b"/><rect width="1" height="1" fill="url(#a)"/>"##.into()),
+            // usvg stops on these two, and never walks the second: finding
+            // the loops something draws would mean resolving stylesheets,
+            // `use` and text as usvg does. Editors write no loops.
+            ("a gradient inheriting from itself", r##"<linearGradient id="a" href="#a"/><rect width="1" height="1" fill="url(#a)"/>"##.into()),
+            ("a loop nothing draws", r##"<linearGradient id="a" href="#b"/><linearGradient id="b" href="#a"/>"##.into()),
+            // Painting, drawn through the content of a pattern. usvg repairs
+            // loops of one or two patterns, one per pass.
+            ("patterns filling each other", [pattern("p1", &filled("p2")), pattern("p2", &filled("p3")), pattern("p3", &filled("p1")), filled("p1")].concat()),
+            ("a pattern filling itself by style", pattern("p", r##"<rect width="1" height="1" style="fill: url('#p')"/>"##)),
+            ("a pattern its group fills", format!(r##"<g fill="url(#p)">{}<rect width="5" height="5"/></g>"##, pattern("p", r#"<rect width="1" height="1"/>"#))),
+            ("patterns filled by style rules", [r#"<style>#p1 rect{fill:url(#p2)} #p2 rect{fill:url(#p3)} #p3 rect{fill:url(#p1)}</style>"#.to_string(), pattern("p1", r#"<rect width="1" height="1"/>"#), pattern("p2", r#"<rect width="1" height="1"/>"#), pattern("p3", r#"<rect width="1" height="1"/>"#), filled("p1")].concat()),
+            ("a pattern filled by a class rule", [r#"<style>.inside{fill:url(#p)}</style>"#.to_string(), pattern("p", r#"<rect class="outside inside" width="1" height="1"/>"#)].concat()),
+            ("a pattern filled by an id rule", [r#"<style>#r{fill:url(#p)}</style>"#.to_string(), pattern("p", r#"<rect id="r" width="1" height="1"/>"#)].concat()),
+            ("patterns drawing each other with use", [pattern("p1", r##"<use href="#r2"/>"##), pattern("p2", r##"<use href="#r3"/>"##), pattern("p3", r##"<use href="#r1"/>"##), r##"<defs><rect id="r1" width="1" height="1" fill="url(#p1)"/><rect id="r2" width="1" height="1" fill="url(#p2)"/><rect id="r3" width="1" height="1" fill="url(#p3)"/></defs>"##.into(), filled("p1")].concat()),
+            // Clipping, masking and filtering.
+            ("clip paths clipping each other", r##"<clipPath id="c1" clip-path="url(#c2)"><rect width="1" height="1"/></clipPath><clipPath id="c2" clip-path="url(#c3)"><rect width="1" height="1"/></clipPath><clipPath id="c3" clip-path="url(#c1)"><rect width="1" height="1"/></clipPath><rect width="5" height="5" clip-path="url(#c1)"/>"##.into()),
+            ("clip path contents clipping each other", r##"<clipPath id="c1"><rect width="1" height="1" clip-path="url(#c2)"/></clipPath><clipPath id="c2"><rect width="1" height="1" clip-path="url(#c3)"/></clipPath><clipPath id="c3"><rect width="1" height="1" clip-path="url(#c1)"/></clipPath><rect width="5" height="5" clip-path="url(#c1)"/>"##.into()),
+            ("masks masking each other", r##"<mask id="m1"><rect width="1" height="1" fill="white" mask="url(#m2)"/></mask><mask id="m2"><rect width="1" height="1" fill="white" mask="url(#m3)"/></mask><mask id="m3"><rect width="1" height="1" fill="white" mask="url(#m1)"/></mask><rect width="5" height="5" mask="url(#m1)"/>"##.into()),
+            ("a filter drawing a group it filters", r##"<filter id="f"><feImage href="#g"/></filter><g id="g"><rect width="5" height="5" filter="url(#f)"/></g>"##.into()),
+            ("filters drawing each other", r##"<filter id="f1"><feImage href="#r2"/></filter><filter id="f2"><feImage href="#r3"/></filter><filter id="f3"><feImage href="#r1"/></filter><rect id="r1" width="5" height="5" filter="url(#f2)"/><rect id="r2" width="5" height="5" filter="url(#f3)"/><rect id="r3" width="5" height="5" filter="url(#f1)"/>"##.into()),
+            ("filters drawing each other by inherit", r##"<g filter="url(#f2)"><rect id="r1" width="1" height="1" filter="inherit"/></g><g filter="url(#f1)"><rect id="r2" width="1" height="1" filter="inherit"/></g><filter id="f1"><feImage href="#r1"/></filter><filter id="f2"><feImage href="#r2"/></filter>"##.into()),
+            // usvg stops on markers inside markers it is drawing.
+            ("markers marking each other", r##"<marker id="m1"><path d="M0 0L1 0" stroke="black" marker-end="url(#m2)"/></marker><marker id="m2"><path d="M0 0L1 0" stroke="black" marker-end="url(#m1)"/></marker><path d="M0 0L5 5" stroke="black" marker-end="url(#m1)"/>"##.into()),
+        ];
+        // The reported document: 227 bytes that never return.
+        let reported = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><defs>
+<linearGradient id="a" href="#b"/><linearGradient id="b" href="#c"/><linearGradient id="c" href="#b"/>
+</defs><rect width="1" height="1" fill="url(#a)"/></svg>"##;
+        std::iter::once(("gradients inheriting in a loop", reported.to_string()))
+            .chain(loops.into_iter().map(|(name, inner)| (name, svg(&inner))))
+            .collect()
+    }
+
+    /// 20 000 loops usvg repairs, one per pass over the document: 1–2 MB,
+    /// three to seven seconds each.
+    fn reference_floods() -> Vec<(&'static str, String)> {
+        let flood = |each: &dyn Fn(usize) -> String| (0..20_000).map(each).collect::<String>();
+        vec![
+            ("patterns filling themselves", flood(&|i| format!(r##"<pattern id="p{i}" width="1" height="1"><rect width="1" height="1" fill="url(#p{i})"/></pattern>"##))),
+            ("clip paths clipping themselves", flood(&|i| format!(r##"<clipPath id="c{i}"><rect width="1" height="1" clip-path="url(#c{i})"/></clipPath>"##))),
+            ("masks masking themselves", flood(&|i| format!(r##"<mask id="m{i}"><rect width="1" height="1" mask="url(#m{i})"/></mask>"##))),
+            ("filters filtering themselves", flood(&|i| format!(r##"<filter id="f{i}" filter="url(#f{i})"/>"##))),
+            ("markers marking themselves", flood(&|i| format!(r##"<marker id="m{i}"><path d="M0 0L1 0" marker-end="url(#m{i})"/></marker>"##))),
+        ]
+        .into_iter()
+        .map(|(name, inner)| (name, svg(&inner)))
+        .collect()
+    }
+
+    #[test]
+    fn reference_loops_are_refused() {
+        for (name, document) in reference_loops().into_iter().chain(reference_floods()) {
+            assert_eq!(
+                reference_cost_of(&document),
+                Some(Cost::ReferenceLoop),
+                "{name}"
+            );
+            assert!(!is_safe_image(document.as_bytes()), "{name}");
+        }
+    }
+
+    #[test]
+    fn references_as_editors_write_them_still_render() {
+        for inner in references_as_editors_write_them() {
+            let document = svg(&inner);
+            assert_eq!(reference_cost_of(&document), None, "{document}");
+            assert!(is_safe_image(document.as_bytes()), "{document}");
+        }
+    }
+
+    /// `count` gradients, each inheriting from the one before, the first
+    /// holding the stops, and a shape painted with each of the `used` last.
+    fn gradient_chain(count: usize, used: usize) -> String {
+        let mut inner = String::from(
+            r#"<linearGradient id="g0"><stop offset="0"/><stop offset="1" stop-color="red"/></linearGradient>"#,
+        );
+        for i in 1..count {
+            inner.push_str(&format!(
+                r##"<linearGradient id="g{i}" href="#g{}"/>"##,
+                i - 1
+            ));
+        }
+        for i in count - used..count {
+            inner.push_str(&format!(
+                r##"<rect width="1" height="1" fill="url(#g{i})"/>"##
+            ));
+        }
+        svg(&inner)
+    }
+
+    #[test]
+    fn long_href_chains_are_refused() {
+        let longest = MAX_HREF_CHAIN as usize;
+        assert_eq!(reference_cost_of(&gradient_chain(longest, 1)), None);
+        assert!(is_safe_image(gradient_chain(longest, longest).as_bytes()));
+        assert_eq!(
+            reference_cost_of(&gradient_chain(longest + 1, 1)),
+            Some(Cost::HrefChain)
+        );
+        // 20 000 gradients, each painting a shape, walk 200 million links.
+        let shared = gradient_chain(20_000, 20_000);
+        assert_eq!(reference_cost_of(&shared), Some(Cost::HrefChain));
+        assert!(!is_safe_image(shared.as_bytes()));
+    }
+
+    #[test]
+    fn costly_reference_lookups_are_refused() {
+        // Each `tref` looks for its target from the start, past 5 000 others.
+        let trefs = svg(&format!(
+            r##"<text>{}</text><text id="t">A</text>"##,
+            r##"<tref href="#t"/>"##.repeat(5_000)
+        ));
+        assert_eq!(reference_cost_of(&trefs), Some(Cost::TrefLookups));
+        let few = svg(r##"<text><tref href="#t"/><tref href="#t"/></text><text id="t">A</text>"##);
+        assert_eq!(reference_cost_of(&few), None);
+
+        // 2 000 rules linking every rect, 1 100 rects: 70 KB, four million
+        // links.
+        let styled = svg(&format!(
+            r#"<style>{}</style><linearGradient id="g"/>{}"#,
+            "rect{fill:url(#g)}".repeat(2_000),
+            r#"<rect width="1" height="1"/>"#.repeat(1_100)
+        ));
+        assert_eq!(reference_cost_of(&styled), Some(Cost::StyleLinks));
+        // 50 rules for one class, named 50 000 times by one element.
+        let repeated = svg(&format!(
+            r#"<style>{}</style><linearGradient id="g"/><rect class="{}" width="1" height="1"/>"#,
+            ".a{fill:url(#g)}".repeat(50),
+            "a ".repeat(50_000)
+        ));
+        assert_eq!(reference_cost_of(&repeated), Some(Cost::StyleLinks));
+        // Rules that link nothing, or only to elements that don't exist,
+        // add nothing.
+        let colors = styled.replace("url(#g)", "red");
+        assert_eq!(reference_cost_of(&colors), None);
+        let missing = styled.replace("url(#g)", "url(#missing)");
+        assert_eq!(reference_cost_of(&missing), None);
+        // Rules for classes no element has add nothing either.
+        let classes: String = (0..2_000)
+            .map(|i| format!(".c{i}{{fill:url(#g)}}"))
+            .collect();
+        let unused = svg(&format!(
+            r#"<style>{classes}</style><linearGradient id="g"/>{}"#,
+            r#"<rect class="c0 x" width="1" height="1"/>"#.repeat(50_000)
+        ));
+        assert_eq!(reference_cost_of(&unused), None);
+
+        // 16 000 rules in one sheet, 300 KB, each costing a read of what
+        // comes before it.
+        let rules: String = (0..16_000).map(|i| format!(".c{i}{{fill:red}}")).collect();
+        let sheet = svg(&format!("<style>{rules}</style>"));
+        assert_eq!(reference_cost_of(&sheet), Some(Cost::Style));
+        // Split into sheets, it costs each sheet's share.
+        let rules: String = (0..1_000)
+            .map(|i| format!("<style>.c{i}{{fill:red}}</style>"))
+            .collect();
+        assert_eq!(reference_cost_of(&svg(&rules)), None);
+        // The same for `style` attributes: 40 000 declarations on one
+        // element, and one on each of 40 000.
+        let one = svg(&format!(
+            r#"<rect width="1" height="1" style="{}"/>"#,
+            "fill:red;".repeat(40_000)
+        ));
+        assert_eq!(reference_cost_of(&one), Some(Cost::Style));
+        let each = svg(&r#"<rect width="1" height="1" style="fill:red;"/>"#.repeat(40_000));
+        assert_eq!(reference_cost_of(&each), None);
+    }
+
+    /// The reviewed 600 KB selector: 100 000 descendant combinators, each
+    /// once a frame of recursion in the guard.
+    #[test]
+    fn long_selectors_are_read_without_recursion() {
+        let selector = "g ".repeat(100_000);
+        let unused = svg(&format!(
+            "<style>{selector}rect{{fill:url(#p)}}</style><linearGradient id='p'/>"
+        ));
+        assert_eq!(reference_cost_of(&unused), None);
+        // What the rule needs of its element, a rect, is still read.
+        let looping = svg(&format!(
+            r#"<style>{selector}rect{{fill:url(#p)}}</style><pattern id="p" width="1" height="1"><rect width="1" height="1"/></pattern>"#
+        ));
+        assert_eq!(reference_cost_of(&looping), Some(Cost::ReferenceLoop));
+    }
+
+    #[test]
+    fn many_stylesheets_are_refused() {
+        let sheets = |count: usize| svg(&"<style>.x{fill:red}</style>".repeat(count));
+        // The reviewed 2.6 MB: five billion rules sorted in usvg, and in the
+        // guard before it parsed each sheet alone.
+        assert_eq!(reference_cost_of(&sheets(100_000)), Some(Cost::StyleSheets));
+        // The most sheets of one rule allowed, and one more.
+        let sheet = ".x{fill:red}".len();
+        let most = (1..)
+            .take_while(|&n: &usize| sheet * n * (n + 1) / 2 <= MAX_STYLE_SORTING)
+            .last()
+            .unwrap();
+        assert_eq!(reference_cost_of(&sheets(most)), None);
+        assert_eq!(
+            reference_cost_of(&sheets(most + 1)),
+            Some(Cost::StyleSheets)
+        );
+    }
+
+    /// A chain of `count` references of one kind, each element drawing the
+    /// next, drawn once.
+    fn reference_chain(kind: &str, count: usize) -> String {
+        let rect = r#"<rect width="1" height="1"/>"#;
+        let mut inner = String::new();
+        for i in 0..count {
+            let next = i + 1;
+            let last = next == count;
+            let link = |attribute: &str| {
+                if last {
+                    rect.to_string()
+                } else {
+                    format!(r##"<rect width="1" height="1" {attribute}="url(#e{next})"/>"##)
+                }
+            };
+            inner.push_str(&match kind {
+                "clip-path" if last => format!(r#"<clipPath id="e{i}">{rect}</clipPath>"#),
+                "clip-path" => format!(r##"<clipPath id="e{i}" clip-path="url(#e{next})">{rect}</clipPath>"##),
+                "clip-path content" => format!(r#"<clipPath id="e{i}">{}</clipPath>"#, link("clip-path")),
+                "mask" => format!(r#"<mask id="e{i}">{}</mask>"#, link("mask")),
+                "pattern" => format!(r#"<pattern id="e{i}" width="1" height="1">{}</pattern>"#, link("fill")),
+                "inherited paint" if last => format!(r#"<pattern id="e{i}" width="1" height="1">{rect}</pattern>"#),
+                "inherited paint" => format!(r##"<g fill="url(#e{next})"><pattern id="e{i}" width="1" height="1"><g>{rect}</g></pattern></g>"##),
+                "marker" => format!(r#"<marker id="e{i}">{}</marker>"#, link("marker-end").replace("<rect", "<path d='M0 0L1 0'")),
+                "filter" if last => format!(r#"<filter id="e{i}"><feFlood/></filter>"#),
+                "filter" => format!(r##"<filter id="e{i}"><feImage href="#r{next}"/></filter><rect id="r{next}" width="1" height="1" filter="url(#e{next})"/>"##),
+                "use" if last => format!(r#"<rect id="e{i}" width="1" height="1"/>"#),
+                "use" => format!(r##"<g id="e{i}"><use href="#e{next}"/></g>"##),
+                _ => unreachable!("{kind}"),
+            });
+        }
+        inner.push_str(match kind {
+            "clip-path" | "clip-path content" => {
+                r##"<rect width="5" height="5" clip-path="url(#e0)"/>"##
+            }
+            "mask" => r##"<rect width="5" height="5" mask="url(#e0)"/>"##,
+            "pattern" | "inherited paint" => r##"<rect width="5" height="5" fill="url(#e0)"/>"##,
+            "marker" => r##"<path d="M0 0L5 5" marker-end="url(#e0)"/>"##,
+            "filter" => r##"<rect width="5" height="5" filter="url(#e0)"/>"##,
+            "use" => r##"<use href="#e0"/>"##,
+            _ => unreachable!(),
+        });
+        svg(&inner)
+    }
+
+    #[test]
+    fn deep_drawing_is_refused() {
+        let kinds = [
+            "clip-path",
+            "clip-path content",
+            "mask",
+            "pattern",
+            "inherited paint",
+            "marker",
+            "filter",
+            "use",
+        ];
+        for kind in kinds {
+            // 20 000 clip paths overflowed usvg's stack, each clipping with
+            // the next; a few hundred of the others did.
+            assert_eq!(
+                reference_cost_of(&reference_chain(kind, 20_000)),
+                Some(Cost::RenderDepth),
+                "{kind}"
+            );
+            assert_eq!(
+                reference_cost_of(&reference_chain(kind, 250)),
+                Some(Cost::RenderDepth),
+                "{kind}"
+            );
+            // A filter drawing the next counts twice: `filter`, `feImage`.
+            assert_eq!(
+                reference_cost_of(&reference_chain(kind, 50)),
+                None,
+                "{kind}"
+            );
+        }
+
+        // Nesting alone: the root, then `levels` groups, then a shape.
+        let nested = |levels: usize, inside: &str| {
+            svg(&format!(
+                "{}{inside}{}",
+                "<g>".repeat(levels),
+                "</g>".repeat(levels)
+            ))
+        };
+        let rect = r#"<rect width="1" height="1"/>"#;
+        let most = MAX_RENDER_DEPTH as usize - 1;
+        assert_eq!(reference_cost_of(&nested(most, rect)), None);
+        assert_eq!(
+            reference_cost_of(&nested(most + 1, rect)),
+            Some(Cost::RenderDepth)
+        );
+        // A reference counts as REFERENCE_DEPTH levels: the groups, the
+        // shape filled, the reference, then the pattern's shape.
+        let pattern =
+            r##"<pattern id="p" width="1" height="1"><rect width="1" height="1"/></pattern>"##;
+        let filled = r##"<rect width="1" height="1" fill="url(#p)"/>"##;
+        let most = (MAX_RENDER_DEPTH - REFERENCE_DEPTH - 2) as usize;
+        let inside = |levels: usize| {
+            format!(
+                "{pattern}{}{filled}{}",
+                "<g>".repeat(levels),
+                "</g>".repeat(levels)
+            )
+        };
+        assert_eq!(reference_cost_of(&svg(&inside(most))), None);
+        assert_eq!(
+            reference_cost_of(&svg(&inside(most + 1))),
+            Some(Cost::RenderDepth)
+        );
+
+        // Inheriting from each of 900 ancestors, and 5 000 shapes sharing a
+        // marker and a chain of 100 patterns, count no more than once.
+        let inherited = svg(&format!(
+            r##"<linearGradient id="g"/><g fill="url(#g)">{}</g>"##,
+            nested(900, rect)
+        ));
+        assert_eq!(reference_cost_of(&inherited), None);
+        let chain = reference_chain("pattern", 100);
+        let shared = chain.replace(
+            "</svg>",
+            &format!(
+                r##"<marker id="m"><path d="M0 0L1 0"/></marker>{}</svg>"##,
+                r##"<path d="M0 0L1 1" fill="url(#e0)" marker-end="url(#m)"/>"##.repeat(5_000)
+            ),
+        );
+        assert_eq!(reference_cost_of(&shared), None);
+    }
+
+    #[test]
+    fn style_probes_are_charged() {
+        // The reviewed megabyte: half a million unit probes, each reading
+        // what comes before, in a sheet and in a `style`.
+        let numbers = "1 ".repeat(500_000);
+        let sheet = svg(&format!(
+            r#"<style>rect{{stroke-dasharray:{numbers}}}</style><rect/>"#
+        ));
+        assert_eq!(reference_cost_of(&sheet), Some(Cost::Style));
+        let inline = svg(&format!(r#"<rect style="stroke-dasharray:{numbers}"/>"#));
+        assert_eq!(reference_cost_of(&inline), Some(Cost::Style));
+        let colors = svg(&format!(
+            r#"<style>rect{{fill:{}}}</style>"#,
+            "#1 ".repeat(100_000)
+        ));
+        assert_eq!(reference_cost_of(&colors), Some(Cost::Style));
+
+        // Every term that probes is charged, however terms abut: after a
+        // unit that failed past a `-`, or at a `.`; after a percentage, a
+        // name, a hex color. With how many probes simplecss makes.
+        let charged = |text| {
+            let mut offsets = Vec::new();
+            for_each_style_probe(text, |offset| offsets.push(offset));
+            offsets
+        };
+        for (text, probes) in [
+            ("1-2-3", 3),
+            ("1..5", 2),
+            ("1.5.5", 2),
+            ("x1.5", 1),
+            ("+.5.5", 2),
+            ("#1.5", 2),
+            ("50%-2", 1),
+            ("a.5", 1),
+            ("#1a-5", 2),
+            ("#1a- ", 2),
+            ("1 2 3", 3),
+            ("fill:red}", 1),
+        ] {
+            assert!(charged(text).len() >= probes, "{text}");
+        }
+        assert_eq!(charged("1-2-3"), [0, 1, 2, 3, 4]);
+        // Names, units and hex colors aren't charged within.
+        assert_eq!(charged("fill-rule"), Vec::<usize>::new());
+        assert_eq!(charged("x1 12px #a1b2"), [3, 8]);
+        assert_eq!(charged("0.75px 10.5"), [0, 7]);
+        assert_eq!(charged("a:1;}"), [2, 3, 4, 4, 4]);
+    }
+
+    /// A sheet as Illustrator writes one, on one line, dashes and transforms
+    /// in each rule, with shapes of many points styled inline.
+    #[test]
+    fn style_as_editors_write_it_still_renders() {
+        let rules: String = (0..300)
+            .map(|i| {
+                format!(
+                    ".cls-{i}{{fill:#1d1d1b;stroke:#e30613;stroke-width:0.75px;stroke-dasharray:4.5 2 1.25 2 0.5 2;stroke-miterlimit:10;opacity:0.85;transform:translate(12.5px, -3.25px) rotate(-45deg) scale(1.5, 0.75);}}"
+                )
+            })
+            .collect();
+        let points: String = (0..2_000)
+            .map(|i| format!("{}.5,{}.25 ", i % 97, i % 89))
+            .collect();
+        let shapes: String = (0..300)
+            .map(|i| {
+                format!(
+                    r#"<polygon class="cls-{i}" points="{points}" style="stroke-dasharray:3 1 0.5 1;stroke-dashoffset:-2.5"/>"#
+                )
+            })
+            .collect();
+        let document = svg(&format!("<defs><style>{rules}</style></defs>{shapes}"));
+        assert!(document.len() > 1 << 20);
+        assert_eq!(reference_cost_of(&document), None);
+        assert!(is_safe_image(document.as_bytes()));
+    }
+
+    #[test]
+    fn url_and_href_fragments_are_read_as_svgtypes_reads_them() {
+        let urls = |value| url_fragments(value).collect::<Vec<_>>();
+        assert_eq!(urls("url(#a)"), ["a"]);
+        assert_eq!(urls(" url( ' #a b ' ) url(#c) none"), ["a b", "c"]);
+        assert_eq!(urls(r##"url("#a")"##), ["a"]);
+        assert_eq!(urls("url(#a b)"), ["a"]);
+        assert_eq!(urls("url(#url(#b)"), ["url(#b"]);
+        assert_eq!(urls("url(a) url(#) url(x#b) URL(#c)"), Vec::<&str>::new());
+        assert_eq!(iri_fragment(" #a "), Some("a"));
+        assert_eq!(iri_fragment("#a\t"), Some("a\t"));
+        assert_eq!(iri_fragment("#a b"), None);
+        assert_eq!(iri_fragment("# a"), None);
+        assert_eq!(iri_fragment("a#b"), None);
+    }
+
     /// How long the guard takes on each attack and large document. Run with
     /// `cargo test --release -p mtc image_guard -- --ignored --nocapture`.
     #[test]
@@ -1026,6 +2202,11 @@ mod tests {
         let documents = attacks()
             .into_iter()
             .map(|(name, document, _)| (name.to_string(), document))
+            .chain(
+                reference_floods()
+                    .into_iter()
+                    .map(|(name, document)| (name.to_string(), document)),
+            )
             .chain(
                 large_documents()
                     .into_iter()
