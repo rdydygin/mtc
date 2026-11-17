@@ -689,12 +689,20 @@ const MAX_HREF_CHAIN: u32 = 16;
 /// 101 with ten groups in each, of 700 masks, of 1 600 clip paths.
 /// Inheriting from a parent and two references to one element add nothing.
 /// Editors nest a few dozen levels, and follow a reference or two.
+///
+/// A level took about 1.5 KB of stack, so at the bound usvg needs about
+/// 1.5 MB. That assumes usvg renders on a thread of 16 MB or more, as the
+/// helper process does: about ten times what it needs. GPUI's own threads
+/// have less, as little as 512 KB on macOS. The guard itself recurses
+/// nowhere with the document's depth: roxmltree parses nesting in a loop
+/// and entities at most ten deep, simplecss matches the guard's stand-in
+/// two calls deep, and the reference graph is searched with a stack of
+/// its own.
 const MAX_RENDER_DEPTH: u32 = 1024;
 
 /// The levels of nesting a reference counts as in [`MAX_RENDER_DEPTH`]:
 /// what drawing a pattern or marker costs usvg's stack, about four levels'
-/// worth, the most of any reference. A level took about 1.5 KB, so at the
-/// bound usvg needs about 1.5 MB.
+/// worth, the most of any reference.
 const REFERENCE_DEPTH: u32 = 5;
 
 /// The most links style rules may add, summed over the elements each could
@@ -703,16 +711,15 @@ const REFERENCE_DEPTH: u32 = 5;
 /// that class: a link or two per element.
 const MAX_STYLE_LINKS: usize = 1 << 22;
 
-/// The most work parsing style may take simplecss, which usvg parses
-/// stylesheets and `style` attributes with, in bytes read. For selectors
-/// and declarations, even some that parse, simplecss works out a line and
-/// column by reading its text from the start, so a text costs up to its
-/// length for each: a sheet of 16 000 rules, 300 KB, took a second, and a
-/// `style` of 40 000 declarations four. Counted as the text's length for
-/// each `{`, `}`, `,` and `;`, about one per item; at this bound, a fifth
-/// of a second. Illustrator's sheets, a few hundred rules, cost tens of
-/// millions, and a `style` a few thousand.
-const MAX_STYLE_PARSING: usize = 1 << 30;
+/// The most work parsing style may take simplecss, which usvg and the
+/// guard both parse stylesheets and `style` attributes with, in bytes
+/// reread; see [`style_parse_cost`]. Measured, a charged byte cost 0.14 to
+/// 0.63 ns, the most on lines without breaks, so at this bound a text takes
+/// a third of a second at most. A sheet of 300 rules on one line, each with
+/// a dash array and three transforms, 57 KB, is charged 290 million and
+/// took 90 ms; Illustrator's one-line sheets are charged this much at about
+/// 1 000 rules.
+const MAX_STYLE_PARSING: usize = 1 << 29;
 
 /// The most work sorting style rules may take usvg, in bytes of stylesheet
 /// sorted. usvg parses every `<style>` into one list of rules, and after
@@ -749,8 +756,7 @@ fn reference_cost(document: &Document, ids: &Ids) -> Option<Cost> {
     let parsing = style_sheets(document)
         .chain(style_attributes)
         .fold(0usize, |work, style| {
-            let items = 1 + style.bytes().filter(|byte| b"{},;".contains(byte)).count();
-            work.saturating_add(items.saturating_mul(style.len()))
+            work.saturating_add(style_parse_cost(style))
         });
     if parsing > MAX_STYLE_PARSING {
         return Some(Cost::Style);
@@ -775,6 +781,80 @@ fn reference_cost(document: &Document, ids: &Ids) -> Option<Cost> {
         }
     }
     References::new(&elements, ids, &rules).cost()
+}
+
+/// What parsing `text` costs simplecss beyond reading it once, in bytes
+/// reread. Wherever an optional token turns out absent, or a part fails,
+/// simplecss works out a line and column, for an error nobody reads, by
+/// reading the text from its start (`gen_text_pos`). It does so
+///
+/// - after every number without a `%`, looking for a unit: `consume_term`;
+/// - after a `#` without a name, as in `#123`;
+/// - where each value ends: at `;`, `}` or `!`, or at anything a value
+///   can't hold, after which the rest of the block, or of a `style`, is
+///   skipped;
+/// - where a declaration's name, `:` or value is missing, then skipping
+///   the same; so at most three times in a block past its last `;`;
+/// - at an `@` rule, and at an unterminated comment, which ends the text;
+/// - in a selector, which it reads from a copy starting at the selector,
+///   so at the cost of the selector's length.
+///
+/// So each is charged the offset of the byte that starts its term or ends
+/// its value, `}` three times, and the few that a text's last block or
+/// `style` makes past its last such byte, the text's length.
+fn style_parse_cost(text: &str) -> usize {
+    let mut cost = text.len().saturating_mul(4);
+    for_each_style_probe(text, |offset| cost = cost.saturating_add(offset));
+    cost
+}
+
+/// Calls `probe` with the offset of each byte [`style_parse_cost`] charges,
+/// as often as it charges it. A term can start at `+`, `#` or `.`, at a `-`
+/// unless inside a name, and at a digit unless inside a name, a hex color
+/// or a number; a `.` that is a number's first stays in it.
+fn for_each_style_probe(text: &str, mut probe: impl FnMut(usize)) {
+    let in_name = |byte: u8| byte.is_ascii_alphabetic() || byte == b'_' || byte >= 0x80;
+    let mut previous = b' ';
+    // Whether the bytes since the last term start are a number's digits.
+    let mut whole_number = false;
+    for (offset, byte) in text.bytes().enumerate() {
+        let charged = match byte {
+            b'}' => 3,
+            b'#' | b';' | b'!' | b'@' => 1,
+            b'+' => {
+                whole_number = true;
+                1
+            }
+            b'.' => {
+                let starts = !whole_number;
+                whole_number = false;
+                usize::from(starts)
+            }
+            // A hex color stops before `-`, so a number can start there.
+            b'-' => {
+                let starts = !in_name(previous) || previous.is_ascii_hexdigit();
+                whole_number = starts;
+                usize::from(starts)
+            }
+            b'0'..=b'9' => {
+                let starts = !(in_name(previous) || matches!(previous, b'0'..=b'9' | b'.' | b'#'));
+                if starts {
+                    whole_number = true;
+                } else if !previous.is_ascii_digit() {
+                    whole_number = false;
+                }
+                usize::from(starts)
+            }
+            _ => {
+                whole_number = false;
+                0
+            }
+        };
+        for _ in 0..charged {
+            probe(offset);
+        }
+        previous = byte;
+    }
 }
 
 /// The text of every `<style>` usvg reads, as it reads it.
@@ -2009,6 +2089,82 @@ mod tests {
             ),
         );
         assert_eq!(reference_cost_of(&shared), None);
+    }
+
+    #[test]
+    fn style_probes_are_charged() {
+        // The reviewed megabyte: half a million unit probes, each reading
+        // what comes before, in a sheet and in a `style`.
+        let numbers = "1 ".repeat(500_000);
+        let sheet = svg(&format!(
+            r#"<style>rect{{stroke-dasharray:{numbers}}}</style><rect/>"#
+        ));
+        assert_eq!(reference_cost_of(&sheet), Some(Cost::Style));
+        let inline = svg(&format!(r#"<rect style="stroke-dasharray:{numbers}"/>"#));
+        assert_eq!(reference_cost_of(&inline), Some(Cost::Style));
+        let colors = svg(&format!(
+            r#"<style>rect{{fill:{}}}</style>"#,
+            "#1 ".repeat(100_000)
+        ));
+        assert_eq!(reference_cost_of(&colors), Some(Cost::Style));
+
+        // Every term that probes is charged, however terms abut: after a
+        // unit that failed past a `-`, or at a `.`; after a percentage, a
+        // name, a hex color. With how many probes simplecss makes.
+        let charged = |text| {
+            let mut offsets = Vec::new();
+            for_each_style_probe(text, |offset| offsets.push(offset));
+            offsets
+        };
+        for (text, probes) in [
+            ("1-2-3", 3),
+            ("1..5", 2),
+            ("1.5.5", 2),
+            ("x1.5", 1),
+            ("+.5.5", 2),
+            ("#1.5", 2),
+            ("50%-2", 1),
+            ("a.5", 1),
+            ("#1a-5", 2),
+            ("#1a- ", 2),
+            ("1 2 3", 3),
+            ("fill:red}", 1),
+        ] {
+            assert!(charged(text).len() >= probes, "{text}");
+        }
+        assert_eq!(charged("1-2-3"), [0, 1, 2, 3, 4]);
+        // Names, units and hex colors aren't charged within.
+        assert_eq!(charged("fill-rule"), Vec::<usize>::new());
+        assert_eq!(charged("x1 12px #a1b2"), [3, 8]);
+        assert_eq!(charged("0.75px 10.5"), [0, 7]);
+        assert_eq!(charged("a:1;}"), [2, 3, 4, 4, 4]);
+    }
+
+    /// A sheet as Illustrator writes one, on one line, dashes and transforms
+    /// in each rule, with shapes of many points styled inline.
+    #[test]
+    fn style_as_editors_write_it_still_renders() {
+        let rules: String = (0..300)
+            .map(|i| {
+                format!(
+                    ".cls-{i}{{fill:#1d1d1b;stroke:#e30613;stroke-width:0.75px;stroke-dasharray:4.5 2 1.25 2 0.5 2;stroke-miterlimit:10;opacity:0.85;transform:translate(12.5px, -3.25px) rotate(-45deg) scale(1.5, 0.75);}}"
+                )
+            })
+            .collect();
+        let points: String = (0..2_000)
+            .map(|i| format!("{}.5,{}.25 ", i % 97, i % 89))
+            .collect();
+        let shapes: String = (0..300)
+            .map(|i| {
+                format!(
+                    r#"<polygon class="cls-{i}" points="{points}" style="stroke-dasharray:3 1 0.5 1;stroke-dashoffset:-2.5"/>"#
+                )
+            })
+            .collect();
+        let document = svg(&format!("<defs><style>{rules}</style></defs>{shapes}"));
+        assert!(document.len() > 1 << 20);
+        assert_eq!(reference_cost_of(&document), None);
+        assert!(is_safe_image(document.as_bytes()));
     }
 
     #[test]
